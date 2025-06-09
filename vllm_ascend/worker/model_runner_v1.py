@@ -2043,6 +2043,7 @@ class NPUModelRunner(GPUModelRunner):
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        profile_cpp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -2073,6 +2074,9 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        elif profile_cpp:
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens] * num_reqs
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -2199,16 +2203,20 @@ class NPUModelRunner(GPUModelRunner):
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
-                # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by
-                # tp_size; otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading
-                # to incorrect memory estimation and potentially causing OOM.
-                intermediate_tokens = num_tokens_padded
-                if enable_sp():
+                # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by tp_size;
+                # otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading to incorrect memory estimation and potentially causing OOM.
+                # actual_tokens = num_tokens
+                actual_tokens = num_tokens_padded
+                sp_will_be_enabled = enable_sp() and (
+                    is_moe_model(self.vllm_config) or num_tokens_padded > 1000
+                )
+                if sp_will_be_enabled:
                     tp_size = get_tensor_model_parallel_world_size()
                     intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
                 if self.intermediate_tensors is None:
                     max_actual_tokens = self.max_num_tokens
-                    if enable_sp():
+                    if sp_will_be_enabled:
+                        # max_actual_tokens = self.max_num_tokens // tp_size
                         max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
                     self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                         batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
