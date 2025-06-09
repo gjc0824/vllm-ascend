@@ -16,8 +16,10 @@
 #
 from collections import deque
 from typing import List, Optional, Union
+from collections import deque
 
 import torch
+from torch import Tensor
 import vllm
 from torch import Tensor
 from torch.distributed import Backend, Work

@@ -1050,6 +1050,8 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._execution_start_time = time.perf_counter()
+
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
@@ -1418,6 +1420,12 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+
+        # 计算实际执行时间（毫秒）
+        execution_time_ms = 0.0
+        if hasattr(self, '_execution_start_time'):
+            execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
+        print("========= actual execution_time_ms", execution_time_ms)
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -1426,6 +1434,7 @@ class NPUModelRunner(GPUModelRunner):
             prompt_logprobs_dict=prompt_logprobs_dict,
             kv_connector_output=kv_connector_output,
             pooler_output=[],
+            execution_time_ms=execution_time_ms,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
         )
