@@ -1326,7 +1326,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             attn_mask_seqlens = torch.tensor([chunk_seqlens, chunk_seqlens], dtype=torch.int32)
             head_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_head_nomask_seqlens], dtype=torch.int32)
             tail_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_tail_nomask_seqlens], dtype=torch.int32)
-            cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=torch.bfloat16), 1)
+            cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=self.dtype), 1)
 
             self.extra_long_seq_kwargs = {
                 'attn_mask_seqlens': attn_mask_seqlens,
