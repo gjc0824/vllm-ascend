@@ -50,7 +50,7 @@ from vllm_ascend.utils import (init_ascend_soc_version,
                                try_register_lib, vllm_version_is)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
-if not vllm_version_is("0.10.1.1"):
+if not (vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1")):
     from vllm.v1.outputs import DraftTokenIds
 else:
     DraftTokenIds = None
@@ -305,7 +305,8 @@ class NPUWorker(WorkerBase):
                                      self.local_rank, "hccl")
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size)
+            self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.context_parallel_size)
         init_ascend_model_parallel(self.parallel_config)
         ensure_kv_transfer_initialized(self.vllm_config)
 

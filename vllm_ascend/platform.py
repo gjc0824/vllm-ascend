@@ -140,52 +140,65 @@ class NPUPlatform(Platform):
 
         check_ascend_config(vllm_config, enforce_eager)
         from vllm.config.compilation import CUDAGraphMode
-
-        # TODO(cmq): update the post init in vllmconfig
-        # if cudagraph_mode is not explicitly set by users, set default value
-        if envs_vllm.VLLM_USE_V1 and compilation_config.level \
-            == CompilationLevel.PIECEWISE:
-            compilation_config.cudagraph_mode = \
-                CUDAGraphMode.PIECEWISE
-        else:
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        vllm_config._set_cudagraph_sizes()
-
-        # TODO(cmq): update the compilation level config to be determined by CUDAGraphMode
-        if enforce_eager or compilation_config.level == CompilationLevel.NO_COMPILATION:
+        if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
             compilation_config.level = CompilationLevel.NO_COMPILATION
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        elif compilation_config.level != CompilationLevel.PIECEWISE:
+
+        compilation_config.cudagraph_num_of_warmups = 1
+
+        # TODO: make vllm support oot platform to set `compilation_config.cudagraph_mode`
+        # if cudagraph_mode is not explicitly set by users, set default value
+        if compilation_config.level == CompilationLevel.PIECEWISE:
+            compilation_config.cudagraph_mode = \
+                CUDAGraphMode.PIECEWISE
+        elif compilation_config.level not in [
+                CompilationLevel.NO_COMPILATION, CompilationLevel.PIECEWISE
+        ]:
             logger.warning(
-                "NPU does not support %s compilation level. Setting level to NO_COMPILATION",
+                "NPU does not support %s compilation level. Setting CUDAGraphMode to NONE",
                 compilation_config.level)
-            compilation_config.level = CompilationLevel.NO_COMPILATION
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        elif ascend_config.torchair_graph_config.enabled:
-            logger.info(
-                "Torchair compilation enabled on NPU. Setting level to NO_COMPILATION"
-            )
-            compilation_config.level = CompilationLevel.NO_COMPILATION
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        elif parallel_config.distributed_executor_backend == "ray":
-            logger.warning(
-                "Ray distributed executor backend is not compatible with ACL Graph mode "
-                "right now. Setting level to NO_COMPILATION")
-            compilation_config.level = CompilationLevel.NO_COMPILATION
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         else:
+            logger.warning(
+                "compilation_config.level = CompilationLevel.NO_COMPILATION is set, Setting CUDAGraphMode to NONE"
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        # set CUDAGraphMode to None when torchair is enabled, no mather what compilation_config.level is.
+        if ascend_config.torchair_graph_config.enabled:
+            logger.info(
+                "Torchair compilation enabled on NPU. Setting CUDAGraphMode to NONE"
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        if parallel_config.distributed_executor_backend == "ray":
+            logger.warning(
+                "Ray distributed executor backend is not compatible with ACL Graph mode "
+                "right now. Setting CUDAGraphMode to NONE")
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        # set cudaprah sizes before extending `compilation_config.splitting_ops`
+        vllm_config._set_cudagraph_sizes()
+
+        if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            compilation_config.level = CompilationLevel.NO_COMPILATION
+        elif compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE:
             logger.info(
                 "PIECEWISE compilation enabled on NPU. use_inductor not supported - "
                 "using only ACL Graph mode")
-            if envs_vllm.VLLM_USE_V1 and \
-                compilation_config.level == CompilationLevel.PIECEWISE:
-                compilation_config.set_splitting_ops_for_v1()
+            assert compilation_config.level == CompilationLevel.PIECEWISE, \
+                "When enabling piecewise aclgraph, please make sure compilation_config.level == CompilationLevel.PIECEWISE and compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE"
+            compilation_config.set_splitting_ops_for_v1()
             compilation_config.use_inductor = False
             compilation_config.splitting_ops.extend(
                 ["vllm.unified_ascend_attention_with_output"])
             update_aclgraph_sizes(vllm_config)
-            compilation_config.cudagraph_num_of_warmups = 1
+        else:
+            logger.info(
+                "%s cudagraph_mode is not support on NPU. falling back to NONE",
+                compilation_config.cudagraph_mode)
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            compilation_config.level = CompilationLevel.NO_COMPILATION
 
         if parallel_config and parallel_config.worker_cls == "auto":
             if ascend_config.torchair_graph_config.enabled:
@@ -216,7 +229,8 @@ class NPUPlatform(Platform):
             vllm_config.scheduler_config = ascend_scheduler_config
 
         if compilation_config.pass_config.enable_sequence_parallelism:
-            if not parallel_config.enable_expert_parallel or vllm_config.model_config.hf_config.model_type != "qwen3_moe":
+            if not parallel_config.enable_expert_parallel \
+                    and vllm_config.model_config.hf_config.model_type not in ["qwen3_moe", "qwen3"]:
                 raise NotImplementedError(
                     "For better performance in Qwen3 MoE, SP only works exclusively with MC2, AllToAll, and AllToAllV."
                 )

@@ -21,7 +21,7 @@ from tests.ut.base import TestBase
 from vllm_ascend.core.scheduler import AscendScheduler
 from vllm_ascend.utils import vllm_version_is
 
-if not vllm_version_is("0.10.1.1"):
+if not (vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1")):
     from vllm.v1.outputs import DraftTokenIds
 else:
     DraftTokenIds = None
@@ -54,18 +54,25 @@ def create_requests(
                                      prompt_logprobs=prompt_logprobs)
     requests = []
     for i in range(num_requests):
-        mm_position = None
-        mm_inputs = None
-        request = Request(request_id=f"{i}",
-                          prompt_token_ids=[i] * num_tokens,
-                          sampling_params=sampling_params,
-                          multi_modal_kwargs=mm_inputs,
-                          multi_modal_placeholders=mm_position,
-                          multi_modal_hashes=None,
-                          eos_token_id=EOS_TOKEN_ID,
-                          pooling_params=None,
-                          block_hasher=get_request_block_hasher(
-                              block_size, hash_fn))
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
+            request = Request(request_id=f"{i}",
+                              prompt_token_ids=[i] * num_tokens,
+                              sampling_params=sampling_params,
+                              multi_modal_kwargs=None,
+                              multi_modal_placeholders=None,
+                              multi_modal_hashes=None,
+                              eos_token_id=EOS_TOKEN_ID,
+                              pooling_params=None,
+                              block_hasher=get_request_block_hasher(
+                                  block_size, hash_fn))
+        else:
+            request = Request(request_id=f"{i}",
+                              prompt_token_ids=[i] * num_tokens,
+                              sampling_params=sampling_params,
+                              eos_token_id=EOS_TOKEN_ID,
+                              pooling_params=None,
+                              block_hasher=get_request_block_hasher(
+                                  block_size, hash_fn))
         requests.append(request)
     return requests
 
@@ -78,7 +85,7 @@ def make_output(scheduler):
     }
     sampled_token_ids = [[1000]] * len(scheduler.running)
     logprobs = None
-    if vllm_version_is("0.10.1.1"):
+    if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
         modelrunner_output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index=req_id_to_index,
@@ -135,6 +142,8 @@ class TestAscendScheduler(TestBase):
         )
         model_config.pooler_config = MagicMock()
         model_config.multimodal_config = MagicMock()
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.is_encoder_decoder = False
         # Cache config, optionally force APC
         kwargs_cache: Dict[str,
                            Any] = ({} if ENABLE_PREFIX_CACHING is None else {
@@ -295,7 +304,7 @@ class TestAscendScheduler(TestBase):
             scheduler.running.append(req)
             req.status = RequestStatus.RUNNING
 
-        if vllm_version_is("0.10.1.1"):
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=[],
@@ -382,7 +391,7 @@ class TestAscendScheduler(TestBase):
             scheduler.running.append(req)
             req.status = RequestStatus.RUNNING
 
-        if vllm_version_is("0.10.1.1"):
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=[],
@@ -466,7 +475,7 @@ class TestAscendScheduler(TestBase):
             scheduler.running.append(req)
             req.status = RequestStatus.RUNNING
 
-        if vllm_version_is("0.10.1.1"):
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=[],
@@ -547,7 +556,7 @@ class TestAscendScheduler(TestBase):
         scheduler.requests[requests[0].request_id] = requests[0]
         scheduler.running.append(requests[0])
 
-        if vllm_version_is("0.10.1.1"):
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=[],
@@ -643,7 +652,7 @@ class TestAscendScheduler(TestBase):
                 512)
 
             # Model output of the first request.
-            if vllm_version_is("0.10.1.1"):
+            if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                 model_runner_output = ModelRunnerOutput(
                     req_ids=[requests[0].request_id],
                     req_id_to_index={requests[0].request_id: 0},
@@ -669,7 +678,7 @@ class TestAscendScheduler(TestBase):
             # request is still running.
             scheduler.schedule()
             # Model output of the second request.
-            if vllm_version_is("0.10.1.1"):
+            if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                 model_runner_output = ModelRunnerOutput(
                     req_ids=[requests[1].request_id],
                     req_id_to_index={requests[1].request_id: 0},
@@ -737,7 +746,7 @@ class TestAscendScheduler(TestBase):
                 req_id = requests[i].request_id
                 self.assertEqual(output.num_scheduled_tokens[req_id], 1)
                 self.assertNotIn(req_id, output.scheduled_spec_decode_tokens)
-            if vllm_version_is("0.10.1.1"):
+            if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                 model_runner_output = ModelRunnerOutput(
                     req_ids=req_ids,
                     req_id_to_index=req_to_index,
@@ -758,7 +767,7 @@ class TestAscendScheduler(TestBase):
 
             engine_core_outputs = scheduler.update_from_output(
                 output, model_runner_output)
-            if not vllm_version_is("0.10.1.1"):
+            if not (vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1")):
                 scheduler.update_draft_token_ids(draft_token_ids)
 
             for i in range(len(requests)):
@@ -795,7 +804,7 @@ class TestAscendScheduler(TestBase):
                 else:
                     self.assertNotIn(req_id,
                                      output.scheduled_spec_decode_tokens)
-            if vllm_version_is("0.10.1.1"):
+            if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                 model_runner_output = ModelRunnerOutput(
                     req_ids=req_ids,
                     req_id_to_index=req_to_index,

@@ -39,6 +39,8 @@ from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
+from vllm_ascend.utils import vllm_version_is
+
 
 @dataclass
 class CachedRequestState:
@@ -61,6 +63,10 @@ class CachedRequestState:
     mrope_position_delta: Optional[int] = None
 
     lora_request: Optional[LoRARequest] = None
+
+    # cp param
+    kv_rank: Optional[tuple[int]] = None
+    num_computed_tokens_of_cp_sp: Optional[list[list[int]]] = None
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -264,6 +270,10 @@ class InputBatch:
 
         self.pooling_params: dict[str, PoolingParams] = {}
 
+        # cp param
+        self.kv_rank: list[tuple[int]] = [None] * max_num_reqs
+        self.num_computed_tokens_of_cp_sp: list[list[list[int]]] = [None] * max_num_reqs
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -309,6 +319,10 @@ class InputBatch:
             self.req_output_token_ids[req_index] = request.output_token_ids
 
         self.req_id_to_index[req_id] = req_index
+
+        # cp param
+        self.kv_rank[req_index] = request.kv_rank
+        self.num_computed_tokens_of_cp_sp[req_index] = request.num_computed_tokens_of_cp_sp
 
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = len(request.prompt_token_ids)
@@ -724,13 +738,20 @@ class InputBatch:
             pooling_params = [
                 self.pooling_params[req_id] for req_id in self.req_ids
             ]
-
-        return PoolingMetadata(
-            prompt_lens=torch.from_numpy(
-                self.num_prompt_tokens[:self.num_reqs]).to(self.device),
-            prompt_token_ids=self.sampling_metadata.prompt_token_ids,
-            pooling_params=pooling_params,
-        )
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
+            return PoolingMetadata(
+                prompt_lens=torch.from_numpy(
+                    self.num_prompt_tokens[:self.num_reqs]).to(self.device),
+                prompt_token_ids=self.sampling_metadata.prompt_token_ids,
+                pooling_params=pooling_params,
+            )
+        else:
+            return PoolingMetadata(
+                prompt_lens=torch.from_numpy(
+                    self.num_prompt_tokens[:self.num_reqs]),
+                prompt_token_ids=self.sampling_metadata.prompt_token_ids,
+                pooling_params=pooling_params,
+            )
 
     def _make_prompt_token_ids_tensor(self) -> torch.Tensor:
         max_prompt_len = self.num_prompt_tokens[:self.num_reqs].max()
