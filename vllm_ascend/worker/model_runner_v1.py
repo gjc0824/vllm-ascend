@@ -1422,7 +1422,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                         dtype=torch.bool), 1)
             computed_lens_cp_sp = np.array(self.input_batch.num_computed_tokens_cp_sp[:num_reqs])
             prefix_attn_seqlens_kv_allrank = np.sum(computed_lens_cp_sp.reshape(-1, self.cp_sp_size), axis=1).tolist()
-            prefix_attn_seqlens = torch.tensor([chunk_seqlens, prefix_attn_seqlens_kv_allrank], dtype=torch.int32)
+            prefix_attn_seqlens = torch.tensor([num_scheduled_tokens.tolist(), prefix_attn_seqlens_kv_allrank], dtype=torch.int32)
             prefix_attn_seqlens_kv = torch.tensor(computed_lens_cp_sp[:, self.cp_rank, self.sp_rank], dtype=torch.int32).to(self.device)
 
             self.extra_long_seq_kwargs = {
@@ -2190,27 +2190,27 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         extra_args = ({"kv_connector_output": kv_connector_output})
 
-        # if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
-        #     model_runner_output = ModelRunnerOutput(
-        #         req_ids=self.input_batch.req_ids,
-        #         req_id_to_index=self.input_batch.req_id_to_index,
-        #         sampled_token_ids=valid_sampled_token_ids,
-        #         logprobs=logprobs_lists,
-        #         spec_token_ids=self._draft_token_ids,
-        #         prompt_logprobs_dict=prompt_logprobs_dict,
-        #         pooler_output=[],
-        #         **extra_args,
-        #     )
-        # else:
-        model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
-            **extra_args,
-        )
+        if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
+            model_runner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=logprobs_lists,
+                spec_token_ids=self._draft_token_ids,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                **extra_args,
+            )
+        else:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=logprobs_lists,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                **extra_args,
+            )
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
