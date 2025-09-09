@@ -4,7 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
-from vllm.config import (CacheConfig, KVTransferConfig, ModelConfig,
+import numpy as np
+
+from vllm.config import (CacheConfig, KVTransferConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig, VllmConfig)
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.sampling_params import SamplingParams
@@ -35,7 +37,10 @@ MAX_NUM_BATCHED_TOKENS = 10000
 LONG_PREFILL_TOKEN_THRESHOLD = 0
 NUM_SPECULATIVE_TOKENS = None
 MAX_NUM_SEQS = 16
-
+TENSOR_PARALLEL_SIZE = 1
+ENABLE_SEQUENCE_PARALLEL = False
+CONTEXT_PARALLEL_SIZE = 1
+BLOCK_SIZE = 16
 
 def create_requests(
     num_requests: int,
@@ -45,8 +50,11 @@ def create_requests(
     stop_token_ids: Optional[list[int]] = None,
     block_size: int = 3,
     hash_fn=hash,
+    init_hash=True,
+    request_id_offset=0,
 ):
-    init_none_hash(hash_fn)
+    if init_hash:
+        init_none_hash(hash_fn)
     prompt_logprobs = PROMPT_LOGPROBS
     sampling_params = SamplingParams(ignore_eos=False,
                                      max_tokens=max_tokens,
@@ -55,7 +63,7 @@ def create_requests(
     requests = []
     for i in range(num_requests):
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
-            request = Request(request_id=f"{i}",
+            request = Request(request_id=f"{i+request_id_offset}",
                               prompt_token_ids=[i] * num_tokens,
                               sampling_params=sampling_params,
                               multi_modal_kwargs=None,
@@ -66,7 +74,7 @@ def create_requests(
                               block_hasher=get_request_block_hasher(
                                   block_size, hash_fn))
         else:
-            request = Request(request_id=f"{i}",
+            request = Request(request_id=f"{i+request_id_offset}",
                               prompt_token_ids=[i] * num_tokens,
                               sampling_params=sampling_params,
                               eos_token_id=EOS_TOKEN_ID,
@@ -115,7 +123,7 @@ class TestAscendScheduler(TestBase):
     def create_scheduler(self, mock_compute_encoder_budget):
         mock_compute_encoder_budget.return_value = [10, 20]
         use_kv_connector = False
-        block_size = 16
+        block_size = BLOCK_SIZE
 
         scheduler_config = SchedulerConfig(
             max_num_seqs=16,
@@ -169,12 +177,17 @@ class TestAscendScheduler(TestBase):
             speculative_config = SpeculativeConfig(
                 model="ngram", num_speculative_tokens=NUM_SPECULATIVE_TOKENS)
 
+        parallel_config = ParallelConfig(tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+                            enable_sequence_parallel=ENABLE_SEQUENCE_PARALLEL,
+                            context_parallel_size=CONTEXT_PARALLEL_SIZE)
+
         vllm_config = VllmConfig(
             scheduler_config=scheduler_config,
             model_config=model_config,
             cache_config=cache_config,
             kv_transfer_config=kv_transfer_config,
             speculative_config=speculative_config,
+            parallel_config=parallel_config,
         )
 
         kv_cache_config = KVCacheConfig(
@@ -289,6 +302,142 @@ class TestAscendScheduler(TestBase):
         self.assertEqual(len(scheduler.running), len(requests))
         for i, request in enumerate(requests):
             self.assertEqual(scheduler.running[i], request)
+
+    def test_schedule_cpsp(self):
+
+        global BLOCK_SIZE
+        tmp_block_size = BLOCK_SIZE
+        BLOCK_SIZE = 3
+        global TENSOR_PARALLEL_SIZE
+        global ENABLE_SEQUENCE_PARALLEL
+        global CONTEXT_PARALLEL_SIZE
+        TENSOR_PARALLEL_SIZE = 2
+        ENABLE_SEQUENCE_PARALLEL = True
+        CONTEXT_PARALLEL_SIZE = 2
+
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.chunked_prefill_enabled = False
+        requests = create_requests(num_requests=5, num_tokens=13, block_size=BLOCK_SIZE)
+        for request in requests:
+            scheduler.add_request(request)
+
+        # Test initial scheduling
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        # Verify all requests are scheduled.
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            self.assertEqual(num_tokens,
+                             len(requests[int(req_id)].prompt_token_ids))
+            self.assertEqual(CONTEXT_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[int(req_id)].block_ids[0]))
+            self.assertEqual(TENSOR_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[int(req_id)].block_ids[0][0]))
+            self.assertEqual(CONTEXT_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[int(req_id)].num_scheduled_tokens_cp_sp))
+            self.assertEqual(TENSOR_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[int(req_id)].num_scheduled_tokens_cp_sp[0]))
+
+            num_blocks = sum([len(output.scheduled_new_reqs[int(req_id)].block_ids[0][cp_rank][sp_rank])
+                for sp_rank in range(TENSOR_PARALLEL_SIZE) for cp_rank in range(CONTEXT_PARALLEL_SIZE)])
+            num_blocks_golden = np.ceil(len(requests[int(req_id)].prompt_token_ids) / BLOCK_SIZE)
+            self.assertEqual(num_blocks, num_blocks_golden)
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests))
+        for i, request in enumerate(requests):
+            self.assertEqual(scheduler.running[i], request)
+
+        BLOCK_SIZE = tmp_block_size
+        TENSOR_PARALLEL_SIZE = 1
+        ENABLE_SEQUENCE_PARALLEL = False
+        CONTEXT_PARALLEL_SIZE = 1
+
+
+    def test_schedule_prefix_cache_cpsp(self):
+
+        global ENABLE_PREFIX_CACHING
+        ENABLE_PREFIX_CACHING = True
+        global BLOCK_SIZE
+        tmp_block_size = BLOCK_SIZE
+        BLOCK_SIZE = 3
+        global TENSOR_PARALLEL_SIZE
+        global ENABLE_SEQUENCE_PARALLEL
+        global CONTEXT_PARALLEL_SIZE
+        TENSOR_PARALLEL_SIZE = 2
+        ENABLE_SEQUENCE_PARALLEL = True
+        CONTEXT_PARALLEL_SIZE = 2
+
+        scheduler = self.create_scheduler()
+        scheduler.scheduler_config.chunked_prefill_enabled = False
+        requests = create_requests(num_requests=5, num_tokens=13, block_size=BLOCK_SIZE)
+        for request in requests:
+            scheduler.add_request(request)
+
+        # Test initial scheduling
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        # Verify all requests are scheduled.
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            self.assertEqual(num_tokens,
+                             len(requests[int(req_id)].prompt_token_ids))
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests))
+        for i, request in enumerate(requests):
+            self.assertEqual(scheduler.running[i], request)
+
+        # prefix cache
+        request_id_offset=10
+        requests_cachehit = create_requests(num_requests=5, num_tokens=13, block_size=BLOCK_SIZE, init_hash=False, request_id_offset=request_id_offset)
+        for request in requests_cachehit:
+            scheduler.add_request(request)
+
+        # Test initial scheduling
+        output = scheduler.schedule()
+        self.assertEqual(len(output.scheduled_new_reqs), len(requests_cachehit))
+        self.assertEqual(output.scheduled_cached_reqs.num_reqs, 0)
+        self.assertEqual(len(output.finished_req_ids), 0)
+        # Verify all requests are scheduled.
+
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            req_id_prefix = int(req_id)-request_id_offset
+            self.assertTrue(num_tokens < len(requests_cachehit[req_id_prefix].prompt_token_ids))
+            self.assertEqual(num_tokens + output.scheduled_new_reqs[req_id_prefix].num_computed_tokens,
+                             len(requests_cachehit[req_id_prefix].prompt_token_ids))
+            self.assertEqual(CONTEXT_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].block_ids[0]))
+            self.assertEqual(TENSOR_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].block_ids[0][0]))
+            self.assertEqual(CONTEXT_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].num_scheduled_tokens_cp_sp))
+            self.assertEqual(TENSOR_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].num_scheduled_tokens_cp_sp[0]))
+            self.assertEqual(CONTEXT_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].num_computed_tokens_cp_sp))
+            self.assertEqual(TENSOR_PARALLEL_SIZE,
+                    len(output.scheduled_new_reqs[req_id_prefix].num_computed_tokens_cp_sp[0]))
+
+            num_blocks = sum([len(output.scheduled_new_reqs[req_id_prefix].block_ids[0][cp_rank][sp_rank])
+                for sp_rank in range(TENSOR_PARALLEL_SIZE) for cp_rank in range(CONTEXT_PARALLEL_SIZE)])
+            num_blocks_golden = np.ceil(len(requests[req_id_prefix].prompt_token_ids) / BLOCK_SIZE)
+            self.assertEqual(num_blocks, num_blocks_golden)
+
+        # Verify requests moved from waiting to running
+        self.assertEqual(len(scheduler.waiting), 0)
+        self.assertEqual(len(scheduler.running), len(requests+requests_cachehit))
+        for i, request in enumerate(requests+requests_cachehit):
+            self.assertEqual(scheduler.running[i], request)
+
+        BLOCK_SIZE = tmp_block_size
+        TENSOR_PARALLEL_SIZE = 1
+        ENABLE_SEQUENCE_PARALLEL = False
+        CONTEXT_PARALLEL_SIZE = 1
 
     def test_stop_via_update_from_output(self):
         """Test stopping behavior through update_from_output"""
