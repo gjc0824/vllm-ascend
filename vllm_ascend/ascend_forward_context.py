@@ -104,7 +104,7 @@ def set_ascend_forward_context(
         # NOTE: This cannot be set using set_forward_context
         # due to multiple warmups before actual capturing
         forward_context.capturing = False
-
+        forward_context.enable_sp = vllm_config.parallel_config.enable_sequence_parallel
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 

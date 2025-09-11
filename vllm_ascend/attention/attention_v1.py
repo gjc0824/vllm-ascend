@@ -37,6 +37,7 @@ from vllm.distributed import (get_context_model_parallel_world_size,
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
+from vllm_ascend.ops.sequence_parallel import init_metadata_for_sp, MetadataForPadding
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d, nd_to_nz_spec)
 from vllm_ascend.worker.npu_input_batch import InputBatch
@@ -124,9 +125,14 @@ class AscendAttentionState(Enum):
     ChunkedPrefill = 3
     SpecDecoding = 4
 
+@dataclass
+class AscendSpMetadata:
+    enable_sp: bool = False
+    metadata_for_padding: MetadataForPadding = None
+
 
 @dataclass
-class AsecendCpMetadata:
+class AscendCpMetadata:
     cp_kv_recover_idx: list[int] = None
     q_head_idx: torch.Tensor = None
     q_tail_idx: torch.Tensor = None
@@ -144,7 +150,9 @@ class AsecendCpMetadata:
 @dataclass
 class AscendPrefillMetadata:
     """ Prefill Specific Metadata for Ascend"""
-    cp_metadata: AsecendCpMetadata = None
+    cp_metadata: AscendCpMetadata = None
+    sp_metadata: AscendSpMetadata = None
+    cp_kv_recover_idx: list[int] = None
 
 
 @dataclass
@@ -262,7 +270,7 @@ class AscendAttentionMetadataBuilder:
             cp_metadata = None
             common_long_seq_metadata = common_attn_metadata.common_long_seq_metadata
             if common_long_seq_metadata is not None:
-                cp_metadata = AsecendCpMetadata(
+                cp_metadata = AscendCpMetadata(
                     cp_kv_recover_idx=common_long_seq_metadata.cp_kv_recover_idx,
                     q_head_idx=common_long_seq_metadata.q_head_idx_tensor,
                     q_tail_idx=common_long_seq_metadata.q_tail_idx_tensor,
@@ -277,7 +285,8 @@ class AscendAttentionMetadataBuilder:
                     cp_prefill_mask=common_long_seq_metadata.cp_prefill_mask
                 )
             prefill_metadata = AscendPrefillMetadata(
-                cp_metadata=cp_metadata
+                cp_metadata=cp_metadata,
+                cp_kv_recover_idx=common_long_seq_metadata.cp_kv_recover_idx if common_long_seq_metadata is not None else None
             )
 
         decode_metadata = None
@@ -305,6 +314,17 @@ class AscendAttentionMetadataBuilder:
             decode=decode_metadata
         )
         return attn_metadata
+
+    def update_attn_metadata_for_sp(self, input_ids: torch.Tensor, vllm_config: VllmConfig,
+                                    attn_metadata: AscendMetadata):
+        if attn_metadata.num_prefills > 0:
+            enable_sequence_parallelism = (
+                vllm_config.compilation_config.pass_config.
+                enable_sequence_parallelism if vllm_config is not None else False)
+            _metadata_for_padding = init_metadata_for_sp(input_ids, enable_sequence_parallelism, is_perifll=True)
+            sp_metadata = AscendSpMetadata(metadata_for_padding=_metadata_for_padding,
+                                           enable_sp=enable_sequence_parallelism)
+            attn_metadata.prefill.sp_metadata = sp_metadata
 
 
 class AscendAttentionBackendImpl(AttentionImpl):
@@ -651,13 +671,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # 1. Attention calculation in the first half of Q in load balancing
         output_head = self._attention_with_nomask_and_mask(
             q=torch.index_select(query, 0, q_head_idx),
-            q_seqlens=[attn_mask_seqlens[0]],
+            q_seqlens=attn_mask_seqlens[0].tolist(),
             k_nomask=torch.index_select(key, 0, kv_with_q_head_nomask_idx) if self.cp_rank > 0 else None,
             v_nomask=torch.index_select(value, 0, kv_with_q_head_nomask_idx) if self.cp_rank > 0 else None,
-            kv_seqlens_nomask=[head_attn_nomask_seqlens[1]],
+            kv_seqlens_nomask=head_attn_nomask_seqlens[1].tolist(),
             k_mask=torch.index_select(key, 0, kv_with_q_head_mask_idx),
             v_mask=torch.index_select(value, 0, kv_with_q_head_mask_idx),
-            kv_seqlens_mask=[attn_mask_seqlens[0]],
+            kv_seqlens_mask=attn_mask_seqlens[0].tolist(),
             mask=mask)
 
         # 2. the Attention calculation in the latter half of Q in load balancing
@@ -665,13 +685,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # cp_rank1: Q2*KV0~KV1 + Q2*KV2
         output_tail = self._attention_with_nomask_and_mask(
             q=torch.index_select(query, 0, q_tail_idx),
-            q_seqlens=[attn_mask_seqlens[0]],
+            q_seqlens=attn_mask_seqlens[0].tolist(),
             k_nomask=torch.index_select(key, 0, kv_with_q_tail_nomask_idx),
             v_nomask=torch.index_select(value, 0, kv_with_q_tail_nomask_idx),
-            kv_seqlens_nomask=[tail_attn_nomask_seqlens[1]],
+            kv_seqlens_nomask=tail_attn_nomask_seqlens[1].tolist(),
             k_mask=torch.index_select(key, 0, kv_with_q_tail_mask_idx),
             v_mask=torch.index_select(value, 0, kv_with_q_tail_mask_idx),
-            kv_seqlens_mask=[attn_mask_seqlens[0]],
+            kv_seqlens_mask=attn_mask_seqlens[0].tolist(),
             mask=mask)
 
         # 3. Combine the output of the first half and second half.

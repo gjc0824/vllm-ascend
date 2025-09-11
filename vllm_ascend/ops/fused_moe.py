@@ -225,8 +225,7 @@ class AscendFusedMoE(FusedMoE):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
-        apply_router_weight_on_input: bool = False,
-        enable_sp: bool = False,
+        apply_router_weight_on_input: bool = False
     ):
         # TODO: This could not initialize FusedMoE baseclass,
         # fixme and make __init__() of AscendFusedMoE more clear
@@ -288,7 +287,6 @@ class AscendFusedMoE(FusedMoE):
         self.activation = activation
         self.log2phy = None
         self.global_redundant_expert_num = 0
-        self.enable_sp = enable_sp
 
         is_deepseek_v3_r1 = self.global_num_experts == 256
         self.rm_router_logits = get_rm_router_logits_state(
@@ -412,6 +410,7 @@ class AscendFusedMoE(FusedMoE):
 
         forward_context = get_forward_context()
         fused_moe_state = forward_context.fused_moe_state
+        self.enable_sp = forward_context.enable_sp
         mc2_mask = forward_context.mc2_mask
         # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
         quantized_x_for_share, dynamic_scale_for_share = None, None
@@ -427,10 +426,6 @@ class AscendFusedMoE(FusedMoE):
         # NOTE enable_sp: qwen3-moe/gqa sp, self.enable_sp: deepseek-v2/mla sp
         # TODO need to use the same enable_sp switch for deepseek & qwen3-moe sp
         if enable_sp or (self.enable_sp and is_prefill):
-            # tp_rank = get_tensor_model_parallel_rank()
-            # mc2_mask_sp = _metadata_for_padding.mc2_mask if _metadata_for_padding is not None else forward_context.mc2_mask
-            # chunk_mc2_mask = torch.tensor_split(mc2_mask_sp, tp_size, dim=0)
-            # mc2_mask = chunk_mc2_mask[tp_rank]
             replace_allreduce = True
 
         if (fused_moe_state not in [

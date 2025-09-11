@@ -14,6 +14,12 @@ _MLP_TP: Optional[GroupCoordinator] = None
 
 _LMTP: Optional[GroupCoordinator] = None
 
+_ENABLE_SP: bool = False
+
+
+def is_sp_enabled():
+    return _ENABLE_SP
+
 
 def get_mc2_group() -> GroupCoordinator:
     assert _MC2 is not None, ("mc2 group is not initialized")
@@ -56,6 +62,8 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                                      get_world_group().local_rank,
                                      backend,
                                      group_name="mc2")
+    global _ENABLE_SP
+    _ENABLE_SP = parallel_config.enable_sequence_parallel
     if envs_ascend.VLLM_ASCEND_ENABLE_MLP_OPTIMIZE:
         global _MLP_TP
         assert _MLP_TP is None, (

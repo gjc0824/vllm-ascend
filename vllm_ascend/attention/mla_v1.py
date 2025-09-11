@@ -24,6 +24,7 @@ from vllm.distributed import (get_tensor_model_parallel_world_size,
                               get_cp_group,
                               get_cpsp_group)
 from vllm.logger import logger
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -538,12 +539,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.q_proj = kwargs['q_proj']
         self.kv_b_proj = kwargs['kv_b_proj']
         self.o_proj = kwargs['o_proj']
-        self.kv_b_proj_full = kwargs['kv_b_proj_full']
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
         self.q_a_proj = kwargs.get('q_a_proj', None)
         self.q_a_layernorm = kwargs.get('q_a_layernorm', None)
-        self.enable_sp = kwargs.get('enable_sp', False)
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -564,8 +563,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.cp_size = get_context_model_parallel_world_size()
         self.cp_rank = get_context_model_parallel_rank()
         self.cp_group = get_cp_group().device_group
-        self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
-        self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
         self.sp_group = get_tp_group().device_group
         self.cp_sp_group = get_cpsp_group().device_group
         self.cp_sp_size = self.cp_size * self.sp_size
@@ -1228,6 +1225,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         has_prefill = attn_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_actual_tokens = attn_metadata.num_actual_tokens
+        forward_context = get_forward_context()
+        self.enable_sp = forward_context.enable_sp
+        if self.enable_sp and has_prefill:
+            need_gather_q_kv =True
         if self.q_a_proj is not None:
             npu_prefetch(self.q_a_proj.weight,
                          hidden_states,
@@ -1248,54 +1249,25 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_preprocess_res = None
         # Preprocess for decode tokens
         if has_decode:
+            self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
             decode_q_c = q_c[:num_decode_tokens]
             cos = attn_metadata.decode.cos
             sin = attn_metadata.decode.sin
-            if self.cp_size * self.sp_size > 1:
-                decode_q_wo_k_up = self.q_proj(decode_q_c)[0] \
-                    .view(-1, self.num_heads, self.qk_head_dim)
-            else:
-                decode_ql_nope, decode_q_pe = \
-                    self._q_proj_and_k_up_proj(decode_q_c)
+            decode_ql_nope, decode_q_pe = \
+                self._q_proj_and_k_up_proj(decode_q_c)
             if self.sp_size > 1:
-                decode_q_wo_k_up = decode_q_wo_k_up.contiguous()
-                decode_q_wo_k_up = get_tp_group().all_gather(decode_q_wo_k_up, 1)
-            if self.cp_size * self.sp_size > 1:
-                decode_q_wo_k_up_pe = decode_q_wo_k_up[..., self.qk_nope_head_dim:]
-                decode_q_wo_k_up_pe = self.rope_single(decode_q_wo_k_up_pe, cos, sin)
-                decode_q_wo_k_up[..., self.qk_nope_head_dim:] = decode_q_wo_k_up_pe
-                decode_kv_no_split = kv_no_split[:num_decode_tokens]
-                kv_c, k_pe = decode_kv_no_split.split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-                k_pe = k_pe.unsqueeze(1) 
-                decode_k_pe = k_pe[:num_decode_tokens]
-                decode_k_pe = self.rope_single(decode_k_pe, cos, sin)
-                k_pe[:num_decode_tokens] = decode_k_pe
-            else:
-                decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+                decode_q_no_split = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
+                decode_q_no_split = get_tp_group().all_gather(decode_q_no_split, 1)
+                decode_ql_nope, decode_q_pe = decode_q_no_split.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
             decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
             decode_kv_no_split = kv_no_split[:num_decode_tokens]
-            if self.cp_size * self.sp_size > 1:
-                kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-                assert len(
-                    kv_cache
-                ) > 1, "the number of kv cache should be greater than 1, namely (nope_cache and rope_cache)"
-                kv_c_normed = kv_c_normed.view(
-                    [num_actual_tokens, self.num_kv_heads, -1])
-                torch_npu._npu_reshape_and_cache(
-                    key=kv_c_normed,
-                    value=k_pe,
-                    key_cache=kv_cache[0],
-                    value_cache=kv_cache[1],
-                    slot_indices=attn_metadata.slot_mapping)
-            else:
-                decode_k_pe, decode_k_nope = self.exec_kv_decode(
+
+            decode_k_pe, decode_k_nope = self.exec_kv_decode(
                 decode_kv_no_split, cos, sin, kv_cache, decode_slots)
-            if self.cp_size * self.sp_size > 1:
-                decode_preprocess_res = DecodeMLAPreprocessResult(decode_q_wo_k_up=decode_q_wo_k_up)
-            else:
-                decode_preprocess_res = DecodeMLAPreprocessResult(
-                    decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
+                
+            decode_preprocess_res = DecodeMLAPreprocessResult(
+                decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
         # Preprocess for prefill tokens
         if has_prefill:
             prefill_kv_no_split = kv_no_split[
@@ -1369,97 +1341,68 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def _forward_decode_sp(
         self,
-        # q_nope: torch.Tensor,
-        # q_pe: torch.Tensor,
-        # k_nope: torch.Tensor,
-        # k_pe: torch.Tensor,
-        q_wo_k_up: torch.Tensor,
-        kv_c_and_k_pe_cache: Tuple[torch.Tensor],
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        block_size: int,
         attn_metadata: AscendMLAMetadata,
-        # enable_multistream_mla: bool = False,
     ) -> torch.Tensor:
-        """
-        Since new page_attn op with softmax_lse return is not ready yet,
-        use npu_ring_mla instead, temporarily.
-        Get kv_cache manually by npu_paged_cache_load, other process is same to prefill.
-        TODO After new op is ready we should abandon this and use the same process as _forward_decode
-        TODO Delete redundant comments before pr
-        """
         decode_meta = attn_metadata.decode
         assert decode_meta is not None
-        num_tokens = q_wo_k_up.size(0)
-
-        q_pe = q_wo_k_up[..., self.qk_nope_head_dim:]
-        q_nope = q_wo_k_up[..., :self.qk_nope_head_dim]
-        decode_metadata = attn_metadata.decode
+        num_tokens = q_nope.size(0)
+        # shape of knope/k_pe for npu graph mode should be:
+        # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
+        if self.enable_sp:
+            num_heads = self.num_heads * self.tp_size
+        else:
+            num_heads = self.num_heads
+        
+        k_nope = k_nope.view(-1, block_size,  self.num_kv_heads,
+                                self.kv_lora_rank)
+        k_pe = k_pe.view(-1, block_size, self.num_kv_heads,
+                            self.qk_rope_head_dim)
+        q_nope = q_nope.view(num_tokens, num_heads, -1)
+        q_pe = q_pe.view(num_tokens, num_heads, -1)
 
         # use cp & sp splited computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_cp_sp = decode_metadata.all_tokens_of_cp_sp # [bs, cp_size, sp_size]
         seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
         seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
         seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
-
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
-        batch_size = seq_len.size(0)
 
         if torch.sum(seq_len).item() == 0:
             # Case that no kv_cache has been stored on this rank, no need to do following computation.
-            attn_output = torch.zeros([batch_size, self.num_heads * self.sp_size, self.v_head_dim], dtype=q_pe.dtype, device=q_pe.device)
-            softmax_lse = torch.zeros([self.num_heads * self.sp_size, batch_size], dtype=torch.float32, device=q_pe.device)
+            attn_output = torch.zeros([num_tokens, num_heads, self.kv_lora_rank], dtype=q_nope.dtype, device=q_nope.device)
+            softmax_lse = torch.full((num_tokens, num_heads, 1), float('-inf'), dtype=q_nope.dtype, device=q_nope.device)
         else:
-            # Normal case.
-            cache_kv_c = kv_c_and_k_pe_cache[0]
-            cache_k_pe = kv_c_and_k_pe_cache[1]
-
-            kv_c_normed, k_pe = torch_npu.atb.npu_paged_cache_load(
-                cache_kv_c,
-                cache_k_pe,
-                decode_metadata.block_table,
-                seq_len.to(q_nope.device),
-                seq_starts=torch.zeros([batch_size], dtype=torch.int32).to(q_nope.device),
+            attn_output = torch.zeros((num_tokens,
+                                    num_heads,
+                                    self.kv_lora_rank),
+                                    dtype=q_nope.dtype,
+                                    device=q_nope.device)
+            
+            softmax_lse = torch.full((num_tokens,
+                                    num_heads,
+                                    1),
+                                    float('-inf'),
+                                    dtype=q_nope.dtype,
+                                    device=q_nope.device)
+            torch_npu.atb.npu_multi_head_latent_attention_with_lse(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                attn_metadata.decode.block_table,
+                seq_len,
+                num_heads,
+                self.scale,
+                self.num_kv_heads,
+                calc_type="calc_type_ring",
+                output=attn_output,
+                lse=softmax_lse
             )
-            # kv_c_normed: [seq, 1, kv_lora_rank(512)], k_pe: [seq, 1, qk_rope_head_dim(64)]
-
-            kv_c_normed = kv_c_normed.squeeze() # [seq, kv_lora_rank(512)]
-            if self.sp_size > 1:
-                # sp > 1, kv splited in sequence dimension, should not do tp here
-                kv_nope = self.kv_b_proj_full(kv_c_normed)[0].view( \
-                    -1, self.num_heads * self.sp_size, self.qk_nope_head_dim + self.v_head_dim)
-                # [seq, kv_lora_rank(512)] -> [seq, num_heads_full * (qk_nope_head_dim + v_head_dim)] -> view to [seq, num_heads_full(16), qk_nope_head_dim + v_head_dim (256)]
-            else:
-                # sp = 1, kv full in sequence dimension, use original tp kv_b_proj
-                kv_nope = self.kv_b_proj(kv_c_normed)[0].view( \
-                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-                # [seq, kv_lora_rank(512)] -> [seq, num_heads * (qk_nope_head_dim + v_head_dim)] -> view to [seq, num_heads(16/tp), qk_nope_head_dim + v_head_dim (256)]
-
-            k_nope, v = kv_nope\
-                .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            # k_nope: [seq, num_heads_full(16), qk_nope_head_dim(128)], v: [seq, num_heads_full(16), v_head_dim(128)]
-            k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
-            mask = torch.triu(
-                torch.ones(512, 512, device=q_nope.device, dtype=q_nope.dtype),
-                1)
-            seq_len_q = torch.ones([batch_size], dtype=torch.int32)
-            seq_len_kv = seq_len
-            seq_len_all = torch.stack([seq_len_q, seq_len_kv])
-
-            attn_output, softmax_lse = torch_npu.atb.npu_ring_mla(
-                q_nope=q_nope,          # [batch_size, num_heads_full(16), qk_nope_head_dim(128)]
-                q_rope=q_pe,            # [batch_size, num_heads_full(16), qk_rope_head_dim(64)]
-                k_nope=k_nope,          # [kv_seq_len, num_heads_full(16), qk_nope_head_dim(128)]
-                k_rope=k_pe,            # [kv_seq_len, num_heads_full(16), qk_rope_head_dim(64)]
-                value=v,                # [kv_seq_len, num_heads_full(16), v_head_dim(128)]
-                mask=mask,
-                seqlen=seq_len_all,     # seq_q + seq_kv, for example: [[1, 1, 1, 1], [9, 7, 7, 7]]
-                head_num=self.num_heads * self.sp_size,
-                kv_head_num=self.num_heads * self.sp_size,
-                qk_scale=self.scale,
-                kernel_type="kernel_type_high_precision",
-                mask_type="no_mask",
-                input_layout="type_bsnd",
-                calc_type="calc_type_first_ring",
-            )
-        # attn_output: [bs, num_heads_full(16), v_head_dim(128)], softmax_lse: [num_heads_full(16), bs]
 
         # TODO use update op to replace this
         def _update_out_and_lse(
@@ -1495,8 +1438,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             return out, lse
 
         # lse: [num_heads,bs] -> [bs,num_heads] -> [bs,num_heads,1]
-        softmax_lse = softmax_lse.permute([1, 0]).unsqueeze(dim=-1)
-
         if self.sp_size > 1:
             # Concat out&lse: [bs,num_heads,v_head_dim] + [bs,num_heads,1] -> [bs,num_heads,v_head_dim+1]
             attn_out_lse = torch.cat([attn_output, softmax_lse], dim=-1)
@@ -1511,7 +1452,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_out_g = None
             attn_lse_g = None
             for i, attn_out_lse_l in enumerate(attn_out_lse_split_on_seq):
-                attn_out_l, attn_lse_l = torch.split(attn_out_lse_l, [self.v_head_dim, 1], dim=-1)
+                attn_out_l, attn_lse_l = torch.split(attn_out_lse_l, [self.kv_lora_rank, 1], dim=-1)
                 attn_out_g, attn_lse_g = _update_out_and_lse(attn_out_g, attn_lse_g, attn_out_l, attn_lse_l, seq_mask_sp[:, i])
             attn_output = attn_out_g
             softmax_lse = attn_lse_g
@@ -1526,14 +1467,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_out_g = None
             attn_lse_g = None
             for i, attn_out_lse_l in enumerate(attn_out_lse_list):
-                attn_out_l, attn_lse_l = torch.split(attn_out_lse_l, [self.v_head_dim, 1], dim=-1)
+                attn_out_l, attn_lse_l = torch.split(attn_out_lse_l, [self.kv_lora_rank, 1], dim=-1)
                 attn_out_g, attn_lse_g = _update_out_and_lse(attn_out_g, attn_lse_g, attn_out_l, attn_lse_l, seq_mask_cp[:, i])
             attn_output = attn_out_g
-
-        attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim]).to(torch.bfloat16)
+        attn_output = attn_output.reshape([num_tokens, self.num_heads * self.kv_lora_rank])
         # out = self.o_proj(attn_output, is_prefill=False)[0]
-        out = attn_output
-        return out
+        current_ms_metadata = get_multistream_comm_context()
+        if current_ms_metadata is None:
+            return self._v_up_proj(attn_output)
+        else:
+            current_ms_metadata.before_comm_event.record()
+            with torch.npu.stream(current_ms_metadata.comm_stream):
+                current_ms_metadata.before_comm_event.wait()
+                return self._v_up_proj(attn_output)
 
     def forward(
         self,
@@ -1567,10 +1513,18 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if decode_preprocess_res is not None:
             # MLA Preprocess for decoding
+            forward_context = get_forward_context()
+            self.enable_sp = forward_context.enable_sp
+            self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
+            self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
             if self.cp_size * self.sp_size > 1:
-                output_decode = self._forward_decode_sp(decode_preprocess_res.decode_q_wo_k_up,
-                                                        kv_cache,
-                                                        attn_metadata)
+                output_decode = self._forward_decode_sp(decode_preprocess_res.ql_nope,
+                                                        decode_preprocess_res.q_pe,
+                                                        decode_preprocess_res.k_nope,
+                                                        decode_preprocess_res.k_pe,
+                                                        kv_cache[0].shape[1],
+                                                        attn_metadata,
+                                                        )
             else:
                 output_decode = self._forward_decode(decode_preprocess_res.ql_nope,
                                                      decode_preprocess_res.q_pe,
@@ -1618,9 +1572,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                          enabled=self.enable_prefetch)
 
             output[...] = self.o_proj(
-                o_proj_input,
-                is_prefill=prefill_preprocess_res is not None,
-                is_force_scatter=self.enable_shared_expert_dp)[0]
+                o_proj_input)[0]
         else:
             with torch.npu.stream(current_ms_metadata.comm_stream):
                 npu_prefetch(self.o_proj.weight,

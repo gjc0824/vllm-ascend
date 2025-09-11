@@ -38,7 +38,9 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CompilationLevel, CUDAGraphMode, VllmConfig
 from vllm.distributed import (get_tensor_model_parallel_world_size,
-                              get_tensor_model_parallel_rank)
+                              get_tensor_model_parallel_rank,
+                              get_tp_group, 
+                              get_cp_group)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
@@ -86,7 +88,8 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import (AscendAttentionState,
                                                 AscendMetadata)
 from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendCommonLongSequenceMetadata
+from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata, 
+                                         AscendCommonLongSequenceMetadata)
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.multistream.ms_split import compute_split_seq_index
 from vllm_ascend.platform import NPUPlatform
@@ -100,6 +103,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
+from vllm_ascend.ops.comm_utils import get_sp_metadata_context
 
 if not (vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1")):
     from vllm.v1.outputs import DraftTokenIds
@@ -1413,7 +1417,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             head_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_head_nomask_seqlens], dtype=torch.int32)
             tail_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_tail_nomask_seqlens], dtype=torch.int32)
             if self.vllm_config.model_config.use_mla:
-                cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=torch.bfloat16), 1)
+                cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=self.dtype), 1)
             else:
                 max_seq_len = max(seq_lens, default=0)
                 cp_prefill_mask = torch.triu(torch.full((seq_lens.shape[0], max_seq_len, max_seq_len),
@@ -1547,6 +1551,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             input_ids, positions, num_input_tokens, with_prefill,
             maybe_padded_num_tokens)
 
+        if hasattr(self.attn_metadata_builder, 'update_attn_metadata_for_sp'):
+            self.attn_metadata_builder.update_attn_metadata_for_sp(input_ids, self.vllm_config, attn_metadata)
+
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
@@ -1615,6 +1622,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        # SP for GQA
+        sp_metadata, _ = get_sp_metadata_context()
+        if sp_metadata and sp_metadata.metadata_for_padding and \
+                sp_metadata.metadata_for_padding.not_dummy_and_is_prefill:
+            hidden_states = sp_metadata.metadata_for_padding.allgather_unpadding_aligned(
+                hidden_states)
+        # SP for MLA
+        if self.enable_sp and with_prefill:
+            hidden_states = get_tp_group().all_gather(hidden_states, 0)
+            hidden_states = hidden_states[:attn_metadata.num_input_tokens]
+        # CP for MLA and GQA
+        if self.cp_size > 1 and with_prefill:
+            hidden_states = get_cp_group().all_gather(hidden_states, 0)
+            hidden_states = torch.index_select(hidden_states, 0, attn_metadata.prefill.cp_kv_recover_idx)
         return hidden_states
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
