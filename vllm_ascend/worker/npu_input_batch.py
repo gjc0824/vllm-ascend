@@ -64,9 +64,10 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
 
-    # cp param
+    # cp sp param
     kv_rank: Optional[tuple[int]] = None
-    num_computed_tokens_of_cp_sp: Optional[list[list[int]]] = None
+    num_scheduled_tokens_cp_sp: Optional[list[list[int]]] = None
+    num_computed_tokens_cp_sp: Optional[list[list[int]]] = None
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -270,9 +271,10 @@ class InputBatch:
 
         self.pooling_params: dict[str, PoolingParams] = {}
 
-        # cp param
+        # cp sp param
         self.kv_rank: list[tuple[int]] = [None] * max_num_reqs
-        self.num_computed_tokens_of_cp_sp: list[list[list[int]]] = [None] * max_num_reqs
+        self.num_scheduled_tokens_cp_sp: list[list[list[int]]] = [None] * max_num_reqs
+        self.num_computed_tokens_cp_sp: list[list[list[int]]] = [None] * max_num_reqs
 
     @property
     def req_ids(self) -> list[str]:
@@ -320,9 +322,10 @@ class InputBatch:
 
         self.req_id_to_index[req_id] = req_index
 
-        # cp param
+        # cp sp param
         self.kv_rank[req_index] = request.kv_rank
-        self.num_computed_tokens_of_cp_sp[req_index] = request.num_computed_tokens_of_cp_sp
+        self.num_scheduled_tokens_cp_sp[req_index] = request.num_scheduled_tokens_cp_sp
+        self.num_computed_tokens_cp_sp[req_index] = request.num_computed_tokens_cp_sp
 
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = len(request.prompt_token_ids)

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import numpy as np
 
 
 @dataclass
@@ -10,7 +11,15 @@ class AscendCommonLongSequenceMetadata:
 
     num_actual_tokens_cp_full: int = None
 
-    num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
+    all_tokens_of_cp_sp: np.array = None
+
+    computed_lens_cp_sp: np.array = None
+
+    prefix_attn_seqlens: torch.Tensor = None
+
+    prefix_attn_seqlens_kv: torch.Tensor = None
+
+    prefix_kv_recover_idx: torch.Tensor = None
 
     q_head_idx_tensor: torch.Tensor = None
 
