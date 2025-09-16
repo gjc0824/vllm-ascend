@@ -371,9 +371,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.key_cache = None
         self.value_cache = None
 
-        self.cp_group = get_cp_group().device_group
         self.cp_size = get_context_model_parallel_world_size()
-        self.cp_rank = get_context_model_parallel_rank()
+        self.cp_rank = get_context_model_parallel_rank() if self.cp_size > 1 else 0
+        self.cp_group = get_cp_group().device_group if self.cp_size > 1 else None
 
     def _forward_prefill_no_cache(
         self,
