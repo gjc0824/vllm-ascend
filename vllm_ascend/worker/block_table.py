@@ -5,7 +5,7 @@ import torch
 from vllm.distributed import get_dcp_group
 from vllm.utils import cdiv
 
-from vllm_ascend.utils import context_parallel_enable
+from vllm_ascend.utils import context_parallel_enable, kv_cache_block_align
 
 if context_parallel_enable():
     from vllm.distributed import get_cp_group
@@ -167,10 +167,15 @@ class BlockTable:
             # tokens.
             virtual_block_offsets = positions % virtual_block_size
             self.current_rank = self.dcp_world_size * self.cp_rank + self.dcp_rank
-            mask = (virtual_block_offsets %
-                    (self.dcp_world_size * self.cp_world_size) == self.current_rank)
-            # Calculate local block_offsets
-            block_offsets = virtual_block_offsets // (self.dcp_world_size * self.cp_world_size)
+            # kv_cache block align: token i is stored to rank (i // block_size) % (cp * dcp)
+            # kv_cache block not align: token i is stored to rank i % (cp * dcp)
+            if kv_cache_block_align():
+                mask = (virtual_block_offsets // self.block_size == self.current_rank)
+                block_offsets = virtual_block_offsets % self.block_size
+            else:
+                mask = (virtual_block_offsets %
+                        (self.dcp_world_size * self.cp_world_size) == self.current_rank)
+                block_offsets = virtual_block_offsets // (self.dcp_world_size * self.cp_world_size)
             # Calculate slot_mapping
             slot_mapping = block_numbers * self.block_size + block_offsets
             # Write final slots, use -1 for not-local
@@ -240,6 +245,41 @@ class BlockTable:
     def get_numpy_array(self) -> np.ndarray:
         """Returns the numpy array of the block table."""
         return self.block_table_np
+    
+    def get_split_computed_tokens(self, num_computed_tokens: np.ndarray) -> list[list[list[int]]]:
+        "Splits computed token counts across dcp and sp dimensions for distributed allocation."
+        self.cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
+        self.dcp_world_size = get_dcp_group().world_size
+        num_requests = len(num_computed_tokens)
+        num_computed_tokens_of_cp_dcp = [[
+            [0] * self.dcp_world_size for _ in range(self.cp_world_size)
+        ] for _ in range(num_requests)]
+        total_ranks = self.cp_world_size * self.dcp_world_size
+        for req_idx in range(num_requests):
+            total_tokens = num_computed_tokens[req_idx]
+            if total_tokens <= 0:
+                continue
+            if kv_cache_block_align():
+                block_num = int(total_tokens) // self.block_size
+                base = block_num // total_ranks
+                remainder = total_tokens - base * total_ranks * self.block_size
+                for rank_idx in range(total_ranks):
+                    cp_idx = rank_idx // self.dcp_world_size
+                    dcp_idx = rank_idx % self.dcp_world_size
+                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][dcp_idx] = base * self.block_size
+                    if remainder > 0:
+                        num_computed_tokens_of_cp_dcp[req_idx][cp_idx][dcp_idx] += min(self.block_size, remainder)
+                        remainder = max(0, remainder - self.block_size)
+            else:
+                base = int(total_tokens) // total_ranks
+                remainder = int(total_tokens) % total_ranks
+                for rank_idx in range(total_ranks):
+                    cp_idx = rank_idx // self.dcp_world_size
+                    dcp_idx = rank_idx % self.dcp_world_size
+                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][dcp_idx] = base
+                    if rank_idx < remainder:
+                        num_computed_tokens_of_cp_dcp[req_idx][cp_idx][dcp_idx] += 1
+        return num_computed_tokens_of_cp_dcp
 
 
 class MultiGroupBlockTable:
@@ -260,7 +300,7 @@ class MultiGroupBlockTable:
         # must be multiplied by dcp_world_size.
         try:
             dcp_world_size = get_dcp_group().world_size
-            cp_world_size = get_cp_group().world_size
+            cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
         except AssertionError:
             # DCP might not be initialized in testing
             dcp_world_size = 1
@@ -316,28 +356,12 @@ class MultiGroupBlockTable:
         for block_table in self.block_tables:
             block_table.commit_slot_mapping(num_tokens)
 
-    def get_split_computed_tokens(self, num_computed_tokens: np.ndarray) -> list[list[list[int]]]:
-        "Splits computed token counts across dcp and sp dimensions for distributed allocation."
-        self.cp_world_size = get_cp_group().world_size if context_parallel_enable() else 1
-        self.dcp_world_size = get_dcp_group().world_size
-        num_requests = len(num_computed_tokens)
-        num_computed_tokens_of_cp_dcp = [[
-            [0] * self.dcp_world_size for _ in range(self.cp_world_size)
-        ] for _ in range(num_requests)]
-        total_ranks = self.cp_world_size * self.dcp_world_size
-        for req_idx in range(num_requests):
-            total_tokens = num_computed_tokens[req_idx]
-            if total_tokens <= 0:
-                continue
-            base = int(total_tokens) // total_ranks
-            remainder = int(total_tokens) % total_ranks
-            for rank_idx in range(total_ranks):
-                cp_idx = rank_idx // self.dcp_world_size
-                sp_idx = rank_idx % self.dcp_world_size
-                num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] = base
-                if rank_idx < remainder:
-                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += 1
-        return num_computed_tokens_of_cp_dcp
+    def get_split_computed_tokens(self, num_computed_tokens: np.ndarray) -> list[list[list[list[int]]]]:
+        "Splits computed token counts across cp and dcp dimensions for distributed allocation."
+        split_num_computed_tokens = []
+        for block_table in self.block_tables:
+            split_num_computed_tokens.append(block_table.get_split_computed_tokens(num_computed_tokens))
+        return split_num_computed_tokens
 
     def clear(self) -> None:
         for block_table in self.block_tables:

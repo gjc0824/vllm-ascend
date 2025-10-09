@@ -578,6 +578,10 @@ def oproj_tp_enable() -> bool:
     return get_ascend_config().oproj_tensor_parallel_size is not None
 
 
+def kv_cache_block_align() -> bool:
+    return get_ascend_config().kv_cache_block_align
+
+
 def mlp_tp_enable() -> bool:
     return envs_ascend.VLLM_ASCEND_ENABLE_MLP_OPTIMIZE
 
