@@ -92,6 +92,12 @@ class AscendConfig:
                 raise AssertionError(
                     "oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
+        self.kv_cache_block_align = additional_config.get("kv_cache_block_align", False)
+        if not self.kv_cache_block_align and vllm_config.kv_transfer_config is not None and \
+            vllm_config.parallel_config.decode_context_parallel_size * vllm_config.parallel_config.context_parallel_size > 1:
+            raise AssertionError(
+                "In P/D disaggregate scenario, kv_cache_block_align must be enabled if use cp or dcp > 1."
+            )
 
 
 class TorchairGraphConfig:
