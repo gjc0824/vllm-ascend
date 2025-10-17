@@ -48,6 +48,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self_device_group = None
         self_cpu_group = None
         hccl_pg_options = create_hccl_pg_options(group_name)
+
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks,
@@ -111,4 +112,4 @@ class GroupCoordinatorPatch(GroupCoordinator):
                                                    gather_sizes)
 
 
-vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch  # Note: check the GroupCoordinator with online serving
+vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch

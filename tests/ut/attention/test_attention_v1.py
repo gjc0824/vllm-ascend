@@ -413,6 +413,7 @@ class TestAscendAttentionBackendImpl(TestBase):
     @patch('torch.npu.graph_task_group_begin')
     @patch('torch.npu.ExternalEvent')
     @patch('torch_npu.npu.current_stream')
+    @patch('vllm_ascend.attention.attention_v1.weak_ref_tensors')
     def test_paged_attention_with_existing_workspace(
         self,
         mock_get_forward_context,
@@ -423,6 +424,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_graph_end,
         mock_external_event_class,
         mock_current_stream,
+        mock_weak_ref_tensors,
     ):
         graph_params = MagicMock()
         attn_metadata = MagicMock()
@@ -459,6 +461,8 @@ class TestAscendAttentionBackendImpl(TestBase):
         workspace = graph_params.workspaces.get(num_tokens)
         self.assertEqual(workspace, 10)
 
+        weak_ref_tensors = MagicMock(side_effect=lambda x: x)
+
         # 2. Handle graph capturing mode
         stream = mock_current_stream()
         event = mock_external_event_class()
@@ -466,13 +470,13 @@ class TestAscendAttentionBackendImpl(TestBase):
         event.reset(stream)
         graph_params.events[num_tokens].append(event)
         graph_params.attn_params[num_tokens].append((
-            query,
-            self_obj.key_cache,
-            self_obj.value_cache,
+            weak_ref_tensors(query),
+            weak_ref_tensors(self_obj.key_cache),
+            weak_ref_tensors(self_obj.value_cache),
             self_obj.num_kv_heads,
             self_obj.num_heads,
             self_obj.scale,
-            attn_metadata.block_tables,
+            weak_ref_tensors(attn_metadata.block_tables),
             attn_metadata.seq_lens,
             output,
         ))
