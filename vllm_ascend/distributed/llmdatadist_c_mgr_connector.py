@@ -951,84 +951,81 @@ class LLMDataDistCMgrConnectorWorker():
             if num_local_blocks < num_remote_blocks:
                 remote_block_ids = remote_block_ids[-num_local_blocks:]
 
-        logger.info(f"remote cluster id is: {remote_cluster_id}")
-        if self.use_mla:
-            remote_cache_key_k_normed = BlocksCacheKey(
-                cluster_id=remote_cluster_id, model_id=0)
-            remote_cache_key_k_pe = BlocksCacheKey(
-                cluster_id=remote_cluster_id, model_id=1)
-            logger.info("Try pull blocks from remote server")
-            try:
-                self.cache_manager.pull_blocks(
-                    remote_cache_key_k_normed,
-                    self.cache[0],  # type: ignore[has-type]
-                    remote_block_ids,
-                    local_block_ids)
-                self.cache_manager.pull_blocks(
-                    remote_cache_key_k_pe,
-                    self.cache[1],  # type: ignore[has-type]    
-                    remote_block_ids,
-                    local_block_ids)
-            except (TypeError, ValueError):
-                raise RuntimeError(
-                    f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key_k_normed} {remote_cache_key_k_pe}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
-                )
-            except LLMException:
-                raise RuntimeError(
-                    "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
-                )
-        elif self.use_sparse:
-            remote_cache_key_k_normed = BlocksCacheKey(
-                cluster_id=remote_cluster_id, model_id=0)
-            remote_cache_key_k_pe = BlocksCacheKey(
-                cluster_id=remote_cluster_id, model_id=1)
-            remote_cache_key_k_idx = BlocksCacheKey(
-                cluster_id=remote_cluster_id, model_id=2)
-            logger.info("Try pull blocks from remote server")
-            try:
-                self.cache_manager.pull_blocks(
-                    remote_cache_key_k_normed,
-                    self.cache[0],  # type: ignore[has-type]
-                    remote_block_ids,
-                    local_block_ids)
-                self.cache_manager.pull_blocks(
-                    remote_cache_key_k_pe,
-                    self.cache[1],  # type: ignore[has-type]    
-                    remote_block_ids,
-                    local_block_ids)
-                self.cache_manager.pull_blocks(
-                    remote_cache_key_k_idx,
-                    self.cache[2],  # type: ignore[has-type]    
-                    remote_block_ids,
-                    local_block_ids)
-            except (TypeError, ValueError):
-                raise RuntimeError(
-                    f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key_k_normed} {remote_cache_key_k_pe} {remote_cache_key_k_idx}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
-                )
-            except LLMException:
-                raise RuntimeError(
-                    "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
-                )
-        else:
-            remote_cache_key = BlocksCacheKey(cluster_id=remote_cluster_id)
-            logger.info("Try pull blocks from remote server")
-            try:
-                self.cache_manager.pull_blocks(
-                    remote_cache_key,
-                    self.cache,  # type: ignore[has-type]
-                    remote_block_ids,
-                    local_block_ids)
-            except (TypeError, ValueError):
-                raise RuntimeError(
-                    f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
-                )
-            except LLMException:
-                raise RuntimeError(
-                    "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
-                )
-        remote_ports = list(
-            range(remote_port + self.tp_rank,
-                  remote_port + int(remote_tp_size), self.tp_size))
+            logger.info(f"remote cluster id is: {remote_cluster_id}")
+            if self.use_mla:
+                remote_cache_key_k_normed = BlocksCacheKey(
+                    cluster_id=remote_cluster_id, model_id=0)
+                remote_cache_key_k_pe = BlocksCacheKey(
+                    cluster_id=remote_cluster_id, model_id=1)
+                logger.info("Try pull blocks from remote server")
+                try:
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key_k_normed,
+                        self.cache[0],  # type: ignore[has-type]
+                        remote_block_ids,
+                        local_block_ids)
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key_k_pe,
+                        self.cache[1],  # type: ignore[has-type]    
+                        remote_block_ids,
+                        local_block_ids)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key_k_normed} {remote_cache_key_k_pe}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
+                    )
+                except LLMException:
+                    raise RuntimeError(
+                        "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
+                    )
+            elif self.use_sparse:
+                remote_cache_key_k_normed = BlocksCacheKey(
+                    cluster_id=remote_cluster_id, model_id=0)
+                remote_cache_key_k_pe = BlocksCacheKey(
+                    cluster_id=remote_cluster_id, model_id=1)
+                remote_cache_key_k_idx = BlocksCacheKey(
+                    cluster_id=remote_cluster_id, model_id=2)
+                logger.info("Try pull blocks from remote server")
+                try:
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key_k_normed,
+                        self.cache[0],  # type: ignore[has-type]
+                        remote_block_ids,
+                        local_block_ids)
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key_k_pe,
+                        self.cache[1],  # type: ignore[has-type]    
+                        remote_block_ids,
+                        local_block_ids)
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key_k_idx,
+                        self.cache[2],  # type: ignore[has-type]    
+                        remote_block_ids,
+                        local_block_ids)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key_k_normed} {remote_cache_key_k_pe} {remote_cache_key_k_idx}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
+                    )
+                except LLMException:
+                    raise RuntimeError(
+                        "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
+                    )
+            else:
+                remote_cache_key = BlocksCacheKey(cluster_id=remote_cluster_id)
+                logger.info("Try pull blocks from remote server")
+                try:
+                    self.cache_manager.pull_blocks(
+                        remote_cache_key,
+                        self.cache,  # type: ignore[has-type]
+                        remote_block_ids,
+                        local_block_ids)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to pull_blocks remote_cache_key: {remote_cache_key}, cache: {self.cache}, local_block_ids: {local_block_ids}, remote_block_ids: {remote_block_ids}"  # type: ignore[has-type]
+                    )
+                except LLMException:
+                    raise RuntimeError(
+                        "LLMDataDistCMgrConnectorWorker: Timeout during pull_blocks, you can try to increase the sync_kv_timeout config or checking your connect status"
+                    )
         self.send_finish_to_remote(remote_ip, remote_ports, request_id)
         with self.thread_lock:
             self.finished_reqs.add(request_id)
