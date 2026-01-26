@@ -14,11 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-
+from collections import deque
+from typing import List, Optional, Union
 
 import torch
 import vllm
-from torch.distributed import Backend
+from torch import Tensor
+from torch.distributed import Backend, Work
 from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
@@ -86,6 +88,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
         self.use_custom_op_call = False
         self.use_cpu_custom_send_recv = False
+        self._async_send_buff:deque[tuple[Work, Tensor]] = deque()
 
     def all_to_all(
         self,

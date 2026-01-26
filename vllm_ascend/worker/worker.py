@@ -372,7 +372,7 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        get_pp_group().send_tensor_dict(output.tensors, all_gather_group=all_gather_group)
+        get_pp_group().send_tensor_dict(output.tensors, all_gather_group=all_gather_group, is_async=True)
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
