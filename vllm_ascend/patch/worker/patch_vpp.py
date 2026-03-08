@@ -103,6 +103,19 @@ def _get_vp_size() -> int:
         return 1
 
 
+def _get_custom_layer_ranges_for_rank() -> list[tuple[int, int]] | None:
+    """Return the manually specified layer ranges for this PP rank, or None."""
+    from vllm_ascend.ascend_config import get_ascend_config
+    try:
+        all_ranges = get_ascend_config().vpp_layer_ranges
+    except RuntimeError:
+        return None
+    if all_ranges is None:
+        return None
+    pp_rank = get_pp_group().rank_in_group
+    return all_ranges[pp_rank]
+
+
 # ---- Patched DeepseekV2Model methods ----
 
 _original_dsv2_model_init = DeepseekV2Model.__init__
@@ -161,12 +174,14 @@ def _vpp_dsv2_model_init(self, *, vllm_config, prefix=""):
     else:
         self.embed_tokens = PPMissingLayer()
 
+    custom_ranges = _get_custom_layer_ranges_for_rank()
     self.vpp_layer_ranges, self.layers = make_vpp_layers(
         config.num_hidden_layers,
         lambda pfx: DeepseekV2DecoderLayer(
             vllm_config, pfx, topk_indices_buffer=topk_indices_buffer),
         f"{prefix}.layers",
         vp_size,
+        custom_layer_ranges=custom_ranges,
     )
     self.start_layer = self.vpp_layer_ranges[0][0]
     self.end_layer = self.vpp_layer_ranges[-1][1]

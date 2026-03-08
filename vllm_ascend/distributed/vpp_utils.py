@@ -47,6 +47,10 @@ def get_vpp_indices(
       even vp: chunk_idx = vp * pp_size + pp_rank        (forward)
       odd  vp: chunk_idx = (vp+1) * pp_size - 1 - pp_rank (backward)
 
+    Supports uneven distribution: when ``num_hidden_layers`` is not
+    divisible by ``pp_size * vp_size``, the first *remainder* chunks
+    each receive one extra layer.
+
     Returns:
         List of (start_layer, end_layer) tuples, one per virtual stage.
         Layer indices are 0-based, end is exclusive.
@@ -56,27 +60,102 @@ def get_vpp_indices(
         [(0, 2), (6, 8)]
         >>> get_vpp_indices(8, 1, 2, 2)
         [(2, 4), (4, 6)]
-        >>> get_vpp_indices(16, 0, 4, 2)
-        [(0, 2), (14, 16)]
-        >>> get_vpp_indices(16, 3, 4, 2)
-        [(6, 8), (8, 10)]
+        >>> get_vpp_indices(61, 0, 4, 2)
+        [(0, 8), (54, 61)]
+        >>> get_vpp_indices(61, 3, 4, 2)
+        [(24, 32), (32, 39)]
     """
     total_chunks = pp_size * vp_size
-    assert num_hidden_layers % total_chunks == 0, (
-        f"num_hidden_layers ({num_hidden_layers}) must be divisible by "
-        f"pp_size * vp_size ({pp_size} * {vp_size} = {total_chunks})"
-    )
-    layers_per_chunk = num_hidden_layers // total_chunks
+    base = num_hidden_layers // total_chunks
+    remainder = num_hidden_layers % total_chunks
+
+    def _chunk_range(chunk_idx: int) -> tuple[int, int]:
+        if chunk_idx < remainder:
+            start = chunk_idx * (base + 1)
+            end = start + base + 1
+        else:
+            start = remainder * (base + 1) + (chunk_idx - remainder) * base
+            end = start + base
+        return (start, end)
+
     ranges: list[tuple[int, int]] = []
     for vp in range(vp_size):
         if vp % 2 == 0:
             chunk_idx = vp * pp_size + pp_rank
         else:
             chunk_idx = (vp + 1) * pp_size - 1 - pp_rank
-        start = chunk_idx * layers_per_chunk
-        end = start + layers_per_chunk
-        ranges.append((start, end))
+        ranges.append(_chunk_range(chunk_idx))
     return ranges
+
+
+def validate_vpp_layer_ranges(
+    layer_ranges: list[list[list[int]]],
+    num_hidden_layers: int,
+    pp_size: int,
+    vp_size: int,
+) -> list[list[tuple[int, int]]]:
+    """Validate and normalize user-provided ``vpp_layer_ranges``.
+
+    Args:
+        layer_ranges: ``pp_size`` entries, each containing ``vp_size``
+            ``[start, end)`` pairs.  Example for pp=4, vp=2, 61 layers::
+
+                [
+                    [[0, 8],  [53, 61]],   # rank 0
+                    [[8, 16], [45, 53]],    # rank 1
+                    [[16, 24],[37, 45]],    # rank 2
+                    [[24, 37]],             # rank 3 (fold-point, may merge)
+                ]
+
+        num_hidden_layers: total layers in the model.
+        pp_size: pipeline parallel size.
+        vp_size: virtual pipeline parallel size.
+
+    Returns:
+        Normalized list of ``list[tuple[int, int]]`` per rank.
+
+    Raises:
+        ValueError on any validation failure.
+    """
+    if len(layer_ranges) != pp_size:
+        raise ValueError(
+            f"vpp_layer_ranges must have {pp_size} entries (one per PP rank), "
+            f"got {len(layer_ranges)}.")
+
+    normalized: list[list[tuple[int, int]]] = []
+    all_indices: set[int] = set()
+
+    for rank, rank_ranges in enumerate(layer_ranges):
+        if len(rank_ranges) != vp_size:
+            raise ValueError(
+                f"Rank {rank}: expected {vp_size} layer ranges "
+                f"(one per virtual stage), got {len(rank_ranges)}.")
+        rank_tuples: list[tuple[int, int]] = []
+        for stage_idx, pair in enumerate(rank_ranges):
+            if len(pair) != 2:
+                raise ValueError(
+                    f"Rank {rank}, stage {stage_idx}: expected [start, end], "
+                    f"got {pair}.")
+            start, end = int(pair[0]), int(pair[1])
+            if start < 0 or end > num_hidden_layers or start >= end:
+                raise ValueError(
+                    f"Rank {rank}, stage {stage_idx}: invalid range "
+                    f"[{start}, {end}) for {num_hidden_layers} layers.")
+            for i in range(start, end):
+                if i in all_indices:
+                    raise ValueError(
+                        f"Layer {i} is assigned to multiple ranks/stages.")
+                all_indices.add(i)
+            rank_tuples.append((start, end))
+        normalized.append(rank_tuples)
+
+    if all_indices != set(range(num_hidden_layers)):
+        missing = set(range(num_hidden_layers)) - all_indices
+        raise ValueError(
+            f"Not all layers are covered.  Missing layers: "
+            f"{sorted(missing)}")
+
+    return normalized
 
 
 def is_vpp_first_stage(pp_rank: int, vp_stage: int) -> bool:
@@ -184,10 +263,16 @@ def make_vpp_layers(
     layer_fn: LayerFn,
     prefix: str,
     vp_size: int,
+    custom_layer_ranges: list[tuple[int, int]] | None = None,
 ) -> tuple[list[tuple[int, int]], "nn.ModuleList"]:
-    """Build a ModuleList with VPP V-shaped fold-back layer assignment.
+    """Build a ModuleList with VPP layer assignment.
 
     Layers not owned by this rank are replaced with ``PPMissingLayer``.
+
+    Args:
+        custom_layer_ranges: If provided, used directly instead of
+            auto-computing via ``get_vpp_indices``.  Must contain
+            ``vp_size`` entries of ``(start, end)`` for this rank.
 
     Returns:
         (layer_ranges, modules) where *layer_ranges* is a list of
@@ -198,11 +283,14 @@ def make_vpp_layers(
     from vllm.model_executor.models.utils import (PPMissingLayer,
                                                    maybe_offload_to_cpu)
 
-    pp_rank = get_pp_group().rank_in_group
-    pp_size = get_pp_group().world_size
-    layer_ranges = get_vpp_indices(
-        num_hidden_layers, pp_rank, pp_size, vp_size
-    )
+    if custom_layer_ranges is not None:
+        layer_ranges = custom_layer_ranges
+    else:
+        pp_rank = get_pp_group().rank_in_group
+        pp_size = get_pp_group().world_size
+        layer_ranges = get_vpp_indices(
+            num_hidden_layers, pp_rank, pp_size, vp_size
+        )
 
     local_indices: set[int] = set()
     for start, end in layer_ranges:
