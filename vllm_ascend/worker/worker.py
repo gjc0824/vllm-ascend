@@ -373,15 +373,34 @@ class NPUWorker(WorkerBase):
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
 
+        vp_size = self._get_vpp_size()
+        if vp_size > 1:
+            return self._execute_model_vpp(scheduler_output, vp_size)
+        return self._execute_model_regular(scheduler_output)
+
+    def _get_vpp_size(self) -> int:
+        if not hasattr(self, "_vpp_size_cached"):
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                self._vpp_size_cached = get_ascend_config().virtual_pipeline_parallel_size
+            except RuntimeError:
+                self._vpp_size_cached = 1
+        return self._vpp_size_cached
+
+    def _get_all_gather_group(self):
+        """Return the all_gather_group, respecting flashcomm1 (SP) mode."""
+        if enable_sp():
+            return None
+        return get_tp_group()
+
+    def _execute_model_regular(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
-            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-            # it will conflict with the all-gather operation in flashcomm1.
-            if enable_sp():
-                all_gather_group = None
-            else:
-                all_gather_group = get_tp_group()
+            all_gather_group = self._get_all_gather_group()
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(all_gather_group=all_gather_group)
             )
@@ -393,12 +412,7 @@ class NPUWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
-        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
-        # it will conflict with the all-gather operation in flashcomm1.
-        if enable_sp():
-            all_gather_group = None
-        else:
-            all_gather_group = get_tp_group()
+        all_gather_group = self._get_all_gather_group()
         get_pp_group().send_tensor_dict(output.tensors, all_gather_group=all_gather_group)
 
         kv_connector_output = output.kv_connector_output
@@ -412,6 +426,55 @@ class NPUWorker(WorkerBase):
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
         return output
+
+    def _execute_model_vpp(
+        self,
+        scheduler_output: "SchedulerOutput",
+        vp_size: int,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        """Execute model with VPP V-shaped fold-back multi-stage loop."""
+        from vllm_ascend.distributed.parallel_state import set_virtual_pipeline_parallel_rank
+        from vllm_ascend.distributed.vpp_utils import get_vpp_comm_info, is_vpp_last_stage
+
+        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        pp_rank = get_pp_group().rank_in_group
+        pp_size = get_pp_group().world_size
+        all_gather_group = self._get_all_gather_group()
+
+        intermediate_tensors = None
+
+        for vp_stage in range(vp_size):
+            set_virtual_pipeline_parallel_rank(vp_stage)
+            comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, vp_size)
+
+            if forward_pass and comm.need_recv:
+                intermediate_tensors = IntermediateTensors(
+                    get_pp_group().recv_tensor_dict(
+                        src=comm.recv_src,
+                        all_gather_group=all_gather_group,
+                    )
+                )
+
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+
+            if is_vpp_last_stage(pp_rank, pp_size, vp_stage, vp_size):
+                if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+                    return output
+                return output
+
+            assert isinstance(output, IntermediateTensors)
+
+            if comm.need_send:
+                get_pp_group().send_tensor_dict(
+                    output.tensors,
+                    dst=comm.send_dst,
+                    all_gather_group=all_gather_group,
+                )
+                intermediate_tensors = None
+            else:
+                intermediate_tensors = output
+
+        return None
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:

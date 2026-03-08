@@ -26,6 +26,23 @@ _P_TP: GroupCoordinator | None = None
 
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
+# Virtual Pipeline Parallelism (VPP) state
+_VIRTUAL_PIPELINE_PARALLEL_SIZE: int = 1
+_VIRTUAL_PIPELINE_PARALLEL_RANK: int = 0
+
+
+def get_virtual_pipeline_parallel_size() -> int:
+    return _VIRTUAL_PIPELINE_PARALLEL_SIZE
+
+
+def get_virtual_pipeline_parallel_rank() -> int:
+    return _VIRTUAL_PIPELINE_PARALLEL_RANK
+
+
+def set_virtual_pipeline_parallel_rank(rank: int) -> None:
+    global _VIRTUAL_PIPELINE_PARALLEL_RANK
+    _VIRTUAL_PIPELINE_PARALLEL_RANK = rank
+
 
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
@@ -219,6 +236,9 @@ def init_ascend_model_parallel(
             group_ranks, get_world_group().local_rank, backend, group_name="fc3_quant_x"
         )
 
+    global _VIRTUAL_PIPELINE_PARALLEL_SIZE
+    _VIRTUAL_PIPELINE_PARALLEL_SIZE = get_ascend_config().virtual_pipeline_parallel_size
+
 
 def model_parallel_initialized():
     return _MC2 is not None
@@ -333,3 +353,7 @@ def destroy_ascend_model_parallel():
     if _DYNAMIC_EPLB:
         _DYNAMIC_EPLB.destroy()
     _DYNAMIC_EPLB = None
+
+    global _VIRTUAL_PIPELINE_PARALLEL_SIZE, _VIRTUAL_PIPELINE_PARALLEL_RANK
+    _VIRTUAL_PIPELINE_PARALLEL_SIZE = 1
+    _VIRTUAL_PIPELINE_PARALLEL_RANK = 0

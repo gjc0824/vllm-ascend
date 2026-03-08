@@ -400,6 +400,28 @@ class NPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         torch.npu.synchronize()
 
+    def _is_vpp_last_or_pp_last(self) -> bool:
+        """Return True if this rank hosts the final output layer.
+
+        Under VPP the "last rank" depends on the fold-back topology, not
+        simply on ``get_pp_group().is_last_rank``.
+        """
+        if not hasattr(self, "_vpp_last_cached"):
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                vp_size = get_ascend_config().virtual_pipeline_parallel_size
+            except RuntimeError:
+                vp_size = 1
+            if vp_size <= 1:
+                self._vpp_last_cached = get_pp_group().is_last_rank
+            else:
+                from vllm_ascend.distributed.vpp_utils import is_vpp_last_stage
+                pp_rank = get_pp_group().rank_in_group
+                pp_size = get_pp_group().world_size
+                last_vp = vp_size - 1
+                self._vpp_last_cached = is_vpp_last_stage(pp_rank, pp_size, last_vp, vp_size)
+        return self._vpp_last_cached
+
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
@@ -411,7 +433,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
-            if get_pp_group().is_last_rank:
+            if self._is_vpp_last_or_pp_last():
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
@@ -1322,9 +1344,7 @@ class NPUModelRunner(GPUModelRunner):
 
             if not self.broadcast_pp_output:
                 # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
+                if isinstance(hidden_states, IntermediateTensors):
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     if self.debugger is not None:
@@ -1348,7 +1368,7 @@ class NPUModelRunner(GPUModelRunner):
                 # Rare case.
                 assert not self.is_pooling_model
 
-                if not get_pp_group().is_last_rank:
+                if isinstance(hidden_states, IntermediateTensors):
                     sample_hidden_states = hidden_states[logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None

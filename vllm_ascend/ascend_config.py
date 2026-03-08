@@ -87,6 +87,27 @@ class AscendConfig:
         self.recompute_scheduler_enable = additional_config.get("recompute_scheduler_enable", False)
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
 
+        # Virtual Pipeline Parallelism (VPP)
+        self.virtual_pipeline_parallel_size: int = additional_config.get(
+            "virtual_pipeline_parallel_size", 1)
+        vp_size = self.virtual_pipeline_parallel_size
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if vp_size > 1:
+            if pp_size <= 1:
+                raise ValueError(
+                    "virtual_pipeline_parallel_size > 1 requires "
+                    "pipeline_parallel_size > 1.")
+            num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
+            total_chunks = pp_size * vp_size
+            if num_layers % total_chunks != 0:
+                raise ValueError(
+                    f"num_hidden_layers ({num_layers}) must be divisible by "
+                    f"pp_size * vp_size ({pp_size} * {vp_size} = {total_chunks}).")
+            logger.info(
+                "VPP enabled: vp_size=%d, pp_size=%d, num_layers=%d, "
+                "layers_per_chunk=%d", vp_size, pp_size, num_layers,
+                num_layers // total_chunks)
+
         self.pd_tp_ratio = 1
         self.pd_head_ratio = 1
         self.num_head_replica = 1
