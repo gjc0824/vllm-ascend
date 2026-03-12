@@ -140,6 +140,15 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         pp_size = self.parallel_config.pipeline_parallel_size
         pcp_size = self.parallel_config.prefill_context_parallel_size
         return tp_size, pp_size, pcp_size
+    
+    def _get_output_rank(self) -> int:
+        addtional_config = self.vllm_config.additional_config or {}
+        vp_size = addtional_config.get(
+            "virtual_pipeline_parallel_size", 1
+        )
+        if vp_size > 1 and vp_size % 2 == 0:
+            return 0
+        return super()._get_output_rank()
 
     def _post_init_executor(self) -> None:
         pass

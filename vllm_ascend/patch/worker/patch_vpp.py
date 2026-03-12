@@ -23,9 +23,8 @@ global state set by ``set_virtual_pipeline_parallel_rank``.
 from __future__ import annotations
 
 from itertools import islice
-
 import torch
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tp_group
 from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
     DeepseekV2Model,
@@ -47,6 +46,8 @@ from vllm_ascend.distributed.vpp_utils import (
     is_vpp_last_stage,
     make_vpp_layers,
 )
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import logger
 
 
 # ---- Runtime helpers (called during forward) ----
@@ -138,6 +139,9 @@ def _vpp_dsv2_model_init(self, *, vllm_config, prefix=""):
     from vllm.platforms import current_platform
 
     super(DeepseekV2Model, self).__init__()
+    self.vllm_config = vllm_config
+    self.compilation_config = vllm_config.compilation_config
+    self.do_not_compile = True
 
     config = vllm_config.model_config.hf_config
     quant_config = vllm_config.quant_config
@@ -177,8 +181,8 @@ def _vpp_dsv2_model_init(self, *, vllm_config, prefix=""):
     custom_ranges = _get_custom_layer_ranges_for_rank()
     self.vpp_layer_ranges, self.layers = make_vpp_layers(
         config.num_hidden_layers,
-        lambda pfx: DeepseekV2DecoderLayer(
-            vllm_config, pfx, topk_indices_buffer=topk_indices_buffer),
+        lambda prefix: DeepseekV2DecoderLayer(
+            vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
         f"{prefix}.layers",
         vp_size,
         custom_layer_ranges=custom_ranges,
@@ -236,8 +240,10 @@ def _vpp_dsv2_model_forward(
         )
     else:
         llama_4_scaling = None
-
+    # logger.info(f">>>>>>>>>>>>>>>>> {start}, ++++++++++++++++, {end} ")
     for layer in islice(self.layers, start, end):
+        # if get_tp_group().rank_in_group == 0:
+        #     logger.info(f"hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}, residual: {residual}")
         hidden_states, residual = layer(
             positions, hidden_states, residual, llama_4_scaling)
 
@@ -313,9 +319,13 @@ def _vpp_dsv2_causal_lm_init(self, *, vllm_config, prefix=""):
         self.config.num_hidden_layers - self.config.first_k_dense_replace)
     self.set_moe_parameters()
 
-
+def _vpp_dsv2_compute_logits(self, hidden_states):
+    if isinstance(self.lm_head, PPMissingLayer):
+        return None
+    return self.logits_processor(self.lm_head, hidden_states)
 # ---- Apply patches ----
 
 DeepseekV2Model.__init__ = _vpp_dsv2_model_init
 DeepseekV2Model.forward = _vpp_dsv2_model_forward
 DeepseekV2ForCausalLM.__init__ = _vpp_dsv2_causal_lm_init
+DeepseekV2ForCausalLM.compute_logits = _vpp_dsv2_compute_logits

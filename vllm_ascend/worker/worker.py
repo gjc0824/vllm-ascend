@@ -432,49 +432,55 @@ class NPUWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         vp_size: int,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        """Execute model with VPP V-shaped fold-back multi-stage loop."""
-        from vllm_ascend.distributed.parallel_state import set_virtual_pipeline_parallel_rank
-        from vllm_ascend.distributed.vpp_utils import get_vpp_comm_info, is_vpp_last_stage
+        """Execute model with VPP — single execute_model call.
+
+        Only the initial recv for vp_stage=0 is handled here.
+        The multi-stage loop and inter-stage P2P communication happen
+        inside model_runner._model_forward_vpp.
+        """
+        from vllm_ascend.distributed.parallel_state import (
+            set_virtual_pipeline_parallel_rank,
+        )
+        from vllm_ascend.distributed.vpp_utils import get_vpp_comm_info
 
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         pp_rank = get_pp_group().rank_in_group
         pp_size = get_pp_group().world_size
         all_gather_group = self._get_all_gather_group()
 
+        set_virtual_pipeline_parallel_rank(0)
         intermediate_tensors = None
 
-        for vp_stage in range(vp_size):
-            set_virtual_pipeline_parallel_rank(vp_stage)
-            comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, vp_size)
-
-            if forward_pass and comm.need_recv:
-                intermediate_tensors = IntermediateTensors(
-                    get_pp_group().recv_tensor_dict(
-                        src=comm.recv_src,
-                        all_gather_group=all_gather_group,
-                    )
-                )
-
-            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-
-            if is_vpp_last_stage(pp_rank, pp_size, vp_stage, vp_size):
-                if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
-                    return output
-                return output
-
-            assert isinstance(output, IntermediateTensors)
-
-            if comm.need_send:
-                get_pp_group().send_tensor_dict(
-                    output.tensors,
-                    dst=comm.send_dst,
+        comm = get_vpp_comm_info(pp_rank, pp_size, 0, vp_size)
+        if forward_pass and comm.need_recv:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    src=comm.recv_src,
                     all_gather_group=all_gather_group,
                 )
-                intermediate_tensors = None
-            else:
-                intermediate_tensors = output
+            )
 
-        return None
+        output = self.model_runner.execute_model(
+            scheduler_output, intermediate_tensors)
+        # if is_vpp_last_stage(pp_rank, pp_size, vp_stage, vp_size):
+        #     logger.info(f"output type, {type(output)}")
+        if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            return output
+        # logger.info(f"output type, {type(output)}")
+
+        # Non-final VPP rank: all P2P sends already done inside
+        # _model_forward_vpp.  Pass through kv_connector_output if any.
+        assert isinstance(output, IntermediateTensors)
+        kv_connector_output = output.kv_connector_output
+        if not kv_connector_output:
+            return None
+
+        if (not kv_connector_output.finished_sending
+                and not kv_connector_output.finished_recving):
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+        return output
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:

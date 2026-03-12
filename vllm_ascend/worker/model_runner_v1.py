@@ -422,6 +422,16 @@ class NPUModelRunner(GPUModelRunner):
                 self._vpp_last_cached = is_vpp_last_stage(pp_rank, pp_size, last_vp, vp_size)
         return self._vpp_last_cached
 
+    def _get_vpp_size(self) -> int:
+        if not hasattr(self, "_vpp_size_cached"):
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                self._vpp_size_cached = (
+                    get_ascend_config().virtual_pipeline_parallel_size)
+            except RuntimeError:
+                self._vpp_size_cached = 1
+        return self._vpp_size_cached
+
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
@@ -1341,7 +1351,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
-
+            logger.info(f"type of hidden_states, {type(hidden_states)}")
             if not self.broadcast_pp_output:
                 # Common case.
                 if isinstance(hidden_states, IntermediateTensors):
@@ -1361,7 +1371,6 @@ class NPUModelRunner(GPUModelRunner):
                         self.debugger.stop()
                         self.debugger.step()
                     return output
-
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
@@ -1719,9 +1728,15 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        _skip_vpp: bool = False,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
+        if not _skip_vpp and self._get_vpp_size() > 1:
+            return self._model_forward_vpp(
+                num_tokens_padded, input_ids, positions,
+                intermediate_tensors, inputs_embeds, **model_kwargs)
+
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1749,6 +1764,84 @@ class NPUModelRunner(GPUModelRunner):
         if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
+    
+    def _model_forward_vpp(
+        self,
+        num_tokens_padded: int,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
+    ):
+        """Run model forward with VPP multi-stage loop and P2P communication.
+
+        All virtual pipeline stages are executed within a single call,
+        avoiding repeated _preprocess / _build_attention_metadata overhead.
+        """
+        from vllm_ascend.distributed.parallel_state import (
+            set_virtual_pipeline_parallel_rank,
+        )
+        from vllm_ascend.distributed.vpp_utils import (
+            get_vpp_comm_info,
+            is_vpp_last_stage,
+        )
+
+        assert self.model is not None
+        pp_rank = get_pp_group().rank_in_group
+        pp_size = get_pp_group().world_size
+        vp_size = self._get_vpp_size()
+        all_gather_group = get_tp_group() if not enable_sp() else None
+
+        hidden_states: torch.Tensor | IntermediateTensors | None = None
+
+        for vp_stage in range(vp_size):
+            set_virtual_pipeline_parallel_rank(vp_stage)
+            comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, vp_size)
+
+            if vp_stage > 0 and comm.need_recv:
+                intermediate_tensors = IntermediateTensors(
+                    get_pp_group().recv_tensor_dict(
+                        src=comm.recv_src,
+                        all_gather_group=all_gather_group,
+                    )
+                )
+                intermediate_tensors = (
+                    self.sync_and_slice_intermediate_tensors(
+                        num_tokens_padded, intermediate_tensors, True,
+                    )
+                )
+
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
+            if is_vpp_last_stage(pp_rank, pp_size, vp_stage, vp_size):
+                break
+
+            assert isinstance(hidden_states, IntermediateTensors)
+
+            if comm.need_send:
+                get_pp_group().send_tensor_dict(
+                    hidden_states.tensors,
+                    dst=comm.send_dst,
+                    all_gather_group=all_gather_group,
+                )
+                intermediate_tensors = None
+            else:
+                intermediate_tensors = hidden_states
+
+        forward_context = get_forward_context()
+        if (forward_context
+                and getattr(forward_context, 'flash_comm_v1_enabled', False)
+                and not isinstance(hidden_states, IntermediateTensors)):
+            hidden_states = self._all_gather_hidden_states_and_aux(
+                hidden_states)
+        return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
@@ -1757,6 +1850,35 @@ class NPUModelRunner(GPUModelRunner):
         if enable_sp(self.vllm_config) or enable_sp_by_pass(self.vllm_config):
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
+    
+    def sync_and_slice_intermediate_tensors(
+        self,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors | None,
+        sync_self: bool,
+    ) -> IntermediateTensors:
+        assert self.intermediate_tensors is not None
+        tp = self.vllm_config.parallel_config.tensor_parallel_size
+
+        # When sequence parallelism is enabled, the "residual" tensor is sharded
+        # across tensor parallel ranks, so each rank only needs its own slice.
+        if sync_self:
+            assert intermediate_tensors is not None
+            for k, v in intermediate_tensors.items():
+                # logger.info(f"k: {k}, v: {v.shape}, num_tokens: {num_tokens}")
+                copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+                self.intermediate_tensors[k][:copy_len].copy_(
+                    v[:copy_len], non_blocking=True
+                )
+
+        return IntermediateTensors(
+            {
+                k: v[: (num_tokens + tp - 1) // tp]
+                if enable_sp()
+                else v[:num_tokens]
+                for k, v in self.intermediate_tensors.items()
+            }
+        )
 
     def _sync_batch_across_dp(
         self,
@@ -2322,6 +2444,25 @@ class NPUModelRunner(GPUModelRunner):
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
+                # In VPP mode, rank 0 also processes non-first virtual stages
+                # that require intermediate_tensors during actual inference.
+                # Pre-allocate the buffer here so it is ready when needed.
+                if self.intermediate_tensors is None:
+                    from vllm_ascend.distributed.parallel_state import (
+                        get_virtual_pipeline_parallel_size,
+                    )
+                    if get_virtual_pipeline_parallel_size() > 1:
+                        max_actual_tokens = self.max_num_tokens
+                        if enable_sp():
+                            tp_size = get_tensor_model_parallel_world_size()
+                            max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+                        self.intermediate_tensors = (
+                            self.model.make_empty_intermediate_tensors(
+                                batch_size=max_actual_tokens,
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        )
             else:
                 # When PP and flashcomm1 are enabled, during dummy_run the estimated space should divide num_tokens by
                 # tp_size; otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading
@@ -2368,7 +2509,8 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
             ):
                 outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                    num_tokens_padded, input_ids, positions,
+                    intermediate_tensors, inputs_embeds, _skip_vpp=True
                 )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -2399,6 +2541,8 @@ class NPUModelRunner(GPUModelRunner):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, IntermediateTensors):
+            return None
         output = None
 
         # For profile, have maximum num_reqs and that collectively have
