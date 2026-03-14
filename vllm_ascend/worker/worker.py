@@ -432,11 +432,11 @@ class NPUWorker(WorkerBase):
         scheduler_output: "SchedulerOutput",
         vp_size: int,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        """Execute model with VPP — single execute_model call.
+        """Execute model with VPP.
 
         Only the initial recv for vp_stage=0 is handled here.
-        The multi-stage loop and inter-stage P2P communication happen
-        inside model_runner._model_forward_vpp.
+        The per-stage VPP execution and inter-stage P2P communication
+        happen inside model_runner.execute_model.
         """
         from vllm_ascend.distributed.parallel_state import (
             set_virtual_pipeline_parallel_rank,

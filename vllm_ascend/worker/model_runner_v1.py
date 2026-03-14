@@ -68,6 +68,7 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
     SamplerOutput,
+    VppContinuationOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.logits_processor import build_logitsprocs
@@ -209,6 +210,36 @@ class ExecuteModelState(NamedTuple):
     positions: torch.Tensor
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
+
+
+@dataclass
+class VppBatchContext:
+    batch_id: int
+    scheduler_output: "SchedulerOutput"
+    num_scheduled_tokens: int
+    num_scheduled_tokens_np: np.ndarray
+    max_num_scheduled_tokens: int
+    num_tokens_unpadded: int
+    num_tokens_padded: int
+    num_reqs: int
+    num_reqs_padded: int
+    logits_indices: torch.Tensor
+    spec_decode_metadata: SpecDecodeMetadata | None
+    spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
+    attn_metadata: "PerLayerAttnMetadata"
+    batch_desc: BatchDescriptor
+    cudagraph_mode: CUDAGraphMode
+    num_tokens_across_dp: torch.Tensor | None
+    input_ids: torch.Tensor | None
+    inputs_embeds: torch.Tensor | None
+    positions: torch.Tensor
+    model_kwargs: dict[str, Any]
+    ec_connector_output: "ECConnectorOutput | None"
+    cudagraph_stats: CUDAGraphStat | None
+    has_encoder_input: bool
+    vp_size: int
+    next_vp_stage: int = 0
+    carry_intermediate_tensors: IntermediateTensors | None = None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -383,6 +414,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         # for cleancode , actually the three attrs is defined in gpu_model_runner
         self.execute_model_state: ExecuteModelState | None = None
+        self._vpp_contexts: dict[int, VppBatchContext] = {}
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -1134,6 +1166,10 @@ class NPUModelRunner(GPUModelRunner):
             self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
         ):
             scheduler_output = deepcopy(scheduler_output)
+        if self._get_vpp_size() > 1:
+            return self._execute_model_vpp_yield(
+                scheduler_output, intermediate_tensors
+            )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -1408,7 +1444,425 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
             )
-            self.kv_connector_output = kv_connector_output
+        self.kv_connector_output = kv_connector_output
+        return None
+
+    def _execute_model_vpp_yield(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | VppContinuationOutput | None:
+        batch_id = getattr(scheduler_output, "batch_id", None)
+        if batch_id is None:
+            raise RuntimeError("VPP requires SchedulerOutput.batch_id")
+
+        ctx = self._vpp_contexts.get(batch_id)
+        if ctx is None:
+            prepared = self._prepare_vpp_context(
+                scheduler_output, intermediate_tensors
+            )
+            if not isinstance(prepared, tuple):
+                return prepared
+            ctx, stage_intermediate_tensors = prepared
+            self._vpp_contexts[batch_id] = ctx
+        else:
+            stage_intermediate_tensors = None
+
+        return self._run_vpp_stage(ctx, stage_intermediate_tensors)
+
+    def _prepare_vpp_context(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> tuple[VppBatchContext, IntermediateTensors | None] | ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        with record_function_or_nullcontext("prepare input"):
+            with self.synchronize_input_prep():
+                # Update persistent batch states.
+                self._update_states(scheduler_output)
+
+                if has_ec_transfer() and get_ec_transfer().is_producer:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                    ) as ec_connector_output:
+                        self._execute_mm_encoder(scheduler_output)
+                        return make_empty_encoder_model_runner_output(
+                            scheduler_output)
+
+                if not num_scheduled_tokens:
+                    if (
+                        self.parallel_config.distributed_executor_backend
+                        == "external_launcher"
+                        and self.parallel_config.data_parallel_size > 1
+                    ):
+                        self._dummy_run(1)
+                    if not has_kv_transfer_group():
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
+                if self.cache_config.kv_sharing_fast_prefill:
+                    assert not self.num_prompt_logprobs, (
+                        "--kv-sharing-fast-prefill produces incorrect "
+                        "logprobs for prompt tokens, tokens, please disable "
+                        "it when the requests need prompt logprobs"
+                    )
+
+                num_reqs = self.input_batch.num_reqs
+                req_ids = self.input_batch.req_ids
+                tokens = [
+                    scheduler_output.num_scheduled_tokens[i]
+                    for i in req_ids
+                ]
+                num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+
+                (
+                    logits_indices,
+                    spec_decode_metadata,
+                    total_num_scheduled_tokens,
+                ) = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
+
+                num_tokens_unpadded = (
+                    scheduler_output.total_num_scheduled_tokens
+                )
+                if self.pcp_size > 1:
+                    num_tokens_unpadded = (
+                        self.pcp_manager.total_num_sampled_tokens_pcp)
+                cascade_attn_prefix_lens = None
+                if (self.cascade_attn_enabled
+                        and not self.parallel_config.enable_dbo):
+                    cascade_attn_prefix_lens = (
+                        self._compute_cascade_attn_prefix_lens(
+                            num_scheduled_tokens_np,
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                            scheduler_output.num_common_prefix_blocks,
+                        )
+                    )
+
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    num_encoder_reqs=len(
+                        scheduler_output.scheduled_encoder_inputs),
+                )
+
+                logger.debug(
+                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                    "should_ubatch: %s, num_tokens_across_dp: %s",
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                )
+
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = (
+                    batch_desc.num_reqs
+                    if batch_desc.num_reqs is not None
+                    else num_reqs
+                )
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
+
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+                use_spec_decode = (
+                    len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                )
+                ubatch_slices_attn = (
+                    ubatch_slices_padded if pad_attn else ubatch_slices
+                )
+
+                if (
+                    cudagraph_mode == CUDAGraphMode.FULL
+                    or (enable_sp() and not self.model_config.use_mla)
+                    and self.pcp_size == 1
+                ):
+                    old_num_reqs_padded = num_reqs_padded
+                    num_reqs_padded = self._pad_query_start_loc_for_fia(
+                        num_tokens_padded, num_reqs_padded, num_reqs)
+                    if enable_sp() and num_tokens_padded == num_tokens_unpadded:
+                        if num_reqs_padded > old_num_reqs_padded:
+                            num_reqs_padded = old_num_reqs_padded
+                            self.query_start_loc.np[num_reqs_padded + 1] = 0
+
+                (attn_metadata, spec_decode_common_attn_metadata) = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded
+                        if not (self.use_cp and
+                                self.pcp_manager.pcp_use_hybrid_attn)
+                        else total_num_scheduled_tokens,
+                        num_tokens_padded=num_tokens_padded,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                    )
+                )
+
+            (
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+                ec_connector_output,
+            ) = self._preprocess(
+                scheduler_output,
+                num_tokens_padded
+                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
+                else total_num_scheduled_tokens,
+                intermediate_tensors,
+            )
+
+            update_cos_sin(positions)
+
+        if self.dynamic_eplb:
+            with record_function_or_nullcontext("EPLB weight D2D"):
+                self.eplb_updator.forward_before()
+
+        if self.calculate_kv_scales:  # type: ignore[has-type]
+            cudagraph_mode = CUDAGraphMode.NONE
+            self.calculate_kv_scales = False  # type: ignore[has-type]
+        if self.debugger is not None:
+            dbg_cfg = getattr(self.debugger, "config", None)
+            dump_level = str(
+                getattr(dbg_cfg, "level", "L1")).upper() if dbg_cfg is not None else "L1"
+            if dump_level in ("L0", "MIX"):
+                self.debugger.start(model=self.model)
+            else:
+                self.debugger.start()
+        if self.ascend_config.enable_async_exponential:
+            self.sampler.do_async_exponential(
+                b_s=logits_indices.shape[0],
+                head_dim=self.model_config.get_vocab_size(),
+                generators=self.input_batch.sampling_metadata.generators,
+            )
+
+        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+        has_encoder_input = (
+            self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+        )
+
+        ctx = VppBatchContext(
+            batch_id=scheduler_output.batch_id,
+            scheduler_output=scheduler_output,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+            attn_metadata=attn_metadata,
+            batch_desc=batch_desc,
+            cudagraph_mode=cudagraph_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            positions=positions,
+            model_kwargs=model_kwargs,
+            ec_connector_output=ec_connector_output,
+            cudagraph_stats=cudagraph_stats,
+            has_encoder_input=has_encoder_input,
+            vp_size=self._get_vpp_size(),
+        )
+        return ctx, intermediate_tensors
+
+    def _run_vpp_stage(
+        self,
+        ctx: VppBatchContext,
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | VppContinuationOutput | None:
+        from vllm_ascend.distributed.parallel_state import (
+            set_virtual_pipeline_parallel_rank,
+        )
+        from vllm_ascend.distributed.vpp_utils import (
+            get_vpp_comm_info,
+            is_vpp_last_stage,
+        )
+
+        pp_rank = get_pp_group().rank_in_group
+        pp_size = get_pp_group().world_size
+        vp_stage = ctx.next_vp_stage
+        set_virtual_pipeline_parallel_rank(vp_stage)
+
+        comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
+        all_gather_group = get_tp_group() if not enable_sp() else None
+
+        if vp_stage > 0:
+            if comm.need_recv:
+                intermediate_tensors = IntermediateTensors(
+                    get_pp_group().recv_tensor_dict(
+                        src=comm.recv_src,
+                        all_gather_group=all_gather_group,
+                    )
+                )
+                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                    ctx.num_tokens_padded, intermediate_tensors, True
+                )
+            else:
+                intermediate_tensors = ctx.carry_intermediate_tensors
+
+        with (
+            record_function_or_nullcontext("forward"),
+            set_ascend_forward_context(
+                ctx.attn_metadata,
+                self.vllm_config,
+                num_tokens=ctx.num_tokens_padded,
+                num_tokens_across_dp=ctx.num_tokens_across_dp,
+                aclgraph_runtime_mode=ctx.cudagraph_mode,
+                batch_descriptor=ctx.batch_desc,
+                num_actual_tokens=ctx.scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model,
+                max_tokens_across_pcp=0
+                if self.pcp_size == 1
+                else self.pcp_manager.max_num_tokens_across_pcp,
+                skip_compiled=ctx.has_encoder_input,
+            ),
+            self.maybe_get_kv_connector_output(
+                ctx.scheduler_output
+            ) as kv_connector_output,
+        ):
+            hidden_states = self._model_forward(
+                ctx.num_tokens_padded,
+                ctx.input_ids,
+                ctx.positions,
+                intermediate_tensors,
+                ctx.inputs_embeds,
+                _skip_vpp=True,
+                **ctx.model_kwargs,
+            )
+
+        is_last = is_vpp_last_stage(
+            pp_rank, pp_size, vp_stage, ctx.vp_size
+        )
+        if not is_last:
+            assert isinstance(hidden_states, IntermediateTensors)
+            if comm.need_send:
+                get_pp_group().send_tensor_dict(
+                    hidden_states.tensors,
+                    dst=comm.send_dst,
+                    all_gather_group=all_gather_group,
+                )
+                ctx.carry_intermediate_tensors = None
+            else:
+                ctx.carry_intermediate_tensors = hidden_states
+            ctx.next_vp_stage += 1
+            return VppContinuationOutput(
+                batch_id=ctx.batch_id,
+                kv_connector_output=kv_connector_output,
+            )
+
+        ctx.next_vp_stage += 1
+        self._vpp_contexts.pop(ctx.batch_id, None)
+        return self._postprocess_after_forward(
+            ctx, hidden_states, kv_connector_output
+        )
+
+    def _postprocess_after_forward(
+        self,
+        ctx: VppBatchContext,
+        hidden_states: torch.Tensor | IntermediateTensors,
+        kv_connector_output: "KVConnectorOutput | None",
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        aux_hidden_states = None
+        if self.use_aux_hidden_state_outputs:
+            hidden_states, aux_hidden_states = hidden_states
+        if self.pcp_size > 1:
+            hidden_states = self.pcp_manager.get_restore_hidden_states(
+                hidden_states)
+            if aux_hidden_states is not None:
+                aux_hidden_states = [
+                    self.pcp_manager.get_restore_hidden_states(
+                        aux_hidden_states_pcp)
+                    for aux_hidden_states_pcp in aux_hidden_states
+                ]
+        if not self.broadcast_pp_output:
+            if isinstance(hidden_states, IntermediateTensors):
+                hidden_states.kv_connector_output = kv_connector_output
+                self.kv_connector_output = kv_connector_output
+                if self.debugger is not None:
+                    self.debugger.stop()
+                    self.debugger.step()
+                return hidden_states
+            if self.is_pooling_model:
+                output = self._pool(
+                    hidden_states,
+                    ctx.num_scheduled_tokens,
+                    ctx.num_scheduled_tokens_np,
+                    kv_connector_output,
+                )
+                output.kv_connector_output = kv_connector_output
+                if self.debugger is not None:
+                    self.debugger.stop()
+                    self.debugger.step()
+                return output
+            sample_hidden_states = hidden_states[ctx.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+        else:
+            assert not self.is_pooling_model
+            if isinstance(hidden_states, IntermediateTensors):
+                sample_hidden_states = hidden_states[ctx.logits_indices]
+                get_pp_group().send_tensor_dict(
+                    hidden_states.tensors, all_gather_group=get_tp_group()
+                )
+                logits = None
+            else:
+                sample_hidden_states = hidden_states[ctx.logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states)
+
+            model_output_broadcast_data: dict[str, Any] = {}
+            if logits is not None:
+                model_output_broadcast_data["logits"] = logits.contiguous()
+            broadcasted = get_pp_group().broadcast_tensor_dict(
+                model_output_broadcast_data,
+                src=len(get_pp_group().ranks) - 1,
+            )
+            assert broadcasted is not None
+            logits = broadcasted["logits"]
+
+        self.execute_model_state = ExecuteModelState(
+            ctx.scheduler_output,
+            logits,
+            ctx.spec_decode_metadata,
+            ctx.spec_decode_common_attn_metadata,
+            hidden_states,
+            sample_hidden_states,
+            aux_hidden_states,
+            ctx.attn_metadata,
+            ctx.positions,
+            ctx.ec_connector_output,
+            ctx.cudagraph_stats,
+        )
+        self.kv_connector_output = kv_connector_output
         return None
 
     @torch.inference_mode()
