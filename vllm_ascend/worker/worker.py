@@ -41,7 +41,13 @@ from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+    VppContinuationOutput,
+)
 from vllm.v1.worker.worker_base import WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -368,7 +374,7 @@ class NPUWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | VppContinuationOutput | None:
         # enable msMonitor to monitor the performance of vllm-ascend
         if envs_ascend.MSMONITOR_USE_DAEMON:
             dp.step()
@@ -431,45 +437,24 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
         vp_size: int,
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | VppContinuationOutput | None:
         """Execute model with VPP.
 
-        Only the initial recv for vp_stage=0 is handled here.
-        The per-stage VPP execution and inter-stage P2P communication
-        happen inside model_runner.execute_model.
+        All per-stage VPP execution and P2P communication happen inside
+        model_runner.execute_model.
         """
-        from vllm_ascend.distributed.parallel_state import (
-            set_virtual_pipeline_parallel_rank,
-        )
-        from vllm_ascend.distributed.vpp_utils import get_vpp_comm_info
-
-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        pp_rank = get_pp_group().rank_in_group
-        pp_size = get_pp_group().world_size
-        all_gather_group = self._get_all_gather_group()
-
-        set_virtual_pipeline_parallel_rank(0)
-        intermediate_tensors = None
-
-        comm = get_vpp_comm_info(pp_rank, pp_size, 0, vp_size)
-        if forward_pass and comm.need_recv:
-            intermediate_tensors = IntermediateTensors(
-                get_pp_group().recv_tensor_dict(
-                    src=comm.recv_src,
-                    all_gather_group=all_gather_group,
-                )
-            )
-
         output = self.model_runner.execute_model(
-            scheduler_output, intermediate_tensors)
+            scheduler_output, None)
+        if isinstance(output, VppContinuationOutput):
+            return output
         # if is_vpp_last_stage(pp_rank, pp_size, vp_stage, vp_size):
         #     logger.info(f"output type, {type(output)}")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
         # logger.info(f"output type, {type(output)}")
 
-        # Non-final VPP rank: all P2P sends already done inside
-        # _model_forward_vpp.  Pass through kv_connector_output if any.
+        # Non-final VPP rank: all P2P sends already done inside the model runner.
+        # Pass through kv_connector_output if any.
         assert isinstance(output, IntermediateTensors)
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:

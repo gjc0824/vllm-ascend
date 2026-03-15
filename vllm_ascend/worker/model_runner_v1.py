@@ -1717,19 +1717,18 @@ class NPUModelRunner(GPUModelRunner):
         comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
         all_gather_group = get_tp_group() if not enable_sp() else None
 
-        if vp_stage > 0:
-            if comm.need_recv:
-                intermediate_tensors = IntermediateTensors(
-                    get_pp_group().recv_tensor_dict(
-                        src=comm.recv_src,
-                        all_gather_group=all_gather_group,
-                    )
+        if comm.need_recv:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    src=comm.recv_src,
+                    all_gather_group=all_gather_group,
                 )
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                    ctx.num_tokens_padded, intermediate_tensors, True
-                )
-            else:
-                intermediate_tensors = ctx.carry_intermediate_tensors
+            )
+            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                ctx.num_tokens_padded, intermediate_tensors, True
+            )
+        elif vp_stage > 0:
+            intermediate_tensors = ctx.carry_intermediate_tensors
 
         with (
             record_function_or_nullcontext("forward"),
