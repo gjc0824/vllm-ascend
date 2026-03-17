@@ -443,6 +443,9 @@ class NPUWorker(WorkerBase):
         All per-stage VPP execution and P2P communication happen inside
         model_runner.execute_model.
         """
+        batch_id = getattr(scheduler_output, "batch_id", None)
+        if batch_id is None:
+            raise RuntimeError("VPP requires SchedulerOutput.batch_id")
         output = self.model_runner.execute_model(
             scheduler_output, None)
         if isinstance(output, VppContinuationOutput):

@@ -55,6 +55,10 @@ class NPUInputBatch(InputBatch):
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        self._block_sizes = block_sizes.copy()
+        self._kernel_block_sizes = [sizes.copy() for sizes in kernel_block_sizes]
+        self._num_speculative_tokens = num_speculative_tokens
+        self._cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -211,3 +215,99 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def clone_for_vpp_sampling(self) -> "NPUInputBatch":
+        """Clone the sampling-visible batch state for a yielded VPP batch."""
+        clone = NPUInputBatch(
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            vocab_size=self.vocab_size,
+            block_sizes=self._block_sizes,
+            kernel_block_sizes=self._kernel_block_sizes,
+            logitsprocs=self.logitsprocs,
+            logitsprocs_need_output_token_ids=self.logitsprocs_need_output_token_ids,
+            is_spec_decode=self.is_spec_decode,
+            is_pooling_model=self.is_pooling_model,
+            num_speculative_tokens=self._num_speculative_tokens,
+            cp_kv_cache_interleave_size=self._cp_kv_cache_interleave_size,
+        )
+
+        clone._req_ids = self._req_ids.copy()
+        clone.req_id_to_index = self.req_id_to_index.copy()
+        clone.token_ids_cpu_tensor.copy_(self.token_ids_cpu_tensor)
+        clone.is_token_ids_tensor.copy_(self.is_token_ids_tensor)
+        clone.req_prompt_embeds = self.req_prompt_embeds.copy()
+        clone.num_tokens = self.num_tokens.copy()
+        clone.num_tokens_no_spec = self.num_tokens_no_spec.copy()
+        clone.num_prompt_tokens = self.num_prompt_tokens.copy()
+        clone.num_computed_tokens_cpu_tensor.copy_(self.num_computed_tokens_cpu_tensor)
+
+        for src_table, dst_table in zip(
+            self.block_table.block_tables, clone.block_table.block_tables
+        ):
+            dst_table.num_blocks_per_row = src_table.num_blocks_per_row.copy()
+            dst_table.block_table.cpu.copy_(src_table.block_table.cpu)
+            dst_table.block_table.gpu.copy_(src_table.block_table.gpu)
+            dst_table.slot_mapping.cpu.copy_(src_table.slot_mapping.cpu)
+            dst_table.slot_mapping.gpu.copy_(src_table.slot_mapping.gpu)
+
+        clone.temperature_cpu_tensor.copy_(self.temperature_cpu_tensor)
+        clone.greedy_reqs = self.greedy_reqs.copy()
+        clone.random_reqs = self.random_reqs.copy()
+
+        clone.top_p_cpu_tensor.copy_(self.top_p_cpu_tensor)
+        clone.top_p_reqs = self.top_p_reqs.copy()
+
+        clone.top_k_cpu_tensor.copy_(self.top_k_cpu_tensor)
+        clone.top_k_reqs = self.top_k_reqs.copy()
+
+        clone.spec_decode_unsupported_reqs = self.spec_decode_unsupported_reqs.copy()
+
+        clone.frequency_penalties_cpu_tensor.copy_(self.frequency_penalties_cpu_tensor)
+        clone.frequency_penalties_reqs = self.frequency_penalties_reqs.copy()
+
+        clone.presence_penalties_cpu_tensor.copy_(self.presence_penalties_cpu_tensor)
+        clone.presence_penalties_reqs = self.presence_penalties_reqs.copy()
+
+        clone.repetition_penalties_cpu_tensor.copy_(self.repetition_penalties_cpu_tensor)
+        clone.repetition_penalties_reqs = self.repetition_penalties_reqs.copy()
+
+        clone.num_accepted_tokens_cpu_tensor.copy_(self.num_accepted_tokens_cpu_tensor)
+
+        clone.request_lora_mapping = self.request_lora_mapping.copy()
+        clone.lora_id_to_request_ids = {
+            lora_id: request_ids.copy()
+            for lora_id, request_ids in self.lora_id_to_request_ids.items()
+        }
+        clone.lora_id_to_lora_request = self.lora_id_to_lora_request.copy()
+
+        clone.generators = self.generators.copy()
+        clone.num_logprobs = self.num_logprobs.copy()
+        clone.in_progress_prompt_logprobs_cpu = self.in_progress_prompt_logprobs_cpu.copy()
+
+        clone.has_allowed_token_ids = self.has_allowed_token_ids.copy()
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            clone.allowed_token_ids_mask_cpu_tensor = self.allowed_token_ids_mask_cpu_tensor.clone()
+        if self.allowed_token_ids_mask is not None:
+            clone.allowed_token_ids_mask = self.allowed_token_ids_mask.clone()
+
+        clone.bad_words_token_ids = {
+            req_idx: [token_ids.copy() for token_ids in bad_words]
+            for req_idx, bad_words in self.bad_words_token_ids.items()
+        }
+        clone.logits_processing_needs_token_ids = self.logits_processing_needs_token_ids.copy()
+        clone.req_output_token_ids = self.req_output_token_ids.copy()
+        clone.spec_token_ids = [token_ids.copy() for token_ids in self.spec_token_ids]
+        clone.pooling_params = self.pooling_params.copy()
+        clone.pooling_states = self.pooling_states.copy()
+        clone.prev_sampled_token_ids = self.prev_sampled_token_ids
+        clone.prev_req_id_to_index = (
+            None if self.prev_req_id_to_index is None else self.prev_req_id_to_index.copy()
+        )
+        clone.sampled_token_ids_cpu = self.sampled_token_ids_cpu
+        clone.async_copy_ready_event = self.async_copy_ready_event
+        clone.sampling_metadata = clone._make_sampling_metadata()
+        return clone
