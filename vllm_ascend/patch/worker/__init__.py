@@ -15,10 +15,7 @@
 # limitations under the License.
 #
 
-from vllm.triton_utils import HAS_TRITON
-
-if HAS_TRITON:
-    import vllm_ascend.patch.worker.patch_triton
+import vllm_ascend.patch.worker.patch_triton
 
 # isort: off
 import vllm_ascend.patch.platform.patch_sched_yield  # noqa

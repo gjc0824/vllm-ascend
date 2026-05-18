@@ -38,6 +38,8 @@ def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
         scheduler_config.max_num_seqs * cache_config.block_size,
     )
 
+    chunked_prefill_workspace_size = 8*1024
+
     return chunked_prefill_workspace_size
 
 

@@ -242,8 +242,13 @@ def _vpp_dsv2_model_forward(
         llama_4_scaling = None
     # logger.info(f">>>>>>>>>>>>>>>>> {start}, ++++++++++++++++, {end} ")
     for layer in islice(self.layers, start, end):
-        # if get_tp_group().rank_in_group == 0:
-        #     logger.info(f"hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}, residual: {residual}")
+        if get_tp_group().rank_in_group == 0:
+            try:
+                logger.info(f">>>>>>>>>>> layer: {layer.mlp.experts.layer_id}")
+            except:
+                logger.info(f">>>>>>>>> mlp layer")
+            logger.info(f"hidden_states.shape: {hidden_states.shape}")
+            # logger.info(f"hidden_states.shape: {hidden_states.shape}, hidden_states: {hidden_states}, residual: {residual}")
         hidden_states, residual = layer(
             positions, hidden_states, residual, llama_4_scaling)
 

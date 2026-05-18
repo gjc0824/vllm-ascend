@@ -15,10 +15,11 @@
 # limitations under the License.
 #
 
-
+from collections import deque
 import torch
 import vllm
-from torch.distributed import Backend
+from torch import Tensor
+from torch.distributed import Backend, ProcessGroup, Work
 from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
@@ -35,6 +36,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
+        self._async_send_buff: deque[tuple[Work, Tensor]] = deque()
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)

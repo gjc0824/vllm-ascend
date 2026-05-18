@@ -149,6 +149,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         moe_comm_method = get_forward_context().moe_comm_method
+        # if get_tp_group().rank_in_group == 0:
+        #     logger.info(f">>>>>>>>>>>> ascend moe layer_id: {layer.layer_id}")
+        #     # logger.info(f">>>>>>>>>>>>>>>> w13_weight.shape: {layer.w13_weight.shape}, w13_weight: {layer.w13_weight}")
+        #     # logger.info(f">>>>>>>>>>>>>>>> w2_weight.shape: {layer.w2_weight.shape}, w2_weight: {layer.w2_weight}")
         final_hidden_states = moe_comm_method.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -669,6 +673,8 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        if get_tp_group().rank_in_group == 0:
+            logger.info(f">>>>>>>>>>>> ascend moe layer_id: {self.layer_id}")
         if self.multistream_overlap_gate:
             set_flash_common3_context(shared_experts=self._shared_experts)
 

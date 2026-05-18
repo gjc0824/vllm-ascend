@@ -246,6 +246,7 @@ class VppBatchContext:
     num_discarded_requests_snapshot: int
     next_vp_stage: int = 0
     carry_intermediate_tensors: IntermediateTensors | None = None
+    pending_noop_cleanup: bool = False
 
 
 @dataclass
@@ -1472,6 +1473,8 @@ class NPUModelRunner(GPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | VppContinuationOutput | None:
         batch_id = getattr(scheduler_output, "batch_id", None)
+        if get_tp_group().rank_in_group == 0:
+            print("================= batch_id", batch_id)
         if batch_id is None:
             raise RuntimeError("VPP requires SchedulerOutput.batch_id")
 
@@ -1485,9 +1488,68 @@ class NPUModelRunner(GPUModelRunner):
             ctx, stage_intermediate_tensors = prepared
             self._vpp_contexts[batch_id] = ctx
         else:
+            if ctx.pending_noop_cleanup:
+                # Fold-point ranks in vp_size=2 may finish both local stages in
+                # the prior call and only need to participate in one final noop.
+                self._vpp_contexts.pop(batch_id, None)
+                return self._make_vpp_empty_output()
             stage_intermediate_tensors = None
 
         return self._run_vpp_stage(ctx, stage_intermediate_tensors)
+
+    def _make_vpp_empty_output(
+        self,
+        kv_connector_output: "KVConnectorOutput | None" = None,
+    ) -> ModelRunnerOutput:
+        output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.kv_connector_output = kv_connector_output
+        return output
+
+    def _merge_vpp_kv_connector_output(
+        self,
+        accumulated: "KVConnectorOutput | None",
+        current: "KVConnectorOutput | None",
+    ) -> "KVConnectorOutput | None":
+        if current is None:
+            return accumulated
+        if accumulated is None:
+            return KVConnectorOutput(
+                finished_sending=set(current.finished_sending or ()) or None,
+                finished_recving=set(current.finished_recving or ()) or None,
+                kv_connector_stats=current.kv_connector_stats,
+                kv_cache_events=current.kv_cache_events,
+                invalid_block_ids=set(current.invalid_block_ids),
+                expected_finished_count=current.expected_finished_count,
+            )
+
+        if current.finished_sending:
+            accumulated.finished_sending = set(accumulated.finished_sending or ())
+            accumulated.finished_sending.update(current.finished_sending)
+        if current.finished_recving:
+            accumulated.finished_recving = set(accumulated.finished_recving or ())
+            accumulated.finished_recving.update(current.finished_recving)
+
+        if accumulated.kv_connector_stats is None:
+            accumulated.kv_connector_stats = current.kv_connector_stats
+        elif current.kv_connector_stats is not None:
+            accumulated.kv_connector_stats = (
+                accumulated.kv_connector_stats.aggregate(
+                    current.kv_connector_stats
+                )
+            )
+
+        if accumulated.kv_cache_events is None:
+            accumulated.kv_cache_events = current.kv_cache_events
+        elif current.kv_cache_events is not None:
+            accumulated.kv_cache_events.add_events(
+                current.kv_cache_events.get_all_events()
+            )
+            accumulated.kv_cache_events.increment_workers(1)
+
+        accumulated.invalid_block_ids.update(current.invalid_block_ids)
+        if current.expected_finished_count > 0:
+            accumulated.expected_finished_count = current.expected_finished_count
+        return accumulated
 
     def _prepare_vpp_context(
         self,
@@ -1732,85 +1794,154 @@ class NPUModelRunner(GPUModelRunner):
         )
         from vllm_ascend.distributed.vpp_utils import (
             get_vpp_comm_info,
+            is_vpp_fold_point,
             is_vpp_last_stage,
         )
 
         pp_rank = get_pp_group().rank_in_group
         pp_size = get_pp_group().world_size
-        vp_stage = ctx.next_vp_stage
-        set_virtual_pipeline_parallel_rank(vp_stage)
-
-        comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
         all_gather_group = get_tp_group() if not enable_sp() else None
+        aggregated_kv_connector_output = None
+        continued_across_fold_point = False
 
-        if comm.need_recv:
-            intermediate_tensors = IntermediateTensors(
-                get_pp_group().recv_tensor_dict(
-                    src=comm.recv_src,
-                    all_gather_group=all_gather_group,
+        while ctx.next_vp_stage < ctx.vp_size:
+            vp_stage = ctx.next_vp_stage
+            set_virtual_pipeline_parallel_rank(vp_stage)
+
+            comm = get_vpp_comm_info(pp_rank, pp_size, vp_stage, ctx.vp_size)
+
+            if comm.need_recv:
+                # Check if the sender is a fold-point rank that sent via
+                # CPU Gloo (to avoid HCCL stream deadlock).
+                fold_recv = (
+                    vp_stage > 0
+                    and is_vpp_fold_point(
+                        comm.recv_src, pp_size, vp_stage - 1, ctx.vp_size
+                    )
                 )
-            )
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
-                ctx.num_tokens_padded, intermediate_tensors, True
-            )
-        elif vp_stage > 0:
-            intermediate_tensors = ctx.carry_intermediate_tensors
+                if fold_recv:
+                    cpu_dict = get_pp_group().recv_tensor_dict(
+                        src=comm.recv_src,
+                    )
+                    intermediate_tensors = IntermediateTensors(
+                        {k: v.to(self.device)
+                         for k, v in cpu_dict.items()}
+                    )
+                else:
+                    intermediate_tensors = IntermediateTensors(
+                        get_pp_group().recv_tensor_dict(
+                            src=comm.recv_src,
+                            all_gather_group=all_gather_group,
+                        )
+                    )
+                intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+                    ctx.num_tokens_padded, intermediate_tensors, True
+                )
+            elif vp_stage > 0:
+                intermediate_tensors = ctx.carry_intermediate_tensors
 
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                ctx.attn_metadata,
-                self.vllm_config,
-                num_tokens=ctx.num_tokens_padded,
-                num_tokens_across_dp=ctx.num_tokens_across_dp,
-                aclgraph_runtime_mode=ctx.cudagraph_mode,
-                batch_descriptor=ctx.batch_desc,
-                num_actual_tokens=ctx.scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                max_tokens_across_pcp=0
-                if self.pcp_size == 1
-                else self.pcp_manager.max_num_tokens_across_pcp,
-                skip_compiled=ctx.has_encoder_input,
-            ),
-            self.maybe_get_kv_connector_output(
-                ctx.scheduler_output
-            ) as kv_connector_output,
-        ):
-            hidden_states = self._model_forward(
-                ctx.num_tokens_padded,
-                ctx.input_ids,
-                ctx.positions,
-                intermediate_tensors,
-                ctx.inputs_embeds,
-                _skip_vpp=True,
-                **ctx.model_kwargs,
-            )
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    ctx.attn_metadata,
+                    self.vllm_config,
+                    num_tokens=ctx.num_tokens_padded,
+                    num_tokens_across_dp=ctx.num_tokens_across_dp,
+                    aclgraph_runtime_mode=ctx.cudagraph_mode,
+                    batch_descriptor=ctx.batch_desc,
+                    num_actual_tokens=ctx.scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    max_tokens_across_pcp=0
+                    if self.pcp_size == 1
+                    else self.pcp_manager.max_num_tokens_across_pcp,
+                    skip_compiled=ctx.has_encoder_input,
+                ),
+                self.maybe_get_kv_connector_output(
+                    ctx.scheduler_output
+                ) as kv_connector_output,
+            ):
+                hidden_states = self._model_forward(
+                    ctx.num_tokens_padded,
+                    ctx.input_ids,
+                    ctx.positions,
+                    intermediate_tensors,
+                    ctx.inputs_embeds,
+                    _skip_vpp=True,
+                    **ctx.model_kwargs,
+                )
 
-        is_last = is_vpp_last_stage(
-            pp_rank, pp_size, vp_stage, ctx.vp_size
-        )
-        if not is_last:
+            aggregated_kv_connector_output = self._merge_vpp_kv_connector_output(
+                aggregated_kv_connector_output,
+                kv_connector_output,
+            )
+            is_last = is_vpp_last_stage(
+                pp_rank, pp_size, vp_stage, ctx.vp_size
+            )
+            ctx.next_vp_stage += 1
+
+            if is_last:
+                get_pp_group()._wait_send_buff()
+                self._vpp_contexts.pop(ctx.batch_id, None)
+                return self._postprocess_after_forward(
+                    ctx, hidden_states, aggregated_kv_connector_output
+                )
+
             assert isinstance(hidden_states, IntermediateTensors)
             if comm.need_send:
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors,
-                    dst=comm.send_dst,
-                    all_gather_group=all_gather_group,
-                )
+                if continued_across_fold_point:
+                    # Fold-point send: route through CPU Gloo backend to
+                    # avoid HCCL stream deadlock.  HCCL serialises ops
+                    # within a process-group, so a fold-point isend whose
+                    # matching recv is in a later RPC call blocks all
+                    # subsequent HCCL recv ops for other batches.  Gloo
+                    # uses TCP buffering and does not have this issue.
+                    cpu_tensors = {
+                        k: v.cpu()
+                        for k, v in hidden_states.tensors.items()
+                    }
+                    get_pp_group().send_tensor_dict(
+                        cpu_tensors,
+                        dst=comm.send_dst,
+                        is_async=True,
+                    )
+                else:
+                    get_pp_group().send_tensor_dict(
+                        hidden_states.tensors,
+                        dst=comm.send_dst,
+                        all_gather_group=all_gather_group,
+                        is_async=True,
+                    )
                 ctx.carry_intermediate_tensors = None
             else:
                 ctx.carry_intermediate_tensors = hidden_states
-            ctx.next_vp_stage += 1
+
+            if (
+                ctx.vp_size % 2 == 0
+                and is_vpp_fold_point(pp_rank, pp_size, vp_stage, ctx.vp_size)
+            ):
+                # Keep fold-point stages back-to-back on the same rank so core
+                # only yields at real cross-rank boundaries.
+                continued_across_fold_point = True
+                intermediate_tensors = ctx.carry_intermediate_tensors
+                continue
+
+            if ctx.vp_size % 2 == 0 and ctx.next_vp_stage >= ctx.vp_size:
+                if continued_across_fold_point:
+                    ctx.pending_noop_cleanup = True
+                else:
+                    self._vpp_contexts.pop(ctx.batch_id, None)
+                return self._make_vpp_empty_output(
+                    aggregated_kv_connector_output
+                )
+
             return VppContinuationOutput(
                 batch_id=ctx.batch_id,
-                kv_connector_output=kv_connector_output,
+                next_vp_stage=ctx.next_vp_stage,
+                kv_connector_output=aggregated_kv_connector_output,
             )
 
-        ctx.next_vp_stage += 1
         self._vpp_contexts.pop(ctx.batch_id, None)
-        return self._postprocess_after_forward(
-            ctx, hidden_states, kv_connector_output
-        )
+        return self._make_vpp_empty_output(aggregated_kv_connector_output)
 
     def _postprocess_after_forward(
         self,
@@ -1873,7 +2004,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             assert broadcasted is not None
             logits = broadcasted["logits"]
-
+        print(">>>>>>>>>>>>>>>>>>>>>>", ctx.batch_id)
         self._pending_vpp_sample_states.append(
             VppPendingSampleState(
                 batch_id=ctx.batch_id,
@@ -1892,9 +2023,9 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 kv_connector_output=kv_connector_output,
                 input_batch=ctx.input_batch_snapshot,
-                num_prompt_logprobs=ctx.num_prompt_logprobs_snapshot.copy(),
-                query_start_loc_cpu=ctx.query_start_loc_cpu_snapshot.clone(),
-                discard_request_indices_cpu=ctx.discard_request_indices_cpu_snapshot.clone(),
+                num_prompt_logprobs=ctx.num_prompt_logprobs_snapshot,
+                query_start_loc_cpu=ctx.query_start_loc_cpu_snapshot,
+                discard_request_indices_cpu=ctx.discard_request_indices_cpu_snapshot,
                 num_discarded_requests=ctx.num_discarded_requests_snapshot,
             )
         )
@@ -1943,7 +2074,6 @@ class NPUModelRunner(GPUModelRunner):
         else:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
-
         if execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
@@ -1956,7 +2086,6 @@ class NPUModelRunner(GPUModelRunner):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
             return output
-
         sample_context = (
             self._use_vpp_pending_sample_state(pending_vpp_state)
             if pending_vpp_state is not None
@@ -2011,7 +2140,6 @@ class NPUModelRunner(GPUModelRunner):
                     sample_hidden_states,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
-
             (
                 logprobs_lists,
                 valid_sampled_token_ids,
@@ -2027,7 +2155,6 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
-
             with record_function_or_nullcontext("draft_token"):
                 if self.speculative_config:
                     use_padded_batch_for_eagle = (
