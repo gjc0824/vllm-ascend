@@ -77,11 +77,13 @@ class ProfilingChunkScheduler(Scheduler):
             include_finished_set=include_finished_set,
             log_stats=log_stats,
         )
+        self.mm_registry = mm_registry
 
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
         init_ascend_config(vllm_config)
         profiling_cfg = get_ascend_config().profiling_chunk_config
+        self.profiling_chunk_config = profiling_cfg
         base_chunk = self.max_num_scheduled_tokens
 
         self.profiling_chunk_manager = ProfilingChunkManager(
@@ -179,6 +181,7 @@ class ProfilingChunkScheduler(Scheduler):
                 "[ProfilingChunk] Profiling failed: only %d samples collected",
                 len(seq_lens),
             )
+            self._run_mm_encoder_profile_init(model_executor)
             return
 
         logger.info(
@@ -190,6 +193,7 @@ class ProfilingChunkScheduler(Scheduler):
 
         predictor = self.profiling_chunk_manager.predictor
         if not predictor.fit(seq_lens, latencies):
+            self._run_mm_encoder_profile_init(model_executor)
             return
 
         predictor.set_target_latency(base_chunk_size)
@@ -197,6 +201,101 @@ class ProfilingChunkScheduler(Scheduler):
         self.profiling_chunk_manager._profiling_done = True
 
         logger.info("[ProfilingChunk] Profiling completed successfully")
+        self._run_mm_encoder_profile_init(model_executor)
+
+    def _run_mm_encoder_profile_init(self, model_executor) -> None:
+        cfg = self.profiling_chunk_config
+        if getattr(cfg, "mm_encoder_profile_enabled", False) is not True:
+            return
+        if not getattr(self.vllm_config.model_config, "is_multimodal_model", False):
+            logger.info("[ProfilingChunk] Skip multimodal encoder profiling for text-only model")
+            return
+
+        profile_specs = self._build_mm_encoder_profile_specs()
+        if not profile_specs:
+            logger.info("[ProfilingChunk] Skip multimodal encoder profiling: no supported modality")
+            return
+
+        rpc_kwargs = self._build_encoder_rpc_kwargs(model_executor)
+        logger.info(
+            "[ProfilingChunk] Running multimodal encoder profiling with %d samples...",
+            len(profile_specs),
+        )
+        for spec in profile_specs:
+            try:
+                result = model_executor.collective_rpc(
+                    "profile_mm_encoder_latency",
+                    args=(spec,),
+                    **rpc_kwargs,
+                )
+            except Exception as e:
+                logger.warning("[ProfilingChunk] Multimodal encoder profiling failed for %s: %s", spec, e)
+                continue
+
+            profile = self._extract_profile_result(result)
+            if profile is None:
+                continue
+
+            latency_ms = profile.get("latency_ms")
+            if latency_ms is None:
+                logger.warning(
+                    "[ProfilingChunk] Multimodal encoder profile produced no latency for %s: %s",
+                    profile.get("mm_counts"),
+                    profile.get("error"),
+                )
+                continue
+
+            self.profiling_chunk_manager.record_encoder_profile(profile)
+            logger.info(
+                "[ProfilingChunk] MM encoder profile: counts=%s latency=%.2f ms",
+                profile.get("mm_counts"),
+                latency_ms,
+            )
+
+        logger.info(
+            "[ProfilingChunk] Collected %d multimodal encoder profile samples",
+            len(self.profiling_chunk_manager.encoder_profile_data),
+        )
+
+    def _build_mm_encoder_profile_specs(self) -> list[dict]:
+        cfg = self.profiling_chunk_config
+        modalities = getattr(cfg, "mm_encoder_profile_modalities", None)
+        if modalities is None:
+            modalities = self._get_supported_mm_modalities()
+
+        counts = getattr(cfg, "mm_encoder_profile_counts", [1])
+        warmup = getattr(cfg, "mm_encoder_profile_warmup", 1)
+        repeat = getattr(cfg, "mm_encoder_profile_repeat", 3)
+
+        profile_specs: list[dict] = []
+        for modality in modalities:
+            for count in counts:
+                profile_specs.append(
+                    {
+                        "mm_counts": {modality: count},
+                        "warmup": warmup,
+                        "repeat": repeat,
+                    }
+                )
+        return profile_specs
+
+    def _get_supported_mm_modalities(self) -> list[str]:
+        try:
+            info = self.mm_registry.get_processing_info(self.vllm_config.model_config)
+            limits = info.supported_mm_limits
+        except Exception as e:
+            logger.warning("[ProfilingChunk] Failed to inspect multimodal modalities: %s", e)
+            return []
+
+        modalities: list[str] = []
+        for modality in limits:
+            try:
+                if self.vllm_config.model_config.get_multimodal_config().get_limit_per_prompt(modality) == 0:
+                    continue
+            except Exception:
+                pass
+            modalities.append(modality)
+        return modalities
 
     @staticmethod
     def _build_rpc_kwargs(model_executor) -> dict:
@@ -219,12 +318,36 @@ class ProfilingChunkScheduler(Scheduler):
         return kwargs
 
     @staticmethod
+    def _build_encoder_rpc_kwargs(model_executor) -> dict:
+        """Reply from rank 0, which belongs to the first PP stage that owns the encoder."""
+        kwargs: dict = {}
+        if not hasattr(model_executor, "collective_rpc"):
+            return kwargs
+
+        sig = inspect.signature(model_executor.collective_rpc)
+        if "unique_reply_rank" not in sig.parameters:
+            return kwargs
+
+        kwargs["unique_reply_rank"] = 0
+        return kwargs
+
+    @staticmethod
     def _extract_latency(result) -> float | None:
         """Extract latency value from collective_rpc result."""
         if isinstance(result, (int, float)):
             return float(result)
         if isinstance(result, list) and len(result) > 0:
             return float(result[0])
+        return None
+
+    @staticmethod
+    def _extract_profile_result(result) -> dict | None:
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    return item
         return None
 
     # ------------------------------------------------------------------

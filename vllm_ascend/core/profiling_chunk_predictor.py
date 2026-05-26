@@ -28,6 +28,7 @@ The approach:
 """
 
 import math
+from typing import Any
 
 import numpy as np
 from vllm.logger import logger
@@ -317,6 +318,7 @@ class ProfilingChunkManager:
         self.base_chunk_size = base_chunk_size
         self.page_size = page_size
         self.chunked_fit_data: list = []
+        self.encoder_profile_data: list[dict[str, Any]] = []
 
         self.predictor = ChunkSizePredictor(smooth_factor=smooth_factor, min_chunk=min_chunk)
         self._profiling_done = False
@@ -330,6 +332,19 @@ class ProfilingChunkManager:
     @property
     def history_ready(self) -> bool:
         return self.is_ready and self.predictor.with_history_ready
+
+    @property
+    def has_encoder_profile_data(self) -> bool:
+        return len(self.encoder_profile_data) > 0
+
+    def record_encoder_profile(self, profile: dict[str, Any] | list[dict[str, Any]] | None) -> None:
+        """Store startup multimodal encoder latency samples for later budget accounting."""
+        if profile is None:
+            return
+        if isinstance(profile, list):
+            self.encoder_profile_data.extend(item for item in profile if item is not None)
+        else:
+            self.encoder_profile_data.append(profile)
 
     def predict_chunk_size(self, num_computed_tokens: int, target_time: float) -> int | None:
         """Predict optimal chunk size for given history length."""

@@ -45,6 +45,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -98,7 +99,7 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     maybe_create_ubatch_slices,
 )
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, sanity_check_mm_encoder_outputs
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -517,6 +518,121 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
+
+    @torch.inference_mode()
+    def profile_mm_encoder_latency(self, profile_spec: dict[str, Any]) -> dict[str, Any] | None:
+        """Profile multimodal encoder latency using vLLM's model-specific dummy inputs."""
+        if not self.supports_mm_inputs or not get_pp_group().is_first_rank:
+            return None
+
+        mm_counts = profile_spec.get("mm_counts", {})
+        if not mm_counts:
+            return None
+
+        warmup = int(profile_spec.get("warmup", 1))
+        repeat = max(int(profile_spec.get("repeat", 3)), 1)
+        mm_kwargs = []
+
+        try:
+            dummy_mm_inputs = self.mm_registry.get_dummy_mm_inputs(
+                self.model_config,
+                mm_counts=mm_counts,
+            )
+            mm_kwargs_items = dummy_mm_inputs["mm_kwargs"].require_data()
+            for modality, items in mm_kwargs_items.items():
+                for item in items:
+                    mm_kwargs.append((modality, item))
+        except Exception as e:
+            logger.warning("[ProfilingChunk] Failed to build dummy multimodal inputs for %s: %s", mm_counts, e)
+            return {
+                "mm_counts": dict(mm_counts),
+                "latency_ms": None,
+                "error": str(e),
+            }
+
+        if not mm_kwargs:
+            return {
+                "mm_counts": dict(mm_counts),
+                "latency_ms": 0.0,
+                "latencies_ms": [],
+                "num_items": 0,
+                "num_encoder_tokens": 0,
+            }
+
+        def run_encoder() -> list[torch.Tensor]:
+            encoder_outputs: list[torch.Tensor] = []
+            current_item_idx = 0
+            for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+                mm_kwargs,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            ):
+                if (
+                    (self.is_multimodal_pruning_enabled or self.requires_sequential_video_encoding)
+                    and modality == "video"
+                    and num_items > 1
+                ):
+                    batch_outputs = []
+                    for video_idx in range(num_items):
+                        video_mm_kwargs_item = mm_kwargs[current_item_idx + video_idx]
+                        _, _, micro_batch_mm_inputs = next(
+                            group_and_batch_mm_kwargs(
+                                [video_mm_kwargs_item],
+                                device=self.device,
+                                pin_memory=self.pin_memory,
+                            )
+                        )
+                        micro_batch_outputs = self.model.embed_multimodal(
+                            **micro_batch_mm_inputs
+                        )
+                        sanity_check_mm_encoder_outputs(
+                            micro_batch_outputs,
+                            expected_num_items=1,
+                        )
+                        batch_outputs.extend(micro_batch_outputs)
+                else:
+                    cudagraph_output = None
+                    if (
+                        self.encoder_cudagraph_manager is not None
+                        and self.encoder_cudagraph_manager.supports_modality(modality)
+                    ):
+                        cudagraph_output = self.encoder_cudagraph_manager.execute(
+                            mm_kwargs_batch,
+                        )
+                    batch_outputs = (
+                        cudagraph_output
+                        if cudagraph_output is not None
+                        else self.model.embed_multimodal(**mm_kwargs_batch)
+                    )
+                sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
+                encoder_outputs.extend(batch_outputs)
+                current_item_idx += num_items
+            return encoder_outputs
+
+        for _ in range(max(warmup, 0)):
+            outputs = run_encoder()
+            del outputs
+        torch.npu.synchronize()
+
+        latencies_ms: list[float] = []
+        last_outputs: list[torch.Tensor] = []
+        for _ in range(repeat):
+            torch.npu.synchronize()
+            start_time = time.perf_counter()
+            last_outputs = run_encoder()
+            torch.npu.synchronize()
+            latencies_ms.append((time.perf_counter() - start_time) * 1000)
+
+        num_encoder_tokens = sum(int(output.shape[0]) for output in last_outputs)
+        return {
+            "mm_counts": dict(mm_counts),
+            "latency_ms": float(np.median(latencies_ms)),
+            "latencies_ms": latencies_ms,
+            "num_items": len(mm_kwargs),
+            "num_encoder_tokens": num_encoder_tokens,
+            "warmup": warmup,
+            "repeat": repeat,
+        }
 
     def _init_device_properties(self) -> None:
         self.num_sms = None

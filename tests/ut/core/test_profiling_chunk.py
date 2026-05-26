@@ -78,6 +78,27 @@ class TestProfilingChunkConfig(TestBase):
         self.assertFalse(cfg.enabled)
         self.assertAlmostEqual(cfg.smooth_factor, 1.0)
         self.assertEqual(cfg.min_chunk, 4096)
+        self.assertFalse(cfg.mm_encoder_profile_enabled)
+        self.assertEqual(cfg.mm_encoder_profile_counts, [1])
+        self.assertIsNone(cfg.mm_encoder_profile_modalities)
+        self.assertEqual(cfg.mm_encoder_profile_warmup, 1)
+        self.assertEqual(cfg.mm_encoder_profile_repeat, 3)
+
+    def test_mm_encoder_profile_config(self):
+        cfg = ProfilingChunkConfig(
+            {
+                "mm_encoder_profile_enabled": True,
+                "mm_encoder_profile_counts": [1, 2],
+                "mm_encoder_profile_modalities": "vision_chunk",
+                "mm_encoder_profile_warmup": 0,
+                "mm_encoder_profile_repeat": 2,
+            }
+        )
+        self.assertTrue(cfg.mm_encoder_profile_enabled)
+        self.assertEqual(cfg.mm_encoder_profile_counts, [1, 2])
+        self.assertEqual(cfg.mm_encoder_profile_modalities, ["vision_chunk"])
+        self.assertEqual(cfg.mm_encoder_profile_warmup, 0)
+        self.assertEqual(cfg.mm_encoder_profile_repeat, 2)
 
     def test_invalid_smooth_factor_raises(self):
         with self.assertRaises(ValueError):
@@ -88,6 +109,16 @@ class TestProfilingChunkConfig(TestBase):
     def test_invalid_min_chunk_raises(self):
         with self.assertRaises(ValueError):
             ProfilingChunkConfig({"min_chunk": 0})
+
+    def test_invalid_mm_encoder_profile_config_raises(self):
+        with self.assertRaises(ValueError):
+            ProfilingChunkConfig({"mm_encoder_profile_counts": []})
+        with self.assertRaises(ValueError):
+            ProfilingChunkConfig({"mm_encoder_profile_counts": [0]})
+        with self.assertRaises(ValueError):
+            ProfilingChunkConfig({"mm_encoder_profile_warmup": -1})
+        with self.assertRaises(ValueError):
+            ProfilingChunkConfig({"mm_encoder_profile_repeat": 0})
 
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
@@ -235,6 +266,13 @@ class TestProfilingChunkManager(TestBase):
         self.assertGreaterEqual(len(mgr.chunked_fit_data), 10)
         self.assertTrue(mgr.history_ready)
 
+    def test_record_encoder_profile(self):
+        mgr = ProfilingChunkManager(base_chunk_size=8192, page_size=128)
+        mgr.record_encoder_profile({"mm_counts": {"image": 1}, "latency_ms": 12.0})
+        mgr.record_encoder_profile([{"mm_counts": {"image": 2}, "latency_ms": 20.0}])
+        self.assertTrue(mgr.has_encoder_profile_data)
+        self.assertEqual(len(mgr.encoder_profile_data), 2)
+
 
 # ===================================================================
 # ProfilingChunkScheduler
@@ -251,6 +289,11 @@ class TestProfilingChunkScheduler(TestBase):
         profiling_cfg.enabled = True
         profiling_cfg.smooth_factor = 0.8
         profiling_cfg.min_chunk = 256
+        profiling_cfg.mm_encoder_profile_enabled = False
+        profiling_cfg.mm_encoder_profile_counts = [1]
+        profiling_cfg.mm_encoder_profile_modalities = None
+        profiling_cfg.mm_encoder_profile_warmup = 1
+        profiling_cfg.mm_encoder_profile_repeat = 3
         mock_get_ascend_config.return_value = MagicMock(profiling_chunk_config=profiling_cfg)
 
         mock_hf_config = MagicMock()
@@ -358,6 +401,36 @@ class TestProfilingChunkScheduler(TestBase):
         scheduler.run_profiling_chunk_init(None)
         self.assertTrue(scheduler._profiling_initialized)
         self.assertFalse(scheduler.profiling_chunk_manager.is_ready)
+
+    def test_mm_encoder_profile_init(self):
+        scheduler = self.create_scheduler()
+        scheduler.profiling_chunk_config.mm_encoder_profile_enabled = True
+        scheduler.profiling_chunk_config.mm_encoder_profile_counts = [1, 2]
+        scheduler.profiling_chunk_config.mm_encoder_profile_modalities = ["image"]
+        scheduler.profiling_chunk_config.mm_encoder_profile_warmup = 0
+        scheduler.profiling_chunk_config.mm_encoder_profile_repeat = 2
+
+        mock_executor = MagicMock()
+        mock_executor.collective_rpc.return_value = {
+            "mm_counts": {"image": 1},
+            "latency_ms": 10.0,
+        }
+
+        with patch.object(type(scheduler.vllm_config.model_config), "is_multimodal_model", True):
+            scheduler._run_mm_encoder_profile_init(mock_executor)
+
+        self.assertEqual(mock_executor.collective_rpc.call_count, 2)
+        mock_executor.collective_rpc.assert_any_call(
+            "profile_mm_encoder_latency",
+            args=(
+                {
+                    "mm_counts": {"image": 1},
+                    "warmup": 0,
+                    "repeat": 2,
+                },
+            ),
+        )
+        self.assertEqual(len(scheduler.profiling_chunk_manager.encoder_profile_data), 2)
 
     def test_schedule_new_requests(self):
         scheduler = self.create_scheduler()

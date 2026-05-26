@@ -642,6 +642,18 @@ class NPUWorker(WorkerBase):
 
         return latency_ms
 
+    @torch.inference_mode()
+    def profile_mm_encoder_latency(self, profile_spec: dict) -> dict | None:
+        """
+        Profile multimodal encoder latency for profiling-based chunk scheduling.
+
+        All TP ranks in the first PP stage execute the encoder so model-parallel
+        collectives remain synchronized. The scheduler reads rank 0's result.
+        """
+        if self.model_runner is None:
+            return None
+        return self.model_runner.profile_mm_encoder_latency(profile_spec)
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
         if not has_kv_transfer_group():

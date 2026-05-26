@@ -613,13 +613,53 @@ class ProfilingChunkConfig:
         # the start to skip online calibration entirely and rely solely on
         # the startup profiling model (avoids per-step sync overhead).
         self.need_timing: bool = config.get("need_timing", self.enabled)
+        self.mm_encoder_profile_enabled: bool = config.get("mm_encoder_profile_enabled", False)
+        self.mm_encoder_profile_counts: list[int] = self._parse_int_list(
+            config.get("mm_encoder_profile_counts", [1])
+        )
+        self.mm_encoder_profile_modalities: list[str] | None = self._parse_str_list(
+            config.get("mm_encoder_profile_modalities")
+        )
+        self.mm_encoder_profile_warmup: int = int(config.get("mm_encoder_profile_warmup", 1))
+        self.mm_encoder_profile_repeat: int = int(config.get("mm_encoder_profile_repeat", 3))
         self._validate()
+
+    @staticmethod
+    def _parse_int_list(value) -> list[int]:
+        if isinstance(value, int):
+            return [int(value)]
+        return [int(item) for item in value]
+
+    @staticmethod
+    def _parse_str_list(value) -> list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [value]
+        return [str(item) for item in value]
 
     def _validate(self):
         if not (0 < self.smooth_factor <= 1.0):
             raise ValueError(f"profiling_chunk_config.smooth_factor must be in (0, 1], got {self.smooth_factor}")
         if self.min_chunk <= 0:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
+        if not self.mm_encoder_profile_counts:
+            raise ValueError("profiling_chunk_config.mm_encoder_profile_counts must not be empty")
+        if any(count <= 0 for count in self.mm_encoder_profile_counts):
+            raise ValueError(
+                "profiling_chunk_config.mm_encoder_profile_counts must contain positive integers, "
+                f"got {self.mm_encoder_profile_counts}"
+            )
+        if self.mm_encoder_profile_warmup < 0:
+            raise ValueError(
+                "profiling_chunk_config.mm_encoder_profile_warmup must be non-negative, "
+                f"got {self.mm_encoder_profile_warmup}"
+            )
+        if self.mm_encoder_profile_repeat <= 0:
+            raise ValueError(
+                "profiling_chunk_config.mm_encoder_profile_repeat must be positive, "
+                f"got {self.mm_encoder_profile_repeat}"
+            )
 
 
 class EplbConfig:
