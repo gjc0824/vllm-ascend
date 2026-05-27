@@ -18,11 +18,12 @@ from __future__ import annotations
 import logging
 from functools import wraps
 from typing import Any, cast
+from collections import deque
 
 import torch
 import vllm
 from torch.distributed import Backend
-from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group
+from vllm.distributed.parallel_state import GroupCoordinator, _get_unique_name, _register_group, Handle
 
 from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCommunicator
 from vllm_ascend.patch.worker._hccl_pg_registry import HcclPgRegistry, make_hccl_pg_key
@@ -177,6 +178,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             except Exception:
                 logger.exception("Failed to clean up partially initialized GroupCoordinatorPatch")
             raise
+        self._async_send_buff: deque[tuple[Handle, torch.Tensor]] = deque()
 
     def destroy(self):
         cpu_group = getattr(self, "cpu_group", None)

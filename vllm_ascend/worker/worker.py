@@ -142,6 +142,9 @@ class NPUWorker(WorkerBase):
             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.20.2; falling back to v1 model runner.")
             self.use_v2_model_runner = False
         self._pp_send_work: list[Handle] = []
+        self.enable_pp_async_send = (
+            not vllm_config.parallel_config.disable_pp_async_send
+        )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -405,7 +408,10 @@ class NPUWorker(WorkerBase):
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
 
-        if self._pp_send_work:
+        # In the legacy path, finish the previous non-blocking PP send before
+        # starting a new step. Async PP send mode keeps those buffers in the
+        # PP group coordinator and lets later steps continue.
+        if self._pp_send_work and not self.enable_pp_async_send:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
@@ -448,7 +454,10 @@ class NPUWorker(WorkerBase):
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=all_gather_group,
+            async_metadata=self.enable_pp_async_send,
         )
+        if self.enable_pp_async_send:
+            self._pp_send_work = []
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
