@@ -20,6 +20,8 @@
 import copy
 import gc
 import logging
+import os
+import sys
 from types import NoneType
 
 import torch
@@ -75,6 +77,16 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _pp_send_diag_log(message: str, *args: object) -> None:
+    logger.warning(message, *args)
+    try:
+        text = message % args if args else message
+        sys.stderr.write(f"{text}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 class NPUWorker(WorkerBase):
@@ -145,6 +157,25 @@ class NPUWorker(WorkerBase):
         self.enable_pp_async_send = (
             not vllm_config.parallel_config.disable_pp_async_send
         )
+        pp_send_diag_env = os.getenv("VLLM_ASCEND_PP_SEND_DIAG", "0")
+        self._pp_send_diag_enabled = pp_send_diag_env.lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._pp_send_diag_step = 0
+        self._pp_send_diag_prev: dict[str, object] | None = None
+        _pp_send_diag_log(
+            "PP_SEND_DIAG init rank=%s env=%r enabled=%s async_send=%s "
+            "disable_pp_async_send=%s use_v2_model_runner=%s",
+            self.rank,
+            pp_send_diag_env,
+            self._pp_send_diag_enabled,
+            self.enable_pp_async_send,
+            vllm_config.parallel_config.disable_pp_async_send,
+            self.use_v2_model_runner,
+        )
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -163,6 +194,108 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+    def _pp_send_diag_handle_statuses(self) -> list[str]:
+        pp_group = get_pp_group()
+        handles = getattr(pp_group, "_async_send_buff", ())
+        statuses: list[str] = []
+        for idx, item in enumerate(handles):
+            handle = item[0]
+            try:
+                completed = handle.is_completed()
+            except Exception as exc:
+                completed = f"error:{type(exc).__name__}"
+            statuses.append(f"{idx}:{completed}")
+        return statuses
+
+    def _pp_send_diag_tensor_infos(
+        self, tensors: dict[str, torch.Tensor]
+    ) -> list[tuple[str, int, tuple[int, ...], str, bool]]:
+        infos: list[tuple[str, int, tuple[int, ...], str, bool]] = []
+        for name, tensor in tensors.items():
+            try:
+                ptr = tensor.data_ptr()
+                shape = tuple(tensor.shape)
+                dtype = str(tensor.dtype)
+                is_npu = tensor.device.type == "npu"
+            except Exception:
+                continue
+            infos.append((name, ptr, shape, dtype, is_npu))
+        return infos
+
+    def _pp_send_diag_before_forward(
+        self, scheduler_output: SchedulerOutput, forward_pass: bool
+    ) -> None:
+        if not self._pp_send_diag_enabled:
+            return
+        pp_group = get_pp_group()
+        prev = self._pp_send_diag_prev
+        _pp_send_diag_log(
+            "PP_SEND_DIAG before_forward rank=%s pp_rank=%s step=%d "
+            "forward=%s reqs=%d toks=%d async_send=%s pending=%s prev=%s",
+            self.rank,
+            pp_group.rank_in_group,
+            self._pp_send_diag_step,
+            forward_pass,
+            len(scheduler_output.num_scheduled_tokens),
+            scheduler_output.total_num_scheduled_tokens,
+            self.enable_pp_async_send,
+            self._pp_send_diag_handle_statuses(),
+            prev,
+        )
+
+    def _pp_send_diag_after_forward(self, output: object) -> None:
+        if not self._pp_send_diag_enabled:
+            return
+        pp_group = get_pp_group()
+        tensor_infos: list[tuple[str, int, tuple[int, ...], str, bool]] = []
+        reused: list[tuple[str, int]] = []
+        if isinstance(output, IntermediateTensors):
+            tensor_infos = self._pp_send_diag_tensor_infos(output.tensors)
+            prev = self._pp_send_diag_prev
+            prev_ptrs = set(prev.get("ptrs", ())) if prev else set()
+            reused = [(name, ptr) for name, ptr, *_ in tensor_infos if ptr in prev_ptrs]
+        _pp_send_diag_log(
+            "PP_SEND_DIAG after_forward rank=%s pp_rank=%s step=%d "
+            "output_type=%s pending=%s tensors=%s reused_prev_ptrs=%s",
+            self.rank,
+            pp_group.rank_in_group,
+            self._pp_send_diag_step,
+            type(output).__name__,
+            self._pp_send_diag_handle_statuses(),
+            tensor_infos,
+            reused,
+        )
+
+    def _pp_send_diag_after_isend(
+        self,
+        output: IntermediateTensors,
+        handles: list[Handle],
+    ) -> None:
+        if not self._pp_send_diag_enabled:
+            return
+        pp_group = get_pp_group()
+        tensor_infos = self._pp_send_diag_tensor_infos(output.tensors)
+        self._pp_send_diag_prev = {
+            "step": self._pp_send_diag_step,
+            "ptrs": [ptr for _, ptr, *_ in tensor_infos],
+            "tensors": tensor_infos,
+            "handle_count": len(handles),
+        }
+        _pp_send_diag_log(
+            "PP_SEND_DIAG after_isend rank=%s pp_rank=%s step=%d "
+            "handles=%d pending=%s tensors=%s",
+            self.rank,
+            pp_group.rank_in_group,
+            self._pp_send_diag_step,
+            len(handles),
+            self._pp_send_diag_handle_statuses(),
+            tensor_infos,
+        )
+
+    def _pp_send_diag_finish_step(self) -> None:
+        if self._pp_send_diag_enabled:
+            self._pp_send_diag_step += 1
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -418,6 +551,7 @@ class NPUWorker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        self._pp_send_diag_before_forward(scheduler_output, forward_pass)
         if forward_pass and not get_pp_group().is_first_rank:
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
             # it will conflict with the all-gather operation in flashcomm1.
@@ -439,7 +573,9 @@ class NPUWorker(WorkerBase):
             self.profiler.step()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        self._pp_send_diag_after_forward(output)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
+            self._pp_send_diag_finish_step()
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -456,19 +592,23 @@ class NPUWorker(WorkerBase):
             all_gather_group=all_gather_group,
             async_metadata=self.enable_pp_async_send,
         )
+        self._pp_send_diag_after_isend(output, self._pp_send_work)
         if self.enable_pp_async_send:
             self._pp_send_work = []
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
+            self._pp_send_diag_finish_step()
             return None
 
         # In case of PP with kv transfer, we need to pass through the
         # kv_connector_output
         if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+            self._pp_send_diag_finish_step()
             return EMPTY_MODEL_RUNNER_OUTPUT
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.kv_connector_output = kv_connector_output
+        self._pp_send_diag_finish_step()
         return output
 
     @torch.inference_mode()
