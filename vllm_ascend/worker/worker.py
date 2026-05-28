@@ -66,6 +66,7 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.pp_send_buffer import PPAsyncSendBufferPool
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -156,6 +157,9 @@ class NPUWorker(WorkerBase):
         self._pp_send_work: list[Handle] = []
         self.enable_pp_async_send = (
             not vllm_config.parallel_config.disable_pp_async_send
+        )
+        self._pp_send_buffer_pool: PPAsyncSendBufferPool | None = (
+            PPAsyncSendBufferPool() if self.enable_pp_async_send else None
         )
         pp_send_diag_env = os.getenv("VLLM_ASCEND_PP_SEND_DIAG", "0")
         self._pp_send_diag_enabled = pp_send_diag_env.lower() in (
@@ -270,27 +274,38 @@ class NPUWorker(WorkerBase):
     def _pp_send_diag_after_isend(
         self,
         output: IntermediateTensors,
+        send_tensors: dict[str, torch.Tensor],
         handles: list[Handle],
     ) -> None:
         if not self._pp_send_diag_enabled:
             return
         pp_group = get_pp_group()
         tensor_infos = self._pp_send_diag_tensor_infos(output.tensors)
+        send_tensor_infos = self._pp_send_diag_tensor_infos(send_tensors)
         self._pp_send_diag_prev = {
             "step": self._pp_send_diag_step,
-            "ptrs": [ptr for _, ptr, *_ in tensor_infos],
-            "tensors": tensor_infos,
+            "ptrs": [ptr for _, ptr, *_ in send_tensor_infos],
+            "output_tensors": tensor_infos,
+            "send_tensors": send_tensor_infos,
             "handle_count": len(handles),
+            "buffer_pool": (
+                self._pp_send_buffer_pool.debug_state()
+                if self._pp_send_buffer_pool is not None
+                else None
+            ),
         }
         _pp_send_diag_log(
             "PP_SEND_DIAG after_isend rank=%s pp_rank=%s step=%d "
-            "handles=%d pending=%s tensors=%s",
+            "handles=%d pending=%s output_tensors=%s send_tensors=%s "
+            "buffer_pool=%s",
             self.rank,
             pp_group.rank_in_group,
             self._pp_send_diag_step,
             len(handles),
             self._pp_send_diag_handle_statuses(),
             tensor_infos,
+            send_tensor_infos,
+            self._pp_send_diag_prev["buffer_pool"],
         )
 
     def _pp_send_diag_finish_step(self) -> None:
@@ -587,12 +602,22 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=all_gather_group,
-            async_metadata=self.enable_pp_async_send,
-        )
-        self._pp_send_diag_after_isend(output, self._pp_send_work)
+        send_tensors = output.tensors
+        if self.enable_pp_async_send and self._pp_send_buffer_pool is not None:
+            send_tensors = self._pp_send_buffer_pool.stage(output.tensors)
+        try:
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                send_tensors,
+                all_gather_group=all_gather_group,
+                async_metadata=self.enable_pp_async_send,
+            )
+        except Exception:
+            if self._pp_send_buffer_pool is not None:
+                self._pp_send_buffer_pool.abort_pending()
+            raise
+        if self._pp_send_buffer_pool is not None:
+            self._pp_send_buffer_pool.attach_handles(self._pp_send_work)
+        self._pp_send_diag_after_isend(output, send_tensors, self._pp_send_work)
         if self.enable_pp_async_send:
             self._pp_send_work = []
 
