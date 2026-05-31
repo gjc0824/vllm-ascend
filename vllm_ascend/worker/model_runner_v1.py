@@ -720,11 +720,15 @@ class NPUModelRunner(GPUModelRunner):
         for i, req_id in enumerate(req_data.req_ids):
             count = 1
             req_state = self.requests.get(req_id)
-            if req_state is not None and req_id in prev_spec_tokens:
+            if req_state is not None:
                 prev_num_computed = req_state.num_computed_tokens
                 num_computed = int(req_data.num_computed_tokens[i])
                 delta = num_computed - prev_num_computed
-                max_count = len(prev_spec_tokens[req_id]) + 1
+                max_count = (
+                    len(prev_spec_tokens[req_id]) + 1
+                    if req_id in prev_spec_tokens
+                    else self.num_spec_tokens + 1
+                )
                 if 0 < delta <= max_count:
                     count = delta
                 elif req_data.new_token_ids and i < len(req_data.new_token_ids):
@@ -1694,7 +1698,10 @@ class NPUModelRunner(GPUModelRunner):
             ),
         )
 
-        if should_fix_non_last_pp_mtp_accepted:
+        if (
+            should_fix_non_last_pp_mtp_accepted
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
             self._prev_non_last_pp_mamba_scheduler_output = scheduler_output
 
         return deferred_state_corrections_fn
