@@ -329,8 +329,10 @@ class NPUModelRunner(GPUModelRunner):
         self.need_accepted_tokens: bool = False
         self._prev_non_last_pp_mamba_scheduler_output: SchedulerOutput | None = None
         self._debug_mtp = _env_flag("VLLM_ASCEND_DEBUG_MTP")
+        self._debug_mtp_state = self._debug_mtp and _env_flag("VLLM_ASCEND_DEBUG_MTP_STATE")
         self._debug_mtp_topk = max(1, min(_env_int("VLLM_ASCEND_DEBUG_MTP_TOPK", 5), 10))
         self._debug_mtp_max_rows = max(1, _env_int("VLLM_ASCEND_DEBUG_MTP_ROWS", 1))
+        self._debug_mtp_max_tokens = max(1, _env_int("VLLM_ASCEND_DEBUG_MTP_TOKENS", 8))
         self._debug_mtp_iter = 0
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
@@ -550,8 +552,10 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         if not self._debug_mtp or spec_decode_metadata is None or logits is None:
             return
+        num_draft_total = sum(spec_decode_metadata.num_draft_tokens)
         rows = min(
-            self._debug_mtp_max_rows,
+            self._debug_mtp_max_tokens,
+            num_draft_total,
             spec_decode_metadata.draft_token_ids.shape[0],
             spec_decode_metadata.target_logits_indices.shape[0],
         )
@@ -572,17 +576,29 @@ class NPUModelRunner(GPUModelRunner):
         accepted_count = None
         if torch.is_tensor(sampled_token_ids):
             accepted_count = (sampled_token_ids != -1).sum(dim=1).detach().cpu().tolist()
+        logits_indices = spec_decode_metadata.logits_indices
+        scheduled_token_ids = []
+        logits_indices_for_log = []
+        if torch.is_tensor(logits_indices):
+            logits_rows = min(self._debug_mtp_max_tokens + 1, logits_indices.shape[0])
+            logits_indices_for_log = logits_indices[:logits_rows].detach().cpu().tolist()
+            scheduled_token_ids = self.input_ids.gpu[
+                logits_indices[:logits_rows]
+            ].detach().cpu().tolist()
         logger.warning(
             "[MTP_DEBUG][verify] iter=%d num_draft_tokens=%s "
-            "draft=%s target_top_ids=%s target_top_vals=%s "
-            "target_indices=%s bonus_top_ids=%s bonus_top_vals=%s "
-            "bonus_indices=%s accepted_count=%s sampled=%s",
+            "draft_tokens=%s target_top_ids=%s target_top_vals=%s "
+            "target_indices=%s logits_indices=%s scheduled_ids=%s "
+            "bonus_top_ids=%s bonus_top_vals=%s bonus_indices=%s "
+            "accepted_count=%s sampled=%s",
             self._debug_mtp_iter,
             spec_decode_metadata.num_draft_tokens,
             spec_decode_metadata.draft_token_ids[:rows].detach().cpu().tolist(),
             top_indices.detach().cpu().tolist(),
             top_values.detach().float().cpu().tolist(),
             spec_decode_metadata.target_logits_indices[:rows].detach().cpu().tolist(),
+            logits_indices_for_log,
+            scheduled_token_ids,
             bonus_top_indices,
             bonus_top_values,
             spec_decode_metadata.bonus_logits_indices[:bonus_rows].detach().cpu().tolist(),
@@ -592,6 +608,101 @@ class NPUModelRunner(GPUModelRunner):
             else sampled_token_ids,
         )
         self._debug_mtp_iter += 1
+
+    def _debug_log_mtp_state(
+        self,
+        stage: str,
+        *,
+        scheduler_output: SchedulerOutput | None = None,
+        output_token_ids: torch.Tensor | None = None,
+        note: str = "",
+    ) -> None:
+        if (
+            not self._debug_mtp_state
+            or self.speculative_config is None
+            or self.speculative_config.method != "mtp"
+        ):
+            return
+        pp_group = get_pp_group()
+        num_reqs = self.input_batch.num_reqs
+        rows = min(self._debug_mtp_max_rows, num_reqs)
+        req_ids = list(self.input_batch.req_ids[:rows])
+
+        accepted_cpu = self.input_batch.num_accepted_tokens_cpu[:rows].tolist()
+        num_computed_cpu = self.input_batch.num_computed_tokens_cpu[:rows].tolist()
+        accepted_gpu = []
+        try:
+            accepted_gpu = (
+                self.num_accepted_tokens.gpu[:rows].detach().cpu().tolist()
+            )
+        except Exception:
+            pass
+
+        req_state_info = []
+        for req_id in req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            req_state_info.append(
+                {
+                    "req_id": req_id,
+                    "computed": req_state.num_computed_tokens,
+                    "tokens": req_state.num_tokens,
+                    "output": len(req_state.output_token_ids),
+                }
+            )
+
+        cached_req_ids = []
+        new_token_ids = []
+        cached_num_computed = []
+        cached_num_output = []
+        scheduled_spec_tokens = {}
+        if scheduler_output is not None:
+            req_data = scheduler_output.scheduled_cached_reqs
+            cached_rows = min(self._debug_mtp_max_rows, len(req_data.req_ids))
+            cached_req_ids = list(req_data.req_ids[:cached_rows])
+            if req_data.new_token_ids:
+                new_token_ids = req_data.new_token_ids[:cached_rows]
+            cached_num_computed = list(req_data.num_computed_tokens[:cached_rows])
+            cached_num_output = list(req_data.num_output_tokens[:cached_rows])
+            scheduled_spec_tokens = {
+                req_id: scheduler_output.scheduled_spec_decode_tokens[req_id]
+                for req_id in cached_req_ids
+                if req_id in scheduler_output.scheduled_spec_decode_tokens
+            }
+
+        sampled = None
+        sampled_count = None
+        if torch.is_tensor(output_token_ids):
+            sampled = output_token_ids.detach().cpu().tolist()
+            sampled_count = (output_token_ids != -1).sum(dim=1).detach().cpu().tolist()
+
+        logger.warning(
+            "[MTP_DEBUG][state] iter=%d stage=%s pp=%d/%d last=%s "
+            "req_ids=%s cached_req_ids=%s new_token_ids=%s "
+            "cached_num_computed=%s cached_num_output=%s "
+            "scheduled_spec=%s req_state=%s accepted_cpu=%s "
+            "accepted_gpu=%s num_computed_cpu=%s sampled_count=%s "
+            "sampled=%s note=%s",
+            self._debug_mtp_iter,
+            stage,
+            pp_group.rank_in_group,
+            pp_group.world_size,
+            pp_group.is_last_rank,
+            req_ids,
+            cached_req_ids,
+            new_token_ids,
+            cached_num_computed,
+            cached_num_output,
+            scheduled_spec_tokens,
+            req_state_info,
+            accepted_cpu,
+            accepted_gpu,
+            num_computed_cpu,
+            sampled_count,
+            sampled,
+            note,
+        )
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -1460,6 +1571,10 @@ class NPUModelRunner(GPUModelRunner):
             and not get_pp_group().is_last_rank
             and not self.use_async_scheduling
         ):
+            self._debug_log_mtp_state(
+                "non_last_update_states_pre",
+                scheduler_output=scheduler_output,
+            )
             req_data = scheduler_output.scheduled_cached_reqs
             prev_scheduler_output = self._prev_non_last_pp_mamba_scheduler_output
             if prev_scheduler_output is not None and req_data.new_token_ids:
@@ -1484,8 +1599,17 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                self._debug_log_mtp_state(
+                    "non_last_postprocess_done",
+                    scheduler_output=scheduler_output,
+                )
 
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
+
+        self._debug_log_mtp_state(
+            "update_states_after_super",
+            scheduler_output=scheduler_output,
+        )
 
         if (
             self.need_accepted_tokens
@@ -1728,6 +1852,19 @@ class NPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
+        if (
+            self._debug_mtp
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and torch.is_tensor(draft_token_ids)
+        ):
+            rows = min(self._debug_mtp_max_rows, draft_token_ids.shape[0])
+            logger.warning(
+                "[MTP_DEBUG][runner_draft] iter=%d draft=%s",
+                self._debug_mtp_iter,
+                draft_token_ids[:rows].detach().cpu().tolist(),
+            )
+
         return draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
@@ -1957,6 +2094,10 @@ class NPUModelRunner(GPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
+                    self._debug_log_mtp_state(
+                        "preprocess_mamba_pre",
+                        scheduler_output=scheduler_output,
+                    )
                     mamba_utils.preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
@@ -1976,6 +2117,10 @@ class NPUModelRunner(GPUModelRunner):
                         self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                     )
                     self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                    self._debug_log_mtp_state(
+                        "preprocess_mamba_post",
+                        scheduler_output=scheduler_output,
+                    )
                 if self.use_compress:
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
@@ -2234,6 +2379,11 @@ class NPUModelRunner(GPUModelRunner):
 
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
+            self._debug_log_mtp_state(
+                "sampled_before_state_update",
+                scheduler_output=scheduler_output,
+                output_token_ids=sampler_output.sampled_token_ids,
+            )
 
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
@@ -2401,6 +2551,11 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 with record_function_or_nullcontext("state_update"):
                     self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            self._debug_log_mtp_state(
+                "sampled_after_state_update",
+                scheduler_output=scheduler_output,
+                output_token_ids=sampler_output.sampled_token_ids,
+            )
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
