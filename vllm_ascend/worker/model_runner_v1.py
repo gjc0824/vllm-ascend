@@ -704,6 +704,43 @@ class NPUModelRunner(GPUModelRunner):
             note,
         )
 
+    def _compute_non_last_pp_mtp_accepted_counts(
+        self,
+        scheduler_output: SchedulerOutput,
+        prev_scheduler_output: SchedulerOutput | None,
+    ) -> dict[str, int]:
+        req_data = scheduler_output.scheduled_cached_reqs
+        prev_spec_tokens = (
+            prev_scheduler_output.scheduled_spec_decode_tokens
+            if prev_scheduler_output is not None
+            else {}
+        )
+        accepted_counts: dict[str, int] = {}
+
+        for i, req_id in enumerate(req_data.req_ids):
+            count = 1
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_id in prev_spec_tokens:
+                prev_num_computed = req_state.num_computed_tokens
+                num_computed = int(req_data.num_computed_tokens[i])
+                delta = num_computed - prev_num_computed
+                max_count = len(prev_spec_tokens[req_id]) + 1
+                if 0 < delta <= max_count:
+                    count = delta
+                elif req_data.new_token_ids and i < len(req_data.new_token_ids):
+                    count = len(req_data.new_token_ids[i]) or 1
+            elif req_data.new_token_ids and i < len(req_data.new_token_ids):
+                count = len(req_data.new_token_ids[i]) or 1
+            accepted_counts[req_id] = max(1, count)
+
+        return accepted_counts
+
+    def _apply_mtp_accepted_counts(self, accepted_counts: dict[str, int]) -> None:
+        for req_id, count in accepted_counts.items():
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is not None:
+                self.input_batch.num_accepted_tokens_cpu[req_index] = count
+
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
@@ -1564,27 +1601,36 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
-        if (
+        should_fix_non_last_pp_mtp_state = (
             self.need_accepted_tokens
             and self.cache_config.mamba_cache_mode == "align"
             and self.speculative_config is not None
             and not get_pp_group().is_last_rank
             and not self.use_async_scheduling
-        ):
+        )
+        non_last_pp_mtp_accepted_counts: dict[str, int] = {}
+        non_last_pp_mtp_state_counts: dict[str, int] = {}
+
+        if should_fix_non_last_pp_mtp_state:
             self._debug_log_mtp_state(
                 "non_last_update_states_pre",
                 scheduler_output=scheduler_output,
             )
-            req_data = scheduler_output.scheduled_cached_reqs
             prev_scheduler_output = self._prev_non_last_pp_mamba_scheduler_output
-            if prev_scheduler_output is not None and req_data.new_token_ids:
+            non_last_pp_mtp_accepted_counts = (
+                self._compute_non_last_pp_mtp_accepted_counts(
+                    scheduler_output,
+                    prev_scheduler_output,
+                )
+            )
+            if (
+                prev_scheduler_output is not None
+                and non_last_pp_mtp_accepted_counts
+            ):
                 num_reqs = self.input_batch.num_reqs
-                for req_id, new_token_ids in zip(req_data.req_ids, req_data.new_token_ids):
-                    req_index = self.input_batch.req_id_to_index.get(req_id)
-                    if req_index is not None:
-                        self.input_batch.num_accepted_tokens_cpu[req_index] = (
-                            len(new_token_ids) or 1
-                        )
+                self._apply_mtp_accepted_counts(
+                    non_last_pp_mtp_accepted_counts
+                )
                 mamba_utils.postprocess_mamba(
                     prev_scheduler_output,
                     self.kv_cache_config,
@@ -1595,6 +1641,12 @@ class NPUModelRunner(GPUModelRunner):
                     self.model.get_mamba_state_copy_func(),
                     self._get_mamba_copy_bufs(),
                 )
+                for req_id in non_last_pp_mtp_accepted_counts:
+                    req_index = self.input_batch.req_id_to_index.get(req_id)
+                    if req_index is not None:
+                        non_last_pp_mtp_state_counts[req_id] = int(
+                            self.input_batch.num_accepted_tokens_cpu[req_index]
+                        )
                 self.num_accepted_tokens.np[:num_reqs] = (
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
@@ -1602,22 +1654,41 @@ class NPUModelRunner(GPUModelRunner):
                 self._debug_log_mtp_state(
                     "non_last_postprocess_done",
                     scheduler_output=scheduler_output,
+                    note=(
+                        "accepted_counts="
+                        f"{non_last_pp_mtp_accepted_counts} "
+                        "state_counts="
+                        f"{non_last_pp_mtp_state_counts}"
+                    ),
                 )
 
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
 
+        if (
+            should_fix_non_last_pp_mtp_state
+            and non_last_pp_mtp_state_counts
+        ):
+            num_reqs = self.input_batch.num_reqs
+            self._apply_mtp_accepted_counts(non_last_pp_mtp_state_counts)
+            self.num_accepted_tokens.np[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            )
+            self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
         self._debug_log_mtp_state(
             "update_states_after_super",
             scheduler_output=scheduler_output,
+            note=(
+                "accepted_counts="
+                f"{non_last_pp_mtp_accepted_counts}"
+                " state_counts="
+                f"{non_last_pp_mtp_state_counts}"
+                if non_last_pp_mtp_accepted_counts
+                else ""
+            ),
         )
 
-        if (
-            self.need_accepted_tokens
-            and self.cache_config.mamba_cache_mode == "align"
-            and self.speculative_config is not None
-            and not get_pp_group().is_last_rank
-            and not self.use_async_scheduling
-        ):
+        if should_fix_non_last_pp_mtp_state:
             self._prev_non_last_pp_mamba_scheduler_output = scheduler_output
 
         return deferred_state_corrections_fn
