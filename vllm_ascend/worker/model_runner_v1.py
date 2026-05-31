@@ -1601,20 +1601,21 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput"):
-        should_fix_non_last_pp_mtp_state = (
+        should_fix_non_last_pp_mtp_accepted = (
             self.need_accepted_tokens
-            and self.cache_config.mamba_cache_mode == "align"
             and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
             and not get_pp_group().is_last_rank
             and not self.use_async_scheduling
         )
         non_last_pp_mtp_accepted_counts: dict[str, int] = {}
         non_last_pp_mtp_state_counts: dict[str, int] = {}
 
-        if should_fix_non_last_pp_mtp_state:
+        if should_fix_non_last_pp_mtp_accepted:
             self._debug_log_mtp_state(
                 "non_last_update_states_pre",
                 scheduler_output=scheduler_output,
+                note=f"mamba_cache_mode={self.cache_config.mamba_cache_mode}",
             )
             prev_scheduler_output = self._prev_non_last_pp_mamba_scheduler_output
             non_last_pp_mtp_accepted_counts = (
@@ -1624,7 +1625,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
             )
             if (
-                prev_scheduler_output is not None
+                self.cache_config.mamba_cache_mode == "align"
+                and prev_scheduler_output is not None
                 and non_last_pp_mtp_accepted_counts
             ):
                 num_reqs = self.input_batch.num_reqs
@@ -1661,11 +1663,15 @@ class NPUModelRunner(GPUModelRunner):
                         f"{non_last_pp_mtp_state_counts}"
                     ),
                 )
+            else:
+                non_last_pp_mtp_state_counts = dict(
+                    non_last_pp_mtp_accepted_counts
+                )
 
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
 
         if (
-            should_fix_non_last_pp_mtp_state
+            should_fix_non_last_pp_mtp_accepted
             and non_last_pp_mtp_state_counts
         ):
             num_reqs = self.input_batch.num_reqs
@@ -1688,7 +1694,7 @@ class NPUModelRunner(GPUModelRunner):
             ),
         )
 
-        if should_fix_non_last_pp_mtp_state:
+        if should_fix_non_last_pp_mtp_accepted:
             self._prev_non_last_pp_mamba_scheduler_output = scheduler_output
 
         return deferred_state_corrections_fn
@@ -3794,6 +3800,23 @@ class NPUModelRunner(GPUModelRunner):
             for attn_groups in self.attn_groups
             for attn_group in attn_groups
         )
+        if self._debug_mtp:
+            pp_group = get_pp_group()
+            logger.warning(
+                "[MTP_DEBUG][init] fix=non_last_pp_mtp_accept_delta_v2 "
+                "pp=%d/%d last=%s need_accepted_tokens=%s "
+                "mamba_cache_mode=%s spec_method=%s",
+                pp_group.rank_in_group,
+                pp_group.world_size,
+                pp_group.is_last_rank,
+                self.need_accepted_tokens,
+                self.cache_config.mamba_cache_mode,
+                (
+                    self.speculative_config.method
+                    if self.speculative_config is not None
+                    else None
+                ),
+            )
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
