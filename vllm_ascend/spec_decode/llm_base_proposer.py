@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import inspect
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -169,6 +170,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.block_table_tensor_clone: torch.Tensor | None = None
 
         self._runnable = self._run_merged_draft
+        self._model_accepts_spec_step_idx = False
+        self._compute_logits_accepts_spec_step_idx = False
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
         if self.uses_mrope:
             self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1), dtype=torch.int32, device=device)
@@ -253,6 +256,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_topk_indices(target_language_model)
         self._maybe_share_lm_head(model)
+        self._model_accepts_spec_step_idx = self._accepts_spec_step_idx(self.model.forward)
+        self._compute_logits_accepts_spec_step_idx = self._accepts_spec_step_idx(self.model.compute_logits)
 
         if (
             self.parallel_drafting
@@ -264,6 +269,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.eagle3_use_aux_hidden_state
                 else self.model.mask_hidden.view(self.hidden_size)
             )
+
+    @staticmethod
+    def _accepts_spec_step_idx(fn: Callable[..., Any]) -> bool:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        return "spec_step_idx" in signature.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        )
+
+    def _maybe_add_spec_step_idx(self, model_kwargs: dict[str, Any], spec_step_idx: int) -> None:
+        if self.method == "mtp" and self._model_accepts_spec_step_idx:
+            model_kwargs["spec_step_idx"] = spec_step_idx
+
+    def _compute_logits(self, hidden_states: torch.Tensor, spec_step_idx: int = 0) -> torch.Tensor:
+        if self.method == "mtp" and self._compute_logits_accepts_spec_step_idx:
+            return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
+        return self.model.compute_logits(hidden_states)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -340,6 +364,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.model.lm_head = model.get_language_model().lm_head
             else:
                 logger.warning("Target model has no accessible lm_head for sharing.")
+
+        if (
+            self.method == "mtp"
+            and self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP")
+        ):
+            target_lm_head = None
+            if hasattr(model, "lm_head"):
+                target_lm_head = model.lm_head
+            elif hasattr(model, "get_language_model") and hasattr(model.get_language_model(), "lm_head"):
+                target_lm_head = model.get_language_model().lm_head
+            if target_lm_head is not None:
+                self.model.lm_head = target_lm_head
 
         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
             for _, layer_module in self.model.model.layers.items():
@@ -907,6 +943,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+            self._maybe_add_spec_step_idx(model_kwargs, 0)
+
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -950,7 +988,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
+        logits = self._compute_logits(sample_hidden_states, spec_step_idx=0)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
@@ -1060,6 +1098,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
+            self._maybe_add_spec_step_idx(model_kwargs, draft_step + 1)
 
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -1083,7 +1122,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(sample_hidden_states)
+            logits = self._compute_logits(sample_hidden_states, spec_step_idx=draft_step + 1)
 
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
