@@ -315,6 +315,7 @@ class NPUModelRunner(GPUModelRunner):
         # use_hybrid_blocks: if hybrid blocks is used.
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
+        self._prev_non_last_pp_mamba_scheduler_output: SchedulerOutput | None = None
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
         self.block_size = vllm_config.cache_config.block_size
@@ -1383,6 +1384,52 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
+    def _update_states(self, scheduler_output: "SchedulerOutput"):
+        if (
+            self.need_accepted_tokens
+            and self.cache_config.mamba_cache_mode == "align"
+            and self.speculative_config is not None
+            and not get_pp_group().is_last_rank
+            and not self.use_async_scheduling
+        ):
+            req_data = scheduler_output.scheduled_cached_reqs
+            prev_scheduler_output = self._prev_non_last_pp_mamba_scheduler_output
+            if prev_scheduler_output is not None and req_data.new_token_ids:
+                num_reqs = self.input_batch.num_reqs
+                for req_id, new_token_ids in zip(req_data.req_ids, req_data.new_token_ids):
+                    req_index = self.input_batch.req_id_to_index.get(req_id)
+                    if req_index is not None:
+                        self.input_batch.num_accepted_tokens_cpu[req_index] = (
+                            len(new_token_ids) or 1
+                        )
+                mamba_utils.postprocess_mamba(
+                    prev_scheduler_output,
+                    self.kv_cache_config,
+                    self.input_batch,
+                    self.requests,
+                    self.mamba_state_idx,
+                    self.compilation_config.static_forward_context,
+                    self.model.get_mamba_state_copy_func(),
+                    self._get_mamba_copy_bufs(),
+                )
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+
+        if (
+            self.need_accepted_tokens
+            and self.cache_config.mamba_cache_mode == "align"
+            and self.speculative_config is not None
+            and not get_pp_group().is_last_rank
+            and not self.use_async_scheduling
+        ):
+            self._prev_non_last_pp_mamba_scheduler_output = scheduler_output
+
+        return deferred_state_corrections_fn
+
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
@@ -2270,13 +2317,17 @@ class NPUModelRunner(GPUModelRunner):
         self._finalize_dump_data()
 
         if self.need_accepted_tokens:
-            assert self.sampling_done_event is not None
-            with (
-                record_function_or_nullcontext("async_state_update"),
-                torch.npu.stream(global_stream()),
-            ):
-                global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            if self.use_async_scheduling:
+                assert self.sampling_done_event is not None
+                with (
+                    record_function_or_nullcontext("async_state_update"),
+                    torch.npu.stream(global_stream()),
+                ):
+                    global_stream().wait_event(self.sampling_done_event)
+                    self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+            else:
+                with record_function_or_nullcontext("state_update"):
+                    self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
@@ -3436,9 +3487,13 @@ class NPUModelRunner(GPUModelRunner):
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
-        # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
+        # NOTE: Currently, we determine whether we need `num_accepted_tokens`
+        # through `MambaSpec`. Check every attention group because hybrid
+        # models may not place the recurrent-state group first.
         self.need_accepted_tokens = any(
-            [isinstance(attn_group[0].kv_cache_spec, MambaSpec) for attn_group in self.attn_groups]
+            isinstance(attn_group.kv_cache_spec, MambaSpec)
+            for attn_groups in self.attn_groups
+            for attn_group in attn_groups
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
