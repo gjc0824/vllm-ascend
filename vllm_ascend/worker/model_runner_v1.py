@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -182,6 +183,17 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -316,6 +328,10 @@ class NPUModelRunner(GPUModelRunner):
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
         self._prev_non_last_pp_mamba_scheduler_output: SchedulerOutput | None = None
+        self._debug_mtp = _env_flag("VLLM_ASCEND_DEBUG_MTP")
+        self._debug_mtp_topk = max(1, min(_env_int("VLLM_ASCEND_DEBUG_MTP_TOPK", 5), 10))
+        self._debug_mtp_max_rows = max(1, _env_int("VLLM_ASCEND_DEBUG_MTP_ROWS", 1))
+        self._debug_mtp_iter = 0
 
         self.is_multimodal_model = self.model_config.is_multimodal_model
         self.block_size = vllm_config.cache_config.block_size
@@ -524,6 +540,58 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+
+    def _debug_log_verify_step(
+        self,
+        *,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        logits: torch.Tensor | None,
+        sampler_output: SamplerOutput,
+    ) -> None:
+        if not self._debug_mtp or spec_decode_metadata is None or logits is None:
+            return
+        rows = min(
+            self._debug_mtp_max_rows,
+            spec_decode_metadata.draft_token_ids.shape[0],
+            spec_decode_metadata.target_logits_indices.shape[0],
+        )
+        if rows == 0:
+            return
+        target_logits = logits[spec_decode_metadata.target_logits_indices[:rows]]
+        topk = min(self._debug_mtp_topk, target_logits.shape[-1])
+        top_values, top_indices = torch.topk(target_logits, k=topk, dim=-1)
+        bonus_rows = min(self._debug_mtp_max_rows, spec_decode_metadata.bonus_logits_indices.shape[0])
+        bonus_top_indices = []
+        bonus_top_values = []
+        if bonus_rows:
+            bonus_logits = logits[spec_decode_metadata.bonus_logits_indices[:bonus_rows]]
+            bonus_values, bonus_indices = torch.topk(bonus_logits, k=topk, dim=-1)
+            bonus_top_indices = bonus_indices.detach().cpu().tolist()
+            bonus_top_values = bonus_values.detach().float().cpu().tolist()
+        sampled_token_ids = sampler_output.sampled_token_ids
+        accepted_count = None
+        if torch.is_tensor(sampled_token_ids):
+            accepted_count = (sampled_token_ids != -1).sum(dim=1).detach().cpu().tolist()
+        logger.warning(
+            "[MTP_DEBUG][verify] iter=%d num_draft_tokens=%s "
+            "draft=%s target_top_ids=%s target_top_vals=%s "
+            "target_indices=%s bonus_top_ids=%s bonus_top_vals=%s "
+            "bonus_indices=%s accepted_count=%s sampled=%s",
+            self._debug_mtp_iter,
+            spec_decode_metadata.num_draft_tokens,
+            spec_decode_metadata.draft_token_ids[:rows].detach().cpu().tolist(),
+            top_indices.detach().cpu().tolist(),
+            top_values.detach().float().cpu().tolist(),
+            spec_decode_metadata.target_logits_indices[:rows].detach().cpu().tolist(),
+            bonus_top_indices,
+            bonus_top_values,
+            spec_decode_metadata.bonus_logits_indices[:bonus_rows].detach().cpu().tolist(),
+            accepted_count,
+            sampled_token_ids.detach().cpu().tolist()
+            if torch.is_tensor(sampled_token_ids)
+            else sampled_token_ids,
+        )
+        self._debug_mtp_iter += 1
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -2154,6 +2222,11 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        self._debug_log_verify_step(
+            spec_decode_metadata=spec_decode_metadata,
+            logits=logits,
+            sampler_output=sampler_output,
+        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:

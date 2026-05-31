@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import inspect
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -53,6 +54,17 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -172,6 +184,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self._runnable = self._run_merged_draft
         self._model_accepts_spec_step_idx = False
         self._compute_logits_accepts_spec_step_idx = False
+        self._debug_mtp = _env_flag("VLLM_ASCEND_DEBUG_MTP")
+        self._debug_mtp_topk = max(1, min(_env_int("VLLM_ASCEND_DEBUG_MTP_TOPK", 5), 10))
+        self._debug_mtp_max_rows = max(1, _env_int("VLLM_ASCEND_DEBUG_MTP_ROWS", 1))
+        self._debug_mtp_iter = 0
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
         if self.uses_mrope:
             self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1), dtype=torch.int32, device=device)
@@ -288,6 +304,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.method == "mtp" and self._compute_logits_accepts_spec_step_idx:
             return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.compute_logits(hidden_states)
+
+    def _debug_log_draft_step(
+        self,
+        *,
+        stage: str,
+        spec_step_idx: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        logits: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+    ) -> None:
+        if not self._debug_mtp or self.method != "mtp":
+            return
+        rows = min(self._debug_mtp_max_rows, draft_token_ids.shape[0])
+        topk = min(self._debug_mtp_topk, logits.shape[-1])
+        top_values, top_indices = torch.topk(logits[:rows], k=topk, dim=-1)
+        if positions.ndim > 1:
+            positions_for_log = positions[:, :rows].detach().cpu().tolist()
+        else:
+            positions_for_log = positions[:rows].detach().cpu().tolist()
+        logger.warning(
+            "[MTP_DEBUG][draft] iter=%d stage=%s spec_step=%d "
+            "num_input=%d sample_idx=%s input_ids=%s positions=%s "
+            "draft=%s top_ids=%s top_vals=%s",
+            self._debug_mtp_iter,
+            stage,
+            spec_step_idx,
+            int(input_ids.shape[0]),
+            token_indices_to_sample[:rows].detach().cpu().tolist(),
+            input_ids[:rows].detach().cpu().tolist(),
+            positions_for_log,
+            draft_token_ids[:rows].detach().cpu().tolist(),
+            top_indices.detach().cpu().tolist(),
+            top_values.detach().float().cpu().tolist(),
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -995,6 +1047,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+        self._debug_log_draft_step(
+            stage="first",
+            spec_step_idx=0,
+            input_ids=model_input_ids,
+            positions=model_positions,
+            token_indices_to_sample=token_indices_to_sample,
+            logits=logits,
+            draft_token_ids=draft_token_ids,
+        )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1132,9 +1193,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+            self._debug_log_draft_step(
+                stage="loop",
+                spec_step_idx=draft_step + 1,
+                input_ids=model_input_ids,
+                positions=model_positions,
+                token_indices_to_sample=token_indices_to_sample,
+                logits=logits,
+                draft_token_ids=draft_token_ids,
+            )
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+        if self._debug_mtp and self.method == "mtp":
+            rows = min(self._debug_mtp_max_rows, draft_token_ids.shape[0])
+            logger.warning(
+                "[MTP_DEBUG][draft] iter=%d final_draft=%s",
+                self._debug_mtp_iter,
+                draft_token_ids[:rows].detach().cpu().tolist(),
+            )
+            self._debug_mtp_iter += 1
         return draft_token_ids
 
     def set_inputs_first_pass(
