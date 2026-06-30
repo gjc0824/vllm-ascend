@@ -90,7 +90,7 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        self.connector_worker.save_kv_layer()
+        self.connector_worker.save_kv_layer(layer_name)
 
     def wait_for_save(self):
         self.connector_worker.wait_for_save()
@@ -98,18 +98,24 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def prepare_lru_resident_and_load(
         self,
         layer_name: str,
+        num_tokens: int,
         num_reqs: int,
         topk_indices: torch.Tensor,
         current_slots: torch.Tensor,
         req_ids: torch.Tensor,
+        token_to_req: torch.Tensor | None = None,
+        tokens_per_req: torch.Tensor | None = None,
         capturing: bool = False,
     ) -> bool:
         return self.connector_worker.prepare_lru_resident_and_load(
             layer_name,
+            num_tokens,
             num_reqs,
             topk_indices,
             current_slots,
             req_ids,
+            token_to_req,
+            tokens_per_req,
             capturing,
         )
 

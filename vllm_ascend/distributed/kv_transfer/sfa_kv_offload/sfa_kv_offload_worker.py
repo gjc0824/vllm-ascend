@@ -137,7 +137,11 @@ class SFAKVOffloadWorker:
 
         self.current_layer_save = 0
         self.current_layer_load = 0
-        self.num_layers = model_config.get_num_layers(parallel_config)
+        self.num_target_layers = model_config.get_num_layers(parallel_config)
+        self.num_offload_layers = self.num_target_layers
+        self.num_layers = self.num_offload_layers
+        self.offload_layer_names: list[str] = []
+        self.layer_name_to_offload_id: dict[str, int] = {}
 
         if self.use_mla:
             self.num_kv_head = 1
@@ -145,9 +149,18 @@ class SFAKVOffloadWorker:
             self.num_kv_head = model_config.get_total_num_kv_heads()
 
         self.kv_send_thread: KVTransferThread | None = None
-
-        self.layer_save_tasks = [[] for _ in range(self.num_layers)]
+        self.layer_save_tasks: list[list[LayerMultiBlockReqMeta]] = []
+        self.pending_save_layer_ids: set[int] = set()
+        self.submitted_save_layer_ids: set[int] = set()
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        decode_width = 1
+        if vllm_config.speculative_config is not None:
+            decode_width += vllm_config.speculative_config.num_speculative_tokens
+        self.max_num_topk_rows = min(
+            self.max_num_tokens,
+            self.max_num_reqs * decode_width,
+        )
         lru_resident_config = ascend_config.lru_resident_cache_config
         self.sfa_sparse_topk = lru_resident_config.topk
         self.lru_resident_capacity = lru_resident_config.buffer_size
@@ -163,6 +176,12 @@ class SFAKVOffloadWorker:
         max_block_num = cdiv(self.max_model_len, self.block_size)
         self.cpu_block_table = CpuGpuBuffer(self.max_num_reqs, max_block_num, dtype=torch.int32, device='npu', pin_memory=True)
         self.cpu_block_table_host_buffer = torch.zeros([self.max_num_reqs, max_block_num], dtype=torch.int32, device='cpu', pin_memory=True)
+        self.lru_expanded_block_table_cpu = torch.empty(
+            [self.max_num_topk_rows, max_block_num],
+            dtype=torch.int32,
+            device='cpu',
+            pin_memory=True,
+        )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
 
@@ -173,8 +192,8 @@ class SFAKVOffloadWorker:
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
         self.kv_cache_config.num_blocks
-        allocate_dram_size = 64 * 1024 * 1024 * 1024 # 64GB, TODO get from config
-        zbal_h2d_init(allocate_dram_size, self.max_num_reqs * self.sfa_sparse_topk * 2)
+        allocate_dram_size = 64 * 1024 * 1024 * 1024 # TODO get from config
+        zbal_h2d_init(allocate_dram_size, self.max_num_topk_rows * self.sfa_sparse_topk * 2)
 
     def _infer_group_block_sizes(
         self,
@@ -195,6 +214,48 @@ class SFAKVOffloadWorker:
             return (cache_or_caches,)
         return tuple(cache_or_caches)
 
+    def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        self.offload_layer_names = [
+            layer_name
+            for layer_name, cache_or_caches in kv_caches.items()
+            if len(self._as_cache_tuple(cache_or_caches)) == 5
+        ]
+        if not self.offload_layer_names:
+            raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
+
+        self.num_offload_layers = len(self.offload_layer_names)
+        self.num_layers = self.num_offload_layers
+        self.layer_name_to_offload_id = {
+            layer_name: layer_id
+            for layer_id, layer_name in enumerate(self.offload_layer_names)
+        }
+        self.layer_save_tasks = [[] for _ in range(self.num_layers)]
+        self.pending_save_layer_ids.clear()
+        self.submitted_save_layer_ids.clear()
+
+        logger.info(
+            "SFA KV offload registered %s layers (%s target layers).",
+            self.num_layers,
+            self.num_target_layers,
+        )
+        if self.tp_rank == 0:
+            preview_layer_names = self.offload_layer_names[:4]
+            if len(self.offload_layer_names) > 4:
+                preview_layer_names += ["..."] + self.offload_layer_names[-4:]
+            logger.info("SFA KV offload layer names: %s", preview_layer_names)
+
+    def _get_offload_layer_id(self, layer_name: str) -> int:
+        layer_id = self.layer_name_to_offload_id.get(layer_name)
+        if layer_id is None:
+            registered_layers = ", ".join(self.offload_layer_names[:8])
+            if len(self.offload_layer_names) > 8:
+                registered_layers += ", ..."
+            raise KeyError(
+                "SFA KV offload layer is not registered, "
+                f"layer_name={layer_name}, registered_layers=[{registered_layers}]"
+            )
+        return layer_id
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
@@ -212,32 +273,34 @@ class SFAKVOffloadWorker:
             first_kv_cache.shape,
         )
 
-        if self.use_layerwise:
-            ready_event = threading.Event()
-            self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
-            self.kv_send_thread = KVCacheStoreLayerSendingThread(
-                self.block_size,
-                self.num_layers,
-                self.tp_rank,
-                ready_event,
-                self.layer_save_finished_events,
-            )
-            self.kv_send_thread.start()
-            ready_event.wait()
-        else:
-            raise ValueError("SFA KV Offload only support layerwise now.")
-
         if self.use_sparse and self.use_offload:
+            self._register_offload_layers(kv_caches)
             self.k_caches_npu: list[torch.Tensor] = []
             self.v_caches_npu: list[torch.Tensor] = []
             self.topk_buffers_k: list[torch.Tensor] = []
             self.topk_buffers_v: list[torch.Tensor] = []
-            for cache_or_caches in kv_caches.values():
+            for layer_name in self.offload_layer_names:
+                cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
                 assert len(cache_or_caches) == 5
                 self.k_caches_npu.append(cache_or_caches[0])
                 self.v_caches_npu.append(cache_or_caches[1])
                 self.topk_buffers_k.append(cache_or_caches[3])
                 self.topk_buffers_v.append(cache_or_caches[4])
+
+            if self.use_layerwise:
+                ready_event = threading.Event()
+                self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
+                self.kv_send_thread = KVCacheStoreLayerSendingThread(
+                    self.block_size,
+                    self.num_layers,
+                    self.tp_rank,
+                    ready_event,
+                    self.layer_save_finished_events,
+                )
+                self.kv_send_thread.start()
+                ready_event.wait()
+            else:
+                raise ValueError("SFA KV Offload only support layerwise now.")
 
             npu_block_num = self.num_blocks
             # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
@@ -253,13 +316,25 @@ class SFAKVOffloadWorker:
             # topk cache reuse related
             self.lru_workspace_threads = 8
             self.lru_topk_indices_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
+                [self.max_num_topk_rows, self.sfa_sparse_topk],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.lru_token_to_req_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.lru_tokens_per_req_cpu = torch.empty(
+                [self.max_num_reqs],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             )
             self.lru_slot_to_token_cpu_list = [torch.full(
-                [self.max_num_reqs, self.lru_resident_capacity],
+                [self.max_num_topk_rows, self.lru_resident_capacity],
                 -1,
                 dtype=torch.int32,
                 device='cpu',
@@ -269,34 +344,34 @@ class SFAKVOffloadWorker:
                 self.lru_resident_capacity,
                 dtype=torch.int32,
                 device='cpu',
-            ).view(1, -1).repeat(self.max_num_reqs, 1).pin_memory() for _ in range(self.num_layers)]
+            ).view(1, -1).repeat(self.max_num_topk_rows, 1).pin_memory() for _ in range(self.num_layers)]
             self.lru_current_slots_cpu = torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
+                [self.max_num_topk_rows, self.sfa_sparse_topk],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             )
             self.lru_miss_count_cpu_list = [torch.empty(
-                [self.max_num_reqs],
+                [self.max_num_topk_rows],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             ) for _ in range(self.num_layers)]
             self.lru_miss_tokens_cpu_list = [torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
+                [self.max_num_topk_rows, self.sfa_sparse_topk],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             ) for _ in range(self.num_layers)]
             self.lru_miss_slots_cpu_list = [torch.empty(
-                [self.max_num_reqs, self.sfa_sparse_topk],
+                [self.max_num_topk_rows, self.sfa_sparse_topk],
                 dtype=torch.int32,
                 device='cpu',
                 pin_memory=True,
             ) for _ in range(self.num_layers)]
-            self.lru_req_ids_cpu = torch.empty([self.max_num_reqs], dtype=torch.int64, device='cpu', pin_memory=True)
+            self.lru_req_ids_cpu = torch.empty([self.max_num_topk_rows], dtype=torch.int64, device='cpu', pin_memory=True)
             self.lru_last_req_ids_cpu_list = [torch.full(
-                [self.max_num_reqs],
+                [self.max_num_topk_rows],
                 -1,
                 dtype=torch.int64,
                 device='cpu',
@@ -337,6 +412,8 @@ class SFAKVOffloadWorker:
             self.lru_req_ids_ptr = self.lru_req_ids_cpu.data_ptr()
             self.lru_last_req_ids_ptrs = [lru_last_req_ids_cpu.data_ptr() for lru_last_req_ids_cpu in self.lru_last_req_ids_cpu_list]
             self.lru_topk_indices_ptr = self.lru_topk_indices_cpu.data_ptr()
+            self.lru_token_to_req_ptr = self.lru_token_to_req_cpu.data_ptr()
+            self.lru_tokens_per_req_ptr = self.lru_tokens_per_req_cpu.data_ptr()
             self.lru_slot_to_token_ptrs = [lru_slot_to_token_cpu.data_ptr() for lru_slot_to_token_cpu in self.lru_slot_to_token_cpu_list]
             self.lru_slots_ptrs = [lru_slots_cpu.data_ptr() for lru_slots_cpu in self.lru_slots_cpu_list]
             self.lru_current_slots_ptr = self.lru_current_slots_cpu.data_ptr()
@@ -356,11 +433,11 @@ class SFAKVOffloadWorker:
             self.gvas_v_bases: list[int] = [t.data_ptr() for t in self.v_caches_cpu]
 
             gvas_buffer_offset = 0
-            gvas_buffer_size_bytes = self.max_num_reqs * self.sfa_sparse_topk * 2 * 8 # 2: k+v, 8: int64
+            gvas_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 8 # 2: k+v, 8: int64
             addr_buffer_offset = gvas_buffer_offset + gvas_buffer_size_bytes
-            addr_buffer_size_bytes = self.max_num_reqs * self.sfa_sparse_topk * 2 * 8
+            addr_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 8
             size_buffer_offset = addr_buffer_offset + addr_buffer_size_bytes
-            size_buffer_size_bytes = self.max_num_reqs * self.sfa_sparse_topk * 2 * 4 # 2: k+v, 4: int32
+            size_buffer_size_bytes = self.max_num_topk_rows * self.sfa_sparse_topk * 2 * 4 # 2: k+v, 4: int32
             num_tokens_buffer_offset = size_buffer_offset + size_buffer_size_bytes
             num_tokens_buffer_size_bytes = 4
             batch_copy_args_buffer_size_bytes = gvas_buffer_size_bytes + addr_buffer_size_bytes + size_buffer_size_bytes + num_tokens_buffer_size_bytes
@@ -372,9 +449,9 @@ class SFAKVOffloadWorker:
             self.size_buffer_cpu = self.batch_copy_args_buffer_cpu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
             self.num_tokens_buffer_cpu = \
                 self.batch_copy_args_buffer_cpu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
-            assert self.gvas_buffer_cpu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
-            assert self.addr_buffer_cpu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
-            assert self.size_buffer_cpu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
+            assert self.gvas_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
+            assert self.addr_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
+            assert self.size_buffer_cpu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_cpu.shape == torch.Size([1])
 
             self.gvas_buffer_npu = self.batch_copy_args_buffer_npu[gvas_buffer_offset:gvas_buffer_offset + gvas_buffer_size_bytes].view(torch.int64)
@@ -382,9 +459,9 @@ class SFAKVOffloadWorker:
             self.size_buffer_npu = self.batch_copy_args_buffer_npu[size_buffer_offset:size_buffer_offset + size_buffer_size_bytes].view(torch.int32)
             self.num_tokens_buffer_npu = \
                 self.batch_copy_args_buffer_npu[num_tokens_buffer_offset:num_tokens_buffer_offset + num_tokens_buffer_size_bytes].view(torch.int32)
-            assert self.gvas_buffer_npu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
-            assert self.addr_buffer_npu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
-            assert self.size_buffer_npu.shape == torch.Size([self.max_num_reqs * self.sfa_sparse_topk * 2])
+            assert self.gvas_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
+            assert self.addr_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
+            assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
     def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
@@ -394,14 +471,22 @@ class SFAKVOffloadWorker:
         req_id_to_block_ids: dict[str, list[int]] = {}
         for layer_save_task in self.layer_save_tasks:
             layer_save_task.clear()
+        self.pending_save_layer_ids.clear()
+        self.submitted_save_layer_ids.clear()
+        for event in getattr(self, "layer_save_finished_events", []):
+            event.clear()
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
             if request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
-        self.num_save_tasks = len(self.layer_save_tasks[0])
+        num_save_layers = sum(1 for layer_save_task in self.layer_save_tasks if layer_save_task)
+        self.num_save_tasks = sum(len(layer_save_task) for layer_save_task in self.layer_save_tasks)
         if self.tp_rank == 0:
-            logger.info(f'>>>>> start load kv, reqs num: {len(metadata.requests)}, save task num = {len(self.layer_save_tasks[0])}')
+            logger.info(
+                f'>>>>> start load kv, reqs num: {len(metadata.requests)}, '
+                f'save layer num = {num_save_layers}, save task num = {self.num_save_tasks}'
+            )
 
         # generate block_table for load
         # NOTE reqs in self.req_ids and metadata.requests may not be in same order,
@@ -414,25 +499,41 @@ class SFAKVOffloadWorker:
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
-    def save_cpu(self):
-        self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer_save])
-        self.current_layer_save += 1
-        if self.current_layer_save == self.num_layers:
-            self.current_layer_save = 0
+    def save_cpu(self, layer_id: int | None = None) -> None:
+        if layer_id is None:
+            layer_id = self.current_layer_save
+            self.current_layer_save += 1
+            if self.current_layer_save == self.num_layers:
+                self.current_layer_save = 0
+        if layer_id < 0 or layer_id >= self.num_layers:
+            raise ValueError(f"SFA KV offload layer id out of range: {layer_id}")
+        if not self.layer_save_tasks[layer_id]:
+            return
+        if layer_id in self.submitted_save_layer_ids:
+            return
+        assert self.kv_send_thread is not None
+        self.pending_save_layer_ids.add(layer_id)
+        self.submitted_save_layer_ids.add(layer_id)
+        self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
 
-    def save_kv_layer(self) -> None:
-        self.save_cpu()
+    def save_kv_layer(self, layer_name: str) -> None:
+        if _is_current_stream_capturing():
+            return
+        self.save_cpu(self._get_offload_layer_id(layer_name))
 
     def wait_for_save(self):
         assert self.use_layerwise
-        if self.num_save_tasks == 0:
+        if not self.pending_save_layer_ids:
             # no save tasks, no need to wait
             return
-        for layer_id, event in enumerate(self.layer_save_finished_events):
+        for layer_id in sorted(self.pending_save_layer_ids):
+            event = self.layer_save_finished_events[layer_id]
             is_finish = event.wait(timeout=1)
             if not is_finish:
                 logger.info(f'>>>>> layer {layer_id} wait for save timeout')
             event.clear()
+        self.pending_save_layer_ids.clear()
+        self.submitted_save_layer_ids.clear()
  
     def set_req_ids(self, req_ids: list):
         self.req_ids = req_ids
@@ -440,6 +541,7 @@ class SFAKVOffloadWorker:
     def prepare_lru_resident_and_load_cpu(self, args):
         (
             num_reqs,
+            lru_topk,
             miss_count,
             miss_tokens,
             miss_slots,
@@ -469,6 +571,7 @@ class SFAKVOffloadWorker:
             addr_buffer,
             size_buffer,
             num_tokens_buffer,
+            layer_id,
             do_offload,
         ) = args
         cpu_sparse_attn.lru_resident_compact(
@@ -487,7 +590,7 @@ class SFAKVOffloadWorker:
             lru_miss_position_workspace_ptr,
             lru_epochs_ptr,
             num_reqs,
-            self.sfa_sparse_topk,
+            lru_topk,
             self.lru_resident_capacity,
             self.max_model_len,
             self.lru_workspace_threads,
@@ -513,24 +616,28 @@ class SFAKVOffloadWorker:
             num_tokens_buffer,
         )
 
-        if not do_offload and self.current_layer_load == 0 and self.tp_rank == 0:
+        if not do_offload and layer_id == 0 and self.tp_rank == 0:
             logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
 
         if do_offload:
             # in graph mode, we don't want to interrupt graph twice (since it's time consuming),
             # so we start offload here instead of original maybe_save_kv.
-            self.save_cpu()
+            self.save_cpu(layer_id)
 
     def prepare_lru_resident_and_load(
         self,
         layer_name: str,
+        num_tokens: int,
         num_reqs: int,
         topk_indices_npu: torch.Tensor,
         current_slots_npu: torch.Tensor,
         req_ids_npu: torch.Tensor,
+        token_to_req_npu: torch.Tensor | None = None,
+        tokens_per_req_npu: torch.Tensor | None = None,
         capturing: bool = False,
     ) -> bool:
         capturing = capturing or _is_current_stream_capturing()
+        layer_id = self._get_offload_layer_id(layer_name)
         topk = self.sfa_sparse_topk
         capacity = self.lru_resident_capacity
         if topk > self.sfa_sparse_topk or capacity > self.lru_resident_capacity:
@@ -540,35 +647,50 @@ class SFAKVOffloadWorker:
                 f"configured_topk={self.sfa_sparse_topk}, "
                 f"configured_capacity={self.lru_resident_capacity}"
             )
-        cpu_block_table = self.cpu_block_table_host_buffer[:num_reqs]
-        cpu_block_table.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
-        topk_indices_cpu = self.lru_topk_indices_cpu[:num_reqs]
-        topk_indices_cpu.copy_(topk_indices_npu[:num_reqs], non_blocking=capturing)
-        req_ids_cpu = self.lru_req_ids_cpu[:num_reqs]
-        req_ids_cpu.copy_(req_ids_npu[:num_reqs], non_blocking=capturing)
+        if num_tokens > self.max_num_topk_rows:
+            raise ValueError(
+                "SFA offload topk rows exceed configured workspace, "
+                f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
+            )
+        cpu_block_table_reqs = self.cpu_block_table_host_buffer[:num_reqs]
+        cpu_block_table_reqs.copy_(self.cpu_block_table.gpu[:num_reqs], non_blocking=capturing)
+        if token_to_req_npu is not None:
+            token_to_req_cpu = self.lru_token_to_req_cpu[:num_tokens]
+            token_to_req_cpu.copy_(token_to_req_npu[:num_tokens], non_blocking=capturing)
+            cpu_block_table_expanded = torch.index_select(
+                self.cpu_block_table.gpu[:num_reqs], 0, token_to_req_npu[:num_tokens].to(torch.int64))
+            cpu_block_table = self.lru_expanded_block_table_cpu[:num_tokens]
+            cpu_block_table.copy_(cpu_block_table_expanded, non_blocking=capturing)
+        else:
+            cpu_block_table = cpu_block_table_reqs
+        topk_indices_cpu = self.lru_topk_indices_cpu[:num_tokens]
+        topk_indices_cpu.copy_(topk_indices_npu[:num_tokens], non_blocking=capturing)
+        req_ids_cpu = self.lru_req_ids_cpu[:num_tokens]
+        req_ids_cpu.copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
 
         args = (
-            num_reqs,
-            self.lru_miss_count_cpu_list[self.current_layer_load][:num_reqs],
-            self.lru_miss_tokens_cpu_list[self.current_layer_load][:num_reqs],
-            self.lru_miss_slots_cpu_list[self.current_layer_load][:num_reqs],
+            num_tokens,
+            topk,
+            self.lru_miss_count_cpu_list[layer_id][:num_tokens],
+            self.lru_miss_tokens_cpu_list[layer_id][:num_tokens, :topk],
+            self.lru_miss_slots_cpu_list[layer_id][:num_tokens, :topk],
             self.lru_req_ids_ptr,
-            self.lru_last_req_ids_ptrs[self.current_layer_load],
+            self.lru_last_req_ids_ptrs[layer_id],
             self.lru_topk_indices_ptr,
-            self.lru_slot_to_token_ptrs[self.current_layer_load],
-            self.lru_slots_ptrs[self.current_layer_load],
+            self.lru_slot_to_token_ptrs[layer_id],
+            self.lru_slots_ptrs[layer_id],
             self.lru_current_slots_ptr,
-            self.lru_miss_count_ptrs[self.current_layer_load],
-            self.lru_miss_tokens_ptrs[self.current_layer_load],
-            self.lru_miss_slots_ptrs[self.current_layer_load],
+            self.lru_miss_count_ptrs[layer_id],
+            self.lru_miss_tokens_ptrs[layer_id],
+            self.lru_miss_slots_ptrs[layer_id],
             cpu_block_table,
             self.block_size,
             self.token_size_bytes_k,
             self.token_size_bytes_v,
-            self.gvas_k_bases[self.current_layer_load],
-            self.gvas_v_bases[self.current_layer_load],
-            self.addr_k_bases[self.current_layer_load],
-            self.addr_v_bases[self.current_layer_load],
+            self.gvas_k_bases[layer_id],
+            self.gvas_v_bases[layer_id],
+            self.addr_k_bases[layer_id],
+            self.addr_v_bases[layer_id],
             self.lru_token_mark_workspace_ptr,
             self.lru_token_pos_workspace_ptr,
             self.lru_slot_workspace_ptr,
@@ -578,10 +700,13 @@ class SFAKVOffloadWorker:
             self.addr_buffer_cpu,
             self.size_buffer_cpu,
             self.num_tokens_buffer_cpu,
+            layer_id,
             capturing,
         )
 
         if capturing:
+            if self.layer_save_tasks[layer_id]:
+                self.pending_save_layer_ids.add(layer_id)
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
             if current_compute_stream not in subscribed_compute_streams:
@@ -604,12 +729,8 @@ class SFAKVOffloadWorker:
             self.topk_buffers_k[0].device,
         )
 
-        current_slots_cpu = self.lru_current_slots_cpu[:num_reqs]
-        current_slots_npu[:num_reqs, :topk].copy_(current_slots_cpu, non_blocking=capturing)
-
-        self.current_layer_load += 1
-        if self.current_layer_load == self.num_layers:
-            self.current_layer_load = 0
+        current_slots_cpu = self.lru_current_slots_cpu[:num_tokens, :topk]
+        current_slots_npu[:num_tokens, :topk].copy_(current_slots_cpu, non_blocking=capturing)
         return True
 
     def process_layer_data(self, request: ReqMeta) -> Generator[

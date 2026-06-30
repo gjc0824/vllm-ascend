@@ -236,7 +236,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     indexer_slot_mapping: torch.Tensor | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
-
+    token_to_req: torch.Tensor | None = None
+    tokens_per_req: torch.Tensor | None = None
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -268,6 +269,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             graph_pad_size=-1,  # It should be -1 when not run in fullgraph mode.
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
+            num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
+            req_ids_tensor=_slice_reqs(self.req_ids_tensor),
+            token_to_req=self.token_to_req[:num_actual_tokens]
+            if self.token_to_req is not None
+            else None,
+            tokens_per_req=_slice_reqs(self.tokens_per_req),
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,
@@ -450,10 +459,13 @@ def set_connector_req_ids(req_ids):
 
 def maybe_prepare_lru_resident_and_load_graph(
     layer_name: str,
+    num_tokens: int,
     num_reqs: int,
     topk_indices: torch.Tensor,
     current_slots: torch.Tensor,
     req_ids: torch.Tensor,
+    token_to_req: torch.Tensor | None = None,
+    tokens_per_req: torch.Tensor | None = None,
     capturing: bool = False,
 ) -> bool:
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
@@ -465,10 +477,13 @@ def maybe_prepare_lru_resident_and_load_graph(
         )
     return connector.prepare_lru_resident_and_load(
         layer_name,
+        num_tokens,
         num_reqs,
         topk_indices,
         current_slots,
         req_ids,
+        token_to_req,
+        tokens_per_req,
         capturing,
     )
 

@@ -213,6 +213,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
             for _ in range(self.num_speculative_tokens)
         ]
+        self.indexer_slot_mapping_group = [
+            torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
+            for _ in range(self.num_speculative_tokens)
+        ] if self.runner.use_offload else []
 
         # dsv32 needs seq_lens and query_start_loc persistent tensors for full graph mode
         self.seq_lens_group = [
@@ -493,6 +497,58 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
 
+    def _get_dummy_block_table_and_slot_mapping(
+        self,
+        kv_cache_gid: int,
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        blk_table = self.runner.input_batch.block_table[kv_cache_gid]
+        return blk_table.get_device_tensor()[:num_reqs], blk_table.slot_mapping.gpu
+
+    def _prepare_dummy_offload_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        query_start_loc_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if not self.runner.use_offload:
+            return None, None
+
+        query_lens = (
+            query_start_loc_cpu[1 : num_reqs + 1] -
+            query_start_loc_cpu[:num_reqs]
+        ).numpy().astype(np.int32, copy=False)
+        token_to_req = np.repeat(np.arange(num_reqs, dtype=np.int32), query_lens)
+        if token_to_req.shape[0] < num_tokens:
+            token_to_req = np.pad(token_to_req, (0, num_tokens - token_to_req.shape[0]))
+        token_to_req = token_to_req[:num_tokens]
+
+        self.runner.num_offloaded_blocks.np[:num_reqs].fill(0)
+        self.runner.num_offloaded_blocks.copy_to_gpu(num_reqs)
+        self.runner.req_ids_tensor.np[:num_reqs] = np.arange(1, num_reqs + 1, dtype=np.int64)
+        self.runner.req_ids_tensor.copy_to_gpu(num_reqs)
+        self.runner.tokens_per_req.np[:num_reqs] = query_lens
+        self.runner.tokens_per_req.copy_to_gpu(num_reqs)
+        self.runner.token_to_req.np[:num_tokens] = token_to_req
+        self.runner.token_to_req.copy_to_gpu(num_tokens)
+
+        return self._get_dummy_block_table_and_slot_mapping(0, num_reqs)
+
+    def _get_indexer_slot_mapping_for_positions(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        block_numbers: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor | None:
+        if common_attn_metadata.indexer_block_table_tensor is None:
+            return None
+
+        indexer_block_ids = common_attn_metadata.indexer_block_table_tensor.gather(
+            dim=1, index=block_numbers.view(-1, 1)
+        ).view(-1)
+        return indexer_block_ids * block_size + positions % block_size
+
     def _freeze_draft_index_attn_metadata(self, attn_metadata):
         decode_metadata = getattr(attn_metadata, "decode", None)
         if decode_metadata is not None:
@@ -569,6 +625,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
                 max_seq_len=0,
             )
+            indexer_block_table_tensor, indexer_slot_mapping = self._prepare_dummy_offload_metadata(
+                num_tokens,
+                num_reqs,
+                self.query_start_loc.cpu[: num_reqs + 1],
+            )
+            common_attn_metadata.indexer_block_table_tensor = indexer_block_table_tensor
+            common_attn_metadata.indexer_slot_mapping = indexer_slot_mapping
+            if self.runner.use_offload:
+                common_attn_metadata.num_offloaded_blocks = self.runner.num_offloaded_blocks.gpu[:num_reqs]
+                common_attn_metadata.req_ids_tensor = self.runner.req_ids_tensor.gpu[:num_reqs]
+                common_attn_metadata.token_to_req = self.runner.token_to_req.gpu[:num_tokens]
+                common_attn_metadata.tokens_per_req = self.runner.tokens_per_req.gpu[:num_reqs]
             if self.pcp_size * self.dcp_size > 1:
                 # update long_seq related params and flatten block_table
                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
@@ -580,6 +648,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
                 # Set the real slot_mapping.
                 common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+                if self.runner.use_offload and indexer_slot_mapping is not None:
+                    indexer_slot_mapping_lens = indexer_slot_mapping.shape[0]
+                    self.indexer_slot_mapping_group[draft_index][:indexer_slot_mapping_lens].copy_(indexer_slot_mapping)
+                    self.indexer_slot_mapping_group[draft_index][indexer_slot_mapping_lens:].fill_(-1)
+                    common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[draft_index]
                 common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
                 common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_index][: num_reqs + 1]
                 if self.pcp_size * self.dcp_size > 1 and draft_index > 0:
@@ -819,6 +892,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        if common_attn_metadata.indexer_slot_mapping is not None:
+            indexer_slot_mapping_lens = common_attn_metadata.indexer_slot_mapping.shape[0]
+            self.indexer_slot_mapping_group[0][:indexer_slot_mapping_lens].copy_(
+                common_attn_metadata.indexer_slot_mapping
+            )
+            self.indexer_slot_mapping_group[0][indexer_slot_mapping_lens:].fill_(-1)
+            common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[0]
 
         self.seq_lens_group[0][:num_reqs_padded].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[0][num_reqs_padded:].fill_(0)
@@ -1675,6 +1755,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Set the address of the attn_metadata.slot_mapping to the self.slot_mapping_group[idx]
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
 
+            indexer_slot_mapping = self._get_indexer_slot_mapping_for_positions(
+                old_common_metadata,
+                block_numbers,
+                clamped_positions[0] if self.uses_mrope else clamped_positions,
+                block_size,
+            )
+            if indexer_slot_mapping is not None:
+                indexer_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+                self.indexer_slot_mapping_group[draft_index][: indexer_slot_mapping.shape[0]].copy_(
+                    indexer_slot_mapping.to(torch.int32)
+                )
+                self.indexer_slot_mapping_group[draft_index][indexer_slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
+                common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[draft_index]
+
         self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
         common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]]
@@ -1859,6 +1953,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        if common_attn_metadata.indexer_slot_mapping is not None:
+            common_attn_metadata.indexer_slot_mapping[: token_indices.shape[0]].copy_(
+                common_attn_metadata.indexer_slot_mapping[token_indices]
+            )
+            common_attn_metadata.indexer_slot_mapping[token_indices.shape[0] :].fill_(-1)
+        token_to_req = None
+        if common_attn_metadata.token_to_req is not None:
+            token_to_req = common_attn_metadata.token_to_req[token_indices]
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -1890,6 +1992,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             is_prefilling=common_attn_metadata.is_prefilling,
+            indexer_block_table_tensor=common_attn_metadata.indexer_block_table_tensor,
+            indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
+            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
+            req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            token_to_req=token_to_req,
+            tokens_per_req=common_attn_metadata.tokens_per_req,
             max_seq_len=0,
         )
         return spec_common_attn_metadata, token_indices
@@ -1983,6 +2091,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             is_prefilling=common_attn_metadata.is_prefilling,
+            indexer_block_table_tensor=common_attn_metadata.indexer_block_table_tensor,
+            indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
+            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
+            req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            token_to_req=common_attn_metadata.token_to_req,
+            tokens_per_req=common_attn_metadata.tokens_per_req,
             max_seq_len=0,
         )
 

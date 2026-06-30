@@ -591,6 +591,8 @@ class NPUModelRunner(GPUModelRunner):
 
         self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     @property
     def use_cp(self) -> bool:
@@ -1363,11 +1365,18 @@ class NPUModelRunner(GPUModelRunner):
                 return zlib.adler32(req_id.encode('utf-8'))
 
             num_offloaded_blocks = np.maximum(self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size - 1, 0)
-            is_prefill = num_scheduled_tokens > 1 # decode_threshold in spec decode case
+            decode_threshold = 1
+            if self.speculative_config is not None:
+                decode_threshold += self.speculative_config.num_speculative_tokens
+            is_prefill = num_scheduled_tokens > decode_threshold
             num_offloaded_blocks[is_prefill] = 0
 
             self.num_offloaded_blocks.np[:num_reqs] = num_offloaded_blocks
             self.num_offloaded_blocks.copy_to_gpu(num_reqs)
+            self.tokens_per_req.np[:num_reqs] = num_scheduled_tokens[:num_reqs]
+            self.tokens_per_req.copy_to_gpu(num_reqs)
+            self.token_to_req.np[:total_num_scheduled_tokens] = req_indices[:total_num_scheduled_tokens]
+            self.token_to_req.copy_to_gpu(total_num_scheduled_tokens)
             req_ids_uint32 = []
             for req_id in self.input_batch.req_ids:
                 req_ids_uint32.append(req_id_2_int(req_id))
@@ -3356,6 +3365,8 @@ class NPUModelRunner(GPUModelRunner):
                 cm.indexer_slot_mapping = indexer_slot_mapping
                 cm.num_offloaded_blocks = self.num_offloaded_blocks.gpu[:num_reqs]
                 cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
+                cm.token_to_req = self.token_to_req.gpu[:num_tokens]
+                cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
                 kv_cache_gid = 0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
@@ -4388,17 +4399,23 @@ class NPUModelRunner(GPUModelRunner):
                     ]
                     dsa_k_cache = raw_dsa_k_tensor.view(dtype).view(dsa_k_cache_shape)
 
-                    max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+                    decode_width = 1
+                    if self.vllm_config.speculative_config is not None:
+                        decode_width += self.vllm_config.speculative_config.num_speculative_tokens
+                    max_num_topk_rows = min(
+                        self.vllm_config.scheduler_config.max_num_batched_tokens,
+                        self.vllm_config.scheduler_config.max_num_seqs * decode_width,
+                    )
                     lru_resident_config = self.ascend_config.lru_resident_cache_config
                     lru_resident_enabled = self.ascend_config.use_offload and lru_resident_config.enabled
                     resident_capacity = lru_resident_config.buffer_size if lru_resident_enabled else 2048
                     topk_buffer_k = torch.zeros(
-                        [max_num_reqs, resident_capacity, 1, 512],
+                        [max_num_topk_rows, resident_capacity, 1, 512],
                         dtype=torch.bfloat16,
                         device='npu',
                     )
                     topk_buffer_v = torch.zeros(
-                        [max_num_reqs, resident_capacity, 1, 64],
+                        [max_num_topk_rows, resident_capacity, 1, 64],
                         dtype=torch.bfloat16,
                         device='npu',
                     )
