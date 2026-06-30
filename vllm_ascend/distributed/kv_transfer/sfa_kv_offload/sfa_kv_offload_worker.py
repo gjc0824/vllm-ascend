@@ -173,7 +173,7 @@ class SFAKVOffloadWorker:
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
         self.kv_cache_config.num_blocks
-        allocate_dram_size = 64 * 1024 * 1024 * 1024 # 64GB, TODO get from config
+        allocate_dram_size = 40 * 1024 * 1024 * 1024 # 64GB, TODO get from config
         zbal_h2d_init(allocate_dram_size, self.max_num_reqs * self.sfa_sparse_topk * 2)
 
     def _infer_group_block_sizes(
@@ -243,7 +243,7 @@ class SFAKVOffloadWorker:
             # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
             # but you may want to set this to 1 in debug case in case of allocating to much dram
             # TODO remove this and directly compute from model config before merge
-            cpu_block_num_multiple = 4
+            cpu_block_num_multiple = 1
             cpu_block_num = npu_block_num * cpu_block_num_multiple
             cpu_cache_size_single_card = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
             logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size_single_card / 1024 / 1024 / 1024} GB per rank')

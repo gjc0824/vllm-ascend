@@ -397,12 +397,12 @@ class OffloadMLAAttentionManager(FullAttentionManager):
 
         # free old full blocks (which should be already offloaded)
         num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
-        num_new_tokens = num_tokens - num_allocated_tokens
-        if num_new_tokens > 1: # decode threshold in spec decode case
+        num_new_tokens_main_model = num_tokens_main_model - num_allocated_tokens
+        if num_new_tokens_main_model > 1:
             num_to_free_blocks = 0
         else:
             # only offload & free after (chunk) prefill is done
-            num_offloaded_blocks = max(num_allocated_tokens // self.block_size - 1, 0) # delay free one last full block, reserve for decode case
+            num_offloaded_blocks = max(num_tokens_main_model // self.block_size - 1, 0) # delay free one last full block, reserve for decode case
             num_freed_blocks = len(req_freed_blocks)
             num_to_free_blocks = num_offloaded_blocks - num_freed_blocks
 
@@ -418,7 +418,7 @@ class OffloadMLAAttentionManager(FullAttentionManager):
 
         # allocate new blocks
         num_new_blocks = num_required_blocks - len(req_blocks) - len(req_freed_blocks)
-        self.req_to_num_allocated_tokens[request_id] = num_tokens
+        self.req_to_num_allocated_tokens[request_id] = num_tokens_main_model
         if num_new_blocks <= 0:
             return []
         else:
