@@ -238,8 +238,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
-    num_actual_tokens_gpu: torch.Tensor | None = None
-
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -279,7 +277,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             if self.token_to_req is not None
             else None,
             tokens_per_req=_slice_reqs(self.tokens_per_req),
-            num_actual_tokens_gpu=self.num_actual_tokens_gpu,
             seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
             if self.seq_lens_cpu_upper_bound is not None
             else None,

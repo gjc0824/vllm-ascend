@@ -593,7 +593,6 @@ class NPUModelRunner(GPUModelRunner):
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        self.num_actual_tokens_buffer = self._make_buffer(1, dtype=torch.int32)
 
     @property
     def use_cp(self) -> bool:
@@ -1378,8 +1377,6 @@ class NPUModelRunner(GPUModelRunner):
             self.tokens_per_req.copy_to_gpu(num_reqs)
             self.token_to_req.np[:total_num_scheduled_tokens] = req_indices[:total_num_scheduled_tokens]
             self.token_to_req.copy_to_gpu(total_num_scheduled_tokens)
-            self.num_actual_tokens_buffer.np[0] = total_num_scheduled_tokens
-            self.num_actual_tokens_buffer.copy_to_gpu(1)
             req_ids_uint32 = []
             for req_id in self.input_batch.req_ids:
                 req_ids_uint32.append(req_id_2_int(req_id))
@@ -3370,7 +3367,6 @@ class NPUModelRunner(GPUModelRunner):
                 cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
                 cm.token_to_req = self.token_to_req.gpu[:num_tokens]
                 cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
-                cm.num_actual_tokens_gpu = self.num_actual_tokens_buffer.gpu
                 kv_cache_gid = 0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(

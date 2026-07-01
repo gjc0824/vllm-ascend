@@ -525,8 +525,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         self.runner.num_offloaded_blocks.np[:num_reqs].fill(0)
         self.runner.num_offloaded_blocks.copy_to_gpu(num_reqs)
-        self.runner.num_actual_tokens_buffer.np[0] = num_tokens
-        self.runner.num_actual_tokens_buffer.copy_to_gpu(1)
         self.runner.req_ids_tensor.np[:num_reqs] = np.arange(1, num_reqs + 1, dtype=np.int64)
         self.runner.req_ids_tensor.copy_to_gpu(num_reqs)
         self.runner.tokens_per_req.np[:num_reqs] = query_lens
@@ -639,7 +637,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.req_ids_tensor = self.runner.req_ids_tensor.gpu[:num_reqs]
                 common_attn_metadata.token_to_req = self.runner.token_to_req.gpu[:num_tokens]
                 common_attn_metadata.tokens_per_req = self.runner.tokens_per_req.gpu[:num_reqs]
-                common_attn_metadata.num_actual_tokens_gpu = self.runner.num_actual_tokens_buffer.gpu
             if self.pcp_size * self.dcp_size > 1:
                 # update long_seq related params and flatten block_table
                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
@@ -1054,10 +1051,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
-
-            if self.runner.use_offload:
-                self.runner.num_actual_tokens_buffer.np[0] = num_tokens
-                self.runner.num_actual_tokens_buffer.copy_to_gpu(1)
 
             model_inputs: dict[str, Any] = {
                 "num_input_tokens": num_input_tokens,
@@ -2005,7 +1998,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
-            num_actual_tokens_gpu=common_attn_metadata.num_actual_tokens_gpu,
             max_seq_len=0,
         )
         return spec_common_attn_metadata, token_indices
@@ -2105,7 +2097,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
-            num_actual_tokens_gpu=common_attn_metadata.num_actual_tokens_gpu,
             max_seq_len=0,
         )
 

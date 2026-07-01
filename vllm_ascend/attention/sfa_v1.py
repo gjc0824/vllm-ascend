@@ -241,7 +241,6 @@ class AscendSFAMetadata:
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
-    num_actual_tokens_gpu: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -363,7 +362,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens] if self.use_offload else None
         num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
         req_ids_tensor = common_attn_metadata.req_ids_tensor
-        num_actual_tokens_gpu = common_attn_metadata.num_actual_tokens_gpu
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = 128
@@ -512,7 +510,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             req_ids_tensor=req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
-            num_actual_tokens_gpu=num_actual_tokens_gpu,
         )
 
     def build_for_graph_capture(
@@ -1494,6 +1491,17 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 attn_output = torch.cat([attn_output_decode, attn_output_prefill], dim=0).contiguous()
 
+            # Align with the non-offload path, which runs sparse attention over
+            # the full padded input (ql_nope.shape[0] == num_input_tokens). The
+            # offload path only computes real tokens, so under graph-replay
+            # padding (e.g. MTP draft) the result is shorter than the input.
+            # Pad the trailing rows so the downstream `output[...] = o_proj(...)`
+            # assignment matches the non-offload output shape.
+            if attn_output.shape[0] < ql_nope.shape[0]:
+                padded = attn_output.new_zeros(ql_nope.shape[0], *attn_output.shape[1:])
+                padded[: attn_output.shape[0]] = attn_output
+                attn_output = padded
+
             return attn_output
 
         return DeviceOperator.execute_sparse_flash_attention_process(
@@ -1871,12 +1879,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 return result
             attn_output = result
 
-        projected = self.o_proj(attn_output)[0]
-        if projected.shape[0] == output.shape[0]:
-            output[...] = projected
-        else:
-            output.zero_()
-            output[: projected.shape[0]] = projected
+        output[...] = self.o_proj(attn_output)[0]
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
@@ -1957,17 +1960,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         req_ids_arg = (attn_metadata.req_ids_tensor[:num_reqs][token_to_req_index]
              if is_mtp_decode else attn_metadata.req_ids_tensor[:num_reqs])
-
-        if attn_metadata.num_actual_tokens_gpu is not None:
-            token_mask = torch.arange(
-                num_tokens, dtype=torch.int32, device=topk_indices.device
-            ) < attn_metadata.num_actual_tokens_gpu.squeeze()
-            cpu_token_indices = torch.where(
-                token_mask.unsqueeze(1), cpu_token_indices,
-                torch.full_like(cpu_token_indices, -1))
-            req_ids_arg = torch.where(
-                token_mask, req_ids_arg,
-                torch.full_like(req_ids_arg, -1, dtype=torch.int64))
 
         maybe_prepare_lru_resident_and_load_graph(
             layer_name,
