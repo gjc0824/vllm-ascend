@@ -239,6 +239,9 @@ class AscendSFAMetadata:
     indexer_slot_mapping: torch.Tensor | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
+    token_to_req: torch.Tensor | None = None
+    tokens_per_req: torch.Tensor | None = None
+    num_actual_tokens_gpu: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -360,6 +363,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens] if self.use_offload else None
         num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
         req_ids_tensor = common_attn_metadata.req_ids_tensor
+        num_actual_tokens_gpu = common_attn_metadata.num_actual_tokens_gpu
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = 128
@@ -506,6 +510,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_slot_mapping=indexer_slot_mapping,
             num_offloaded_blocks=num_offloaded_blocks,
             req_ids_tensor=req_ids_tensor,
+            token_to_req=common_attn_metadata.token_to_req,
+            tokens_per_req=common_attn_metadata.tokens_per_req,
+            num_actual_tokens_gpu=num_actual_tokens_gpu,
         )
 
     def build_for_graph_capture(
@@ -677,6 +684,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         # sfa offload
         self.block_size = self.vllm_config.cache_config.block_size
         max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+        decode_width = 1
+        if self.vllm_config.speculative_config is not None:
+            decode_width += self.vllm_config.speculative_config.num_speculative_tokens
+        max_num_topk_rows = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            max_num_reqs * decode_width,
+        )
         self.sfa_sparse_topk = self.lru_resident_cache_config.topk
         self.lru_resident_capacity = self.lru_resident_cache_config.buffer_size
         if self.lru_resident_capacity % self.block_size != 0:
@@ -686,19 +700,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         self.sparse_block_table = torch.arange(
             0,
-            max_num_reqs * self.lru_resident_capacity // self.block_size,
+            max_num_topk_rows * self.lru_resident_capacity // self.block_size,
             dtype=torch.int32,
             device='npu',
-        ).reshape([max_num_reqs, -1])
+        ).reshape([max_num_topk_rows, -1])
         self.sparse_topk_indices = torch.arange(
             self.sfa_sparse_topk,
             dtype=torch.int32,
             device="npu",
-        ).view(1, -1).repeat(max_num_reqs, 1)
-        self.sparse_seq_len_kv = torch.full([max_num_reqs], self.lru_resident_capacity, dtype=torch.int32, device='npu')
+        ).view(1, -1).repeat(max_num_topk_rows, 1)
+        self.sparse_seq_len_kv = torch.full(
+            [max_num_topk_rows], self.lru_resident_capacity, dtype=torch.int32, device='npu')
+        self.sparse_seq_len_q = torch.arange(1, max_num_topk_rows + 1, dtype=torch.int32, device='npu')
         self.max_model_len = self.vllm_config.model_config.max_model_len
         self.lru_current_slots = torch.full(
-            [max_num_reqs, self.sfa_sparse_topk],
+            [max_num_topk_rows, self.sfa_sparse_topk],
             -1,
             dtype=torch.int32,
             device='npu',
@@ -1397,6 +1413,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     topk_buffer,
                     sparse_topk_indices,
                     sparse_block_table,
+                    sparse_seq_len_q,
                     sparse_seq_len_kv,
                     cpu_mask,
                     attn_output_decode_npu,
@@ -1417,7 +1434,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     scale_value=self.scale,
                     sparse_block_size=1,
                     block_table=sparse_block_table,
-                    actual_seq_lengths_query=actual_seq_lengths_query_decode,
+                    actual_seq_lengths_query=sparse_seq_len_q,
                     actual_seq_lengths_kv=sparse_seq_len_kv,
                     query_rope=q_pe_decode,
                     key_rope=topk_buffer[1],
@@ -1854,7 +1871,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 return result
             attn_output = result
 
-        output[...] = self.o_proj(attn_output)[0]
+        projected = self.o_proj(attn_output)[0]
+        if projected.shape[0] == output.shape[0]:
+            output[...] = projected
+        else:
+            output.zero_()
+            output[: projected.shape[0]] = projected
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
@@ -1870,15 +1892,28 @@ class AscendSFAImpl(MLAAttentionImpl):
         layer_name: str,
     ):
         forward_context: ForwardContext = get_forward_context()
-        num_reqs = topk_indices.shape[0]
-        topk_buffer_k = kv_cache[3][:num_reqs]
-        topk_buffer_v = kv_cache[4][:num_reqs]
+        num_tokens = topk_indices.shape[0]
+        num_reqs = attn_metadata.num_decodes
+        if num_reqs <= 0:
+            raise RuntimeError("SFA offload decode path requires at least one decode request")
+        # if num_tokens > num_reqs and forward_context.capturing:
+        #     raise RuntimeError("SFA offload with MTP/spec decode is not supported in graph capture yet")
+        topk_buffer_k = kv_cache[3][:num_tokens]
+        topk_buffer_v = kv_cache[4][:num_tokens]
         topk_indices = topk_indices.squeeze(1) # TODO maybe consider dim1 (head_num?)
 
         # common
         valid_mask = topk_indices >= 0
-        num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs].unsqueeze(1)
-        offload_thresholds = num_offloaded_blocks * self.block_size
+        is_mtp_decode = num_tokens != num_reqs
+        if is_mtp_decode:
+            if attn_metadata.token_to_req is None:
+                raise RuntimeError("SFA offload MTP decode requires token_to_req metadata")
+            token_to_req = attn_metadata.token_to_req[:num_tokens]
+        else:
+            token_to_req = torch.arange(num_tokens, dtype=torch.int32, device=topk_indices.device)
+        token_to_req_index = token_to_req.long()
+        num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs]
+        offload_thresholds = (num_offloaded_blocks * self.block_size)[token_to_req_index].unsqueeze(1)
 
         # compute npu attn (kv which are not offloaded yet)
         side_compute_stream = get_side_compute_stream()
@@ -1912,33 +1947,53 @@ class AscendSFAImpl(MLAAttentionImpl):
             softmax_lse_npu = _normalize_sfa_lse(
                 softmax_max,
                 softmax_sum,
-                num_tokens=num_reqs,
+                num_tokens=num_tokens,
                 num_heads=self.local_num_heads,
             )
 
         # cpu kv cache reuse and cache miss h2d
         cpu_mask = (topk_indices < offload_thresholds) & valid_mask
         cpu_token_indices = torch.where(cpu_mask, topk_indices, -1)
+
+        req_ids_arg = (attn_metadata.req_ids_tensor[:num_reqs][token_to_req_index]
+             if is_mtp_decode else attn_metadata.req_ids_tensor[:num_reqs])
+
+        if attn_metadata.num_actual_tokens_gpu is not None:
+            token_mask = torch.arange(
+                num_tokens, dtype=torch.int32, device=topk_indices.device
+            ) < attn_metadata.num_actual_tokens_gpu.squeeze()
+            cpu_token_indices = torch.where(
+                token_mask.unsqueeze(1), cpu_token_indices,
+                torch.full_like(cpu_token_indices, -1))
+            req_ids_arg = torch.where(
+                token_mask, req_ids_arg,
+                torch.full_like(req_ids_arg, -1, dtype=torch.int64))
+
         maybe_prepare_lru_resident_and_load_graph(
             layer_name,
+            num_tokens,
             num_reqs,
             cpu_token_indices,
-            self.lru_current_slots[:num_reqs],
-            attn_metadata.req_ids_tensor[:num_reqs],
+            self.lru_current_slots[:num_tokens],
+            req_ids_arg,
+            token_to_req if is_mtp_decode else None,
+            None,
             forward_context.capturing,
         )
 
         topk_buffer_k = topk_buffer_k.reshape([-1, self.block_size, 1, 512])
         topk_buffer_v = topk_buffer_v.reshape([-1, self.block_size, 1, 64])
-        sparse_block_table = self.sparse_block_table[:num_reqs]
-        sparse_seq_len_kv = self.sparse_seq_len_kv[:num_reqs]
-        sparse_topk_indices = self.lru_current_slots[:num_reqs].unsqueeze(1)
+        sparse_block_table = self.sparse_block_table[:num_tokens]
+        sparse_seq_len_q = self.sparse_seq_len_q[:num_tokens]
+        sparse_seq_len_kv = self.sparse_seq_len_kv[:num_tokens]
+        sparse_topk_indices = self.lru_current_slots[:num_tokens].unsqueeze(1)
 
         torch_npu.npu.current_stream().wait_stream(side_compute_stream)
         return (
             (topk_buffer_k, topk_buffer_v),
             sparse_topk_indices,
             sparse_block_table,
+            sparse_seq_len_q,
             sparse_seq_len_kv,
             cpu_mask,
             attn_out_npu,

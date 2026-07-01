@@ -21,6 +21,12 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 )
 
 
+def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: str) -> int:
+    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+    draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
+    return max(num_scheduled_tokens - len(draft_tokens), 0)
+
+
 class CPUBlockManager(ABC):
     def __init__(self, block_num: int) -> None:
         self.block_num = block_num
@@ -118,7 +124,8 @@ class SFAKVOffloadlScheduler:
 
         for request in scheduler_output.scheduled_new_reqs:
             block_ids_npu = request.block_ids[-1].copy() # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-            num_tokens_to_compute = request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
+            num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
+                scheduler_output, request.req_id)
             num_new_offload_blocks = num_tokens_to_compute // self._block_size
             block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
             request_tracker = RequestTracker(
@@ -149,7 +156,7 @@ class SFAKVOffloadlScheduler:
             # decode/chunked request
             else:
                 request_tracker = self._request_trackers[req_id]
-                num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                num_new_tokens = _num_finalized_scheduled_tokens(scheduler_output, req_id)
                 req_tuple = self._unfinished_requests.get(req_id)
                 if req_tuple:
                     request = req_tuple[0]
@@ -161,7 +168,7 @@ class SFAKVOffloadlScheduler:
                 num_tokens_after_step = num_computed_token + num_new_tokens
                 num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
-                num_new_offload_blocks = num_blocks_after_step - num_offloaded_blocks
+                num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
 
