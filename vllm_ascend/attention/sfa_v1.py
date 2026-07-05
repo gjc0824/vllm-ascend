@@ -1398,6 +1398,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         o_proj_full_handle = None
         o_proj_full_param_handles = None
         kv_no_split_for_alias_restore = None
+        used_mlapo_for_alias_restore = False
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
         # weight for prefill stage.
         full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
@@ -1420,6 +1421,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 slot_mapping=slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
+            used_mlapo_for_alias_restore = True
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
@@ -1713,20 +1715,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv_cache is not None
             and self.has_indexer
             and use_indexer_alias_mapping
-            and kv_no_split_for_alias_restore is not None
+            and (
+                used_mlapo_for_alias_restore
+                or kv_no_split_for_alias_restore is not None
+            )
             and not self.enable_dsa_cp
         ):
             # The SFA hybrid layout aliases the indexer cache onto the K tensor.
             # Top-k needs the indexer view, but sparse attention must read the
             # real KV view. Re-materialize K/V after top-k selection.
-            self.exec_kv(
-                kv_no_split_for_alias_restore,
-                cos,
-                sin,
-                kv_cache,
-                slot_mapping,
-                attn_metadata,
-            )
+            if used_mlapo_for_alias_restore:
+                self._sfa_preprocess_with_mlapo(
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
+            else:
+                assert kv_no_split_for_alias_restore is not None
+                self.exec_kv(
+                    kv_no_split_for_alias_restore,
+                    cos,
+                    sin,
+                    kv_cache,
+                    slot_mapping,
+                    attn_metadata,
+                )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key

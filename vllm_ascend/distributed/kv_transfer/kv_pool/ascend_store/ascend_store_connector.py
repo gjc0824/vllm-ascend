@@ -75,6 +75,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _is_sfa_indexer_layer(layer_name: str) -> bool:
         return ".indexer.k_cache" in layer_name
 
+    @staticmethod
+    def _trim_sfa_hybrid_store_cache(cache: Any) -> Any:
+        if isinstance(cache, (tuple, list)) and len(cache) >= 3:
+            return tuple(cache[:2])
+        return cache
+
     @classmethod
     def _filter_sfa_hybrid_kv_cache_config(
         cls,
@@ -273,7 +279,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         if self._store_layer_names is not None:
             kv_caches = {
-                layer_name: cache
+                layer_name: self._trim_sfa_hybrid_store_cache(cache)
                 for layer_name, cache in kv_caches.items()
                 if layer_name in self._store_layer_names
             }
