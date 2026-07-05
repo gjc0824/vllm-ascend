@@ -193,8 +193,8 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
-    indexer_block_table_tensor: torch.Tensor | None = None
-    indexer_slot_mapping: torch.Tensor | None = None
+    block_table_tensors_by_group: list[torch.Tensor] | None = None
+    slot_mappings_by_group: list[torch.Tensor] | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -302,14 +302,20 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        indexer_block_table_tensor = (
-            common_attn_metadata.indexer_block_table_tensor[:num_reqs]
-            if common_attn_metadata.indexer_block_table_tensor is not None
+        block_table_tensors_by_group = (
+            [
+                block_table_tensor[:num_reqs]
+                for block_table_tensor in common_attn_metadata.block_table_tensors_by_group
+            ]
+            if common_attn_metadata.block_table_tensors_by_group is not None
             else None
         )
-        indexer_slot_mapping = (
-            common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
-            if common_attn_metadata.indexer_slot_mapping is not None
+        slot_mappings_by_group = (
+            [
+                slot_mapping_tensor[:num_input_tokens]
+                for slot_mapping_tensor in common_attn_metadata.slot_mappings_by_group
+            ]
+            if common_attn_metadata.slot_mappings_by_group is not None
             else None
         )
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
@@ -352,14 +358,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
             if pad_size_slot > 0:
                 slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
-                if indexer_slot_mapping is not None:
-                    indexer_slot_mapping = nn.functional.pad(
-                        indexer_slot_mapping, (0, pad_size_slot), value=-1
-                    )
+                if slot_mappings_by_group is not None:
+                    slot_mappings_by_group = [
+                        nn.functional.pad(
+                            slot_mapping_tensor,
+                            (0, pad_size_slot),
+                            value=-1,
+                        )
+                        for slot_mapping_tensor in slot_mappings_by_group
+                    ]
             else:
                 slot_mapping = slot_mapping[:num_tokens_pad]
-                if indexer_slot_mapping is not None:
-                    indexer_slot_mapping = indexer_slot_mapping[:num_tokens_pad]
+                if slot_mappings_by_group is not None:
+                    slot_mappings_by_group = [
+                        slot_mapping_tensor[:num_tokens_pad]
+                        for slot_mapping_tensor in slot_mappings_by_group
+                    ]
             slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
 
             cos = cos[local_start:local_end_with_pad]
@@ -451,8 +465,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=group_len,
             group_key_idx=group_key_idx,
             group_key_cache_idx=group_key_cache_idx,
-            indexer_block_table_tensor=indexer_block_table_tensor,
-            indexer_slot_mapping=indexer_slot_mapping,
+            block_table_tensors_by_group=block_table_tensors_by_group,
+            slot_mappings_by_group=slot_mappings_by_group,
         )
 
     def build_for_graph_capture(
@@ -618,6 +632,57 @@ class AscendSFAImpl(MLAAttentionImpl):
                             f"Check layer_sharding config and model layer names."
                         )
                 register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
+
+    def _get_sfa_layer_id(self) -> int | None:
+        if self.layer_name is None:
+            return None
+        parts = self.layer_name.split(".")
+        for idx, part in enumerate(parts[:-1]):
+            if part == "layers":
+                try:
+                    return int(parts[idx + 1])
+                except ValueError:
+                    return None
+        return None
+
+    def _get_sfa_indexer_group_id(
+        self,
+        tensors_by_group: list[torch.Tensor] | None,
+    ) -> int | None:
+        if tensors_by_group is None or len(tensors_by_group) <= 1:
+            return None
+        layer_id = self._get_sfa_layer_id()
+        if layer_id is None:
+            return None
+        # SFA hybrid groups are ordered as all indexer groups followed by the
+        # real KV group.
+        return layer_id % (len(tensors_by_group) - 1)
+
+    def get_sfa_indexer_block_table(self, attn_metadata) -> torch.Tensor:
+        block_tables_by_group = getattr(
+            attn_metadata, "block_table_tensors_by_group", None
+        )
+        group_id = self._get_sfa_indexer_group_id(block_tables_by_group)
+        if group_id is None:
+            return attn_metadata.block_table
+        return block_tables_by_group[group_id]
+
+    def get_sfa_indexer_slot_mapping(self, attn_metadata) -> torch.Tensor:
+        slot_mappings_by_group = getattr(
+            attn_metadata, "slot_mappings_by_group", None
+        )
+        group_id = self._get_sfa_indexer_group_id(slot_mappings_by_group)
+        if group_id is None:
+            return attn_metadata.slot_mapping
+        return slot_mappings_by_group[group_id]
+
+    def uses_sfa_group_indexed_mapping(self, attn_metadata) -> bool:
+        return (
+            self._get_sfa_indexer_group_id(
+                getattr(attn_metadata, "slot_mappings_by_group", None)
+            )
+            is not None
+        )
 
     @staticmethod
     def update_graph_params(
@@ -1565,12 +1630,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dsa_k_cache_idx = 2
                 dsa_k_scale_cache_idx = 3
 
-            indexer_slot_mapping = (
-                attn_metadata.indexer_slot_mapping
-                if attn_metadata.indexer_slot_mapping is not None
-                else slot_mapping
+            indexer_slot_mapping = self.get_sfa_indexer_slot_mapping(
+                attn_metadata
             )
-            use_indexer_alias_mapping = attn_metadata.indexer_slot_mapping is not None
+            use_indexer_alias_mapping = self.uses_sfa_group_indexed_mapping(
+                attn_metadata
+            )
 
             if (
                 self.is_kv_producer

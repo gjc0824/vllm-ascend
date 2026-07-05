@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
+import re
 from collections import defaultdict
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
@@ -17,7 +19,16 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+logger = init_logger(__name__)
+
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+
+_SFA_INDEXER_ALIAS_CACHE_DTYPE = "sfa_indexer_alias"
+_SFA_HYBRID_CONNECTORS = {"AscendStoreConnector", "MooncakeConnectorStoreV1"}
+_SFA_INDEXER_REUSE_TENSOR_SLOTS = 4
+_SFA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -90,6 +101,243 @@ def group_and_unify_kv_cache_specs(
         swa_uniform_specs.append(uniform_spec)
 
     return [*mla_uniform_specs, *swa_uniform_specs]
+
+
+def _is_sfa_indexer_layer(layer_name: str) -> bool:
+    return ".indexer.k_cache" in layer_name
+
+
+def _extract_sfa_layer_id(layer_name: str) -> int | None:
+    match = _SFA_LAYER_RE.search(layer_name)
+    return int(match.group(1)) if match is not None else None
+
+
+def _is_sfa_indexer_spec(layer_name: str, spec: KVCacheSpec) -> bool:
+    return (
+        _is_sfa_indexer_layer(layer_name)
+        or getattr(spec, "cache_dtype_str", None)
+        == _SFA_INDEXER_ALIAS_CACHE_DTYPE
+    )
+
+
+def _use_sfa_hybrid_layout(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> bool:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return False
+    if not kv_transfer_config.kv_connector_extra_config.get(
+        "use_layerwise", False
+    ):
+        return False
+    if kv_transfer_config.kv_connector not in _SFA_HYBRID_CONNECTORS:
+        return False
+    has_indexer = any(
+        _is_sfa_indexer_spec(layer_name, spec)
+        for layer_name, spec in kv_cache_spec.items()
+    )
+    has_kv = any(
+        not _is_sfa_indexer_spec(layer_name, spec)
+        for layer_name, spec in kv_cache_spec.items()
+    )
+    return has_indexer and has_kv
+
+
+def _get_sfa_total_layers(
+    vllm_config: VllmConfig,
+    layer_ids: set[int],
+) -> int:
+    try:
+        return vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
+    except Exception:
+        return max(layer_ids) + 1
+
+
+def _split_sfa_layers(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[int, dict[int, str], dict[int, str]] | None:
+    kv_layers_by_id: dict[int, str] = {}
+    indexer_layers_by_id: dict[int, str] = {}
+    for layer_name, spec in kv_cache_spec.items():
+        layer_id = _extract_sfa_layer_id(layer_name)
+        if layer_id is None:
+            continue
+        if _is_sfa_indexer_spec(layer_name, spec):
+            indexer_layers_by_id[layer_id] = layer_name
+        else:
+            kv_layers_by_id[layer_id] = layer_name
+
+    if not kv_layers_by_id or not indexer_layers_by_id:
+        return None
+    if set(kv_layers_by_id) - set(indexer_layers_by_id):
+        return None
+
+    total_layers = _get_sfa_total_layers(
+        vllm_config, set(kv_layers_by_id) | set(indexer_layers_by_id)
+    )
+    return total_layers, kv_layers_by_id, indexer_layers_by_id
+
+
+def _get_sfa_indexer_group_count(total_layers: int) -> int:
+    return total_layers // _SFA_INDEXER_REUSE_TENSOR_SLOTS + 1
+
+
+def _ascend_get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    if not _use_sfa_hybrid_layout(vllm_config, kv_cache_spec):
+        return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    split_layers = _split_sfa_layers(vllm_config, kv_cache_spec)
+    if split_layers is None:
+        return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    total_layers, kv_layers_by_id, indexer_layers_by_id = split_layers
+    indexer_group_count = _get_sfa_indexer_group_count(total_layers)
+
+    grouped_layer_names: list[list[str]] = []
+    for group_id in range(indexer_group_count):
+        group_layer_names = [
+            indexer_layers_by_id[layer_id]
+            for layer_id in sorted(indexer_layers_by_id)
+            if layer_id % indexer_group_count == group_id
+        ]
+        if not group_layer_names:
+            logger.warning(
+                "SFA hybrid cache layout expected indexer group %d to have "
+                "at least one layer; falling back to vLLM cache grouping.",
+                group_id,
+            )
+            return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+        grouped_layer_names.append(group_layer_names)
+
+    grouped_layer_names.append(
+        [kv_layers_by_id[layer_id] for layer_id in sorted(kv_layers_by_id)]
+    )
+    kv_cache_groups = vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(
+        kv_cache_spec, grouped_layer_names
+    )
+    logger.info(
+        "SFA hybrid KV cache groups: %d indexer groups + 1 KV group "
+        "(%d layers, %d reuse tensors)",
+        indexer_group_count,
+        total_layers,
+        _SFA_INDEXER_REUSE_TENSOR_SLOTS,
+    )
+    return kv_cache_groups
+
+
+def _is_sfa_indexer_kv_cache_group(group: KVCacheGroupSpec) -> bool:
+    return bool(group.layer_names) and all(
+        _is_sfa_indexer_layer(layer_name)
+        for layer_name in group.layer_names
+    )
+
+
+def _get_sfa_hybrid_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig | None:
+    indexer_groups = [
+        group
+        for group in kv_cache_groups
+        if _is_sfa_indexer_kv_cache_group(group)
+    ]
+    kv_groups = [
+        group
+        for group in kv_cache_groups
+        if not _is_sfa_indexer_kv_cache_group(group)
+    ]
+    if not indexer_groups or len(kv_groups) != 1:
+        return None
+
+    kv_group = kv_groups[0]
+    kv_layers_by_id = {
+        layer_id: layer_name
+        for layer_name in kv_group.layer_names
+        if (layer_id := _extract_sfa_layer_id(layer_name)) is not None
+    }
+    indexer_layers_by_id: dict[int, str] = {}
+    for indexer_group in indexer_groups:
+        for layer_name in indexer_group.layer_names:
+            layer_id = _extract_sfa_layer_id(layer_name)
+            if layer_id is not None:
+                indexer_layers_by_id[layer_id] = layer_name
+
+    if not kv_layers_by_id or set(kv_layers_by_id) - set(indexer_layers_by_id):
+        return None
+
+    total_layers = _get_sfa_total_layers(
+        vllm_config, set(kv_layers_by_id) | set(indexer_layers_by_id)
+    )
+    indexer_group_count = _get_sfa_indexer_group_count(total_layers)
+    if len(indexer_groups) != indexer_group_count:
+        return None
+
+    page_size = vllm.v1.core.kv_cache_utils.get_uniform_page_size(
+        [group.kv_cache_spec for group in kv_cache_groups]
+    )
+    # The worker inflates available_memory by total_layers / physical_tensors
+    # for layerwise reuse. Preserve vLLM's original total-layer divisor here so
+    # the four physical tensors fit in the real profiled memory budget.
+    num_blocks = vllm.v1.core.kv_cache_utils.get_num_blocks(
+        vllm_config, total_layers, available_memory, page_size
+    )
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    num_tensor_slots = max(
+        (layer_id // indexer_group_count) + 1
+        for layer_id in kv_layers_by_id
+    )
+    for tensor_idx in range(num_tensor_slots):
+        shared_by: list[str] = []
+        start_layer = tensor_idx * indexer_group_count
+        end_layer = min(start_layer + indexer_group_count, total_layers)
+        for layer_id in range(start_layer, end_layer):
+            kv_layer_name = kv_layers_by_id.get(layer_id)
+            indexer_layer_name = indexer_layers_by_id.get(layer_id)
+            if kv_layer_name is not None:
+                shared_by.append(kv_layer_name)
+            if indexer_layer_name is not None:
+                shared_by.append(indexer_layer_name)
+        if shared_by:
+            kv_cache_tensors.append(
+                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+            )
+
+    logger.info(
+        "SFA hybrid KV cache tensors: %d physical tensors for %d layers "
+        "(num_blocks=%d)",
+        len(kv_cache_tensors),
+        total_layers,
+        num_blocks,
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+
+def _ascend_get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    kv_cache_config = _get_sfa_hybrid_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    )
+    if kv_cache_config is not None:
+        return kv_cache_config
+    return _orig_get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    )
 
 
 def _get_kv_cache_groups_uniform_groups(
@@ -249,6 +497,8 @@ def _get_kv_cache_config_deepseek_v4(
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _ascend_get_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
 vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 

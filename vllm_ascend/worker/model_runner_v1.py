@@ -3221,7 +3221,23 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
             0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+        slot_mapping_cpu_gid_0 = self.cpu_slot_mapping
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        block_table_tensors_by_group = None
+        slot_mappings_by_group = None
+        slot_mapping_cpus_by_group = None
+        if self._use_sfa_ascend_store_hybrid_layout():
+            block_table_tensors_by_group = [block_table_gid_0]
+            slot_mappings_by_group = [slot_mapping_gid_0]
+            slot_mapping_cpus_by_group = [slot_mapping_cpu_gid_0]
+            for kv_cache_gid in range(1, len(kv_cache_groups)):
+                block_table_tensor, slot_mapping = _get_block_table_and_slot_mapping(
+                    kv_cache_gid,
+                    total_num_scheduled_tokens_compressed_list,
+                )  # type: ignore[arg-type]
+                block_table_tensors_by_group.append(block_table_tensor)
+                slot_mappings_by_group.append(slot_mapping)
+                slot_mapping_cpus_by_group.append(self.cpu_slot_mapping)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3257,7 +3273,7 @@ class NPUModelRunner(GPUModelRunner):
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
-            slot_mapping_cpu=self.cpu_slot_mapping,
+            slot_mapping_cpu=slot_mapping_cpu_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
             num_input_tokens=num_tokens_padded,
@@ -3267,6 +3283,8 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            block_table_tensors_by_group=block_table_tensors_by_group,
+            slot_mappings_by_group=slot_mappings_by_group,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -3380,9 +3398,19 @@ class NPUModelRunner(GPUModelRunner):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
                     cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
 
-            if kv_cache_gid > 0:
+            if self._use_sfa_ascend_store_hybrid_layout():
+                assert block_table_tensors_by_group is not None
+                assert slot_mappings_by_group is not None
+                assert slot_mapping_cpus_by_group is not None
+                cm.block_table_tensor = block_table_tensors_by_group[
+                    kv_cache_gid
+                ]
+                cm.slot_mapping = slot_mappings_by_group[kv_cache_gid]
+                cm.slot_mapping_cpu = slot_mapping_cpus_by_group[kv_cache_gid]
+            elif kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
+                cm.slot_mapping_cpu = self.cpu_slot_mapping
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
@@ -3392,9 +3420,6 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
-            if self._use_sfa_ascend_store_hybrid_layout():
-                cm.indexer_block_table_tensor = block_table_gid_0
-                cm.indexer_slot_mapping = slot_mapping_gid_0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid, attn_gid, cm, num_reqs_actual,
@@ -3925,6 +3950,19 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         if self._use_sfa_ascend_store_hybrid_layout():
+            indexer_group_count = sum(
+                1
+                for group in kv_cache_config.kv_cache_groups
+                if self._is_sfa_indexer_kv_cache_group(group)
+            )
+            if indexer_group_count > 1:
+                logger.info(
+                    "Layerwise SFA hybrid KV cache reuse: using %d "
+                    "pre-planned indexer groups and %d cache tensors.",
+                    indexer_group_count,
+                    len(old_tensors),
+                )
+                return
             kv_layer_names: list[str] = []
             for t in old_tensors:
                 non_indexer_layers = [

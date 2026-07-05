@@ -381,11 +381,11 @@ class BaseDeviceAdaptor:
         use_sparse_c8_indexer: bool,
         use_torch_npu_lightning_indexer: bool,
     ) -> torch.Tensor:
-        indexer_block_table = getattr(
-            attn_metadata, "indexer_block_table_tensor", None
+        indexer_block_table = (
+            sfa_impl.get_sfa_indexer_block_table(attn_metadata)
+            if hasattr(sfa_impl, "get_sfa_indexer_block_table")
+            else attn_metadata.block_table
         )
-        if indexer_block_table is None:
-            indexer_block_table = attn_metadata.block_table
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
@@ -1456,11 +1456,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         use_sparse_c8_indexer: bool,
         use_torch_npu_lightning_indexer: bool,
     ) -> torch.Tensor:
-        indexer_block_table = getattr(
-            attn_metadata, "indexer_block_table_tensor", None
+        indexer_block_table = (
+            sfa_impl.get_sfa_indexer_block_table(attn_metadata)
+            if hasattr(sfa_impl, "get_sfa_indexer_block_table")
+            else attn_metadata.block_table
         )
-        if indexer_block_table is None:
-            indexer_block_table = attn_metadata.block_table
         if use_sparse_c8_indexer:
             assert len(kv_cache) == 3
             assert q_li_shape_ori is not None
