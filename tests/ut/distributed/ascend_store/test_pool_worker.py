@@ -73,6 +73,29 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         result = cls.find_max_hit_index(None, [], 0)
         self.assertEqual(result, -1)
 
+    def test_submit_ready_layer_loads_schedules_reuse_wait_without_transfer(self):
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.num_layers = 5
+        worker.current_layer = 3
+        worker.next_layer_to_submit = 3
+        worker.num_prefetch_layers = 1
+        worker.prefetch_layer_map = {3: 1}
+        worker.layer_load_tasks = [[] for _ in range(worker.num_layers)]
+        worker.layer_load_submitted = [False for _ in range(worker.num_layers)]
+        worker.kv_recv_thread = MagicMock()
+
+        worker._submit_ready_layer_loads()
+
+        worker.kv_recv_thread.add_request.assert_called_once()
+        task = worker.kv_recv_thread.add_request.call_args.args[0]
+        self.assertEqual(task.layer_id, 3)
+        self.assertEqual(task.wait_for_save_layer, 1)
+        self.assertEqual(task.transfer_tasks, [])
+        self.assertIsNone(task.attention_start_gate)
+        self.assertTrue(worker.layer_load_submitted[3])
+        self.assertEqual(worker.next_layer_to_submit, 4)
+
 
 class TestKVPoolWorkerInit(unittest.TestCase):
     """Test KVPoolWorker initialization with mocked dependencies."""

@@ -203,6 +203,20 @@ _backend_pkg = _make_pkg(
     "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend",
     os.path.join(os.path.abspath(_ascend_store_real_path), "backend"),
 )
+_backend_pkg.backend_map = {  # type: ignore[attr-defined]
+    "mooncake": {
+        "name": "MooncakeBackend",
+        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend",
+    },
+    "memcache": {
+        "name": "MemcacheBackend",
+        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend",
+    },
+    "yuanrong": {
+        "name": "YuanrongBackend",
+        "path": "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_backend",
+    },
+}
 sys.modules["vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend"] = _backend_pkg
 
 if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascend.utils"], "AscendDeviceType"):

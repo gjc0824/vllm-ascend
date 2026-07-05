@@ -248,14 +248,24 @@ class TestKVPoolScheduler(unittest.TestCase):
 
 
 class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
-    def _make_config(self, kv_role="kv_producer", block_size=16):
+    def _make_config(self, kv_role="kv_producer", block_size=16, extra_config=None):
+        extra_config = extra_config or {}
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
-        config.kv_transfer_config.kv_connector_extra_config = {}
-        config.kv_transfer_config.get_from_extra_config.return_value = True
+        config.kv_transfer_config.kv_connector_extra_config = extra_config
+        config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default=None: extra_config.get(
+            key, default
+        )
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.prefill_context_parallel_size = 1
         config.parallel_config.decode_context_parallel_size = 1
+        config.parallel_config.tensor_parallel_size = 1
+        config.parallel_config.pipeline_parallel_size = 1
+        config.parallel_config.rank = 0
+        config.parallel_config.world_size = 1
+        config.model_config.get_total_num_kv_heads.return_value = 1
+        config.model_config.get_num_layers.return_value = 4
+        config.model_config.model = "glm5"
         config.cache_config.block_size = block_size
         return config
 
@@ -372,6 +382,66 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
 
         _meta = scheduler.build_connector_meta(sched_output)
         self.assertNotIn("r1", scheduler._request_trackers)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.importlib.import_module")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_build_connector_meta_layerwise_decode_load_without_new_blocks(self, mock_client_cls, mock_import_module):
+        backend_cls = MagicMock()
+        backend_cls.create_scheduler_client.return_value = MagicMock()
+        backend_module = MagicMock()
+        backend_module.MemcacheBackend = backend_cls
+        mock_import_module.return_value = backend_module
+
+        config = self._make_config(
+            block_size=16,
+            extra_config={
+                "backend": "memcache",
+                "use_layerwise": True,
+                "layerwise_num_shared_buffers": 1,
+                "layerwise_independent_layers": "",
+            },
+        )
+        scheduler = KVPoolScheduler(config, use_layerwise=True)
+
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import RequestTracker
+
+        request = MagicMock()
+        request.request_id = "r1"
+        request.prompt_token_ids = list(range(10))
+        request.all_token_ids = list(range(11))
+        request.block_hashes = []
+        scheduler._unfinished_requests["r1"] = (request, [[7]])
+        scheduler._unfinished_request_ids.add("r1")
+        scheduler._request_trackers["r1"] = RequestTracker(
+            req_id="r1",
+            token_len=10,
+            allocated_block_ids=[7],
+            num_saved_tokens=10,
+            token_ids=list(range(10)),
+            last_block_gva=1234,
+        )
+
+        cached_reqs = MagicMock()
+        cached_reqs.req_ids = ["r1"]
+        cached_reqs.new_block_ids = [[]]
+        sched_output = MagicMock()
+        sched_output.finished_req_ids = set()
+        sched_output.preempted_req_ids = set()
+        sched_output.scheduled_new_reqs = []
+        sched_output.scheduled_cached_reqs = cached_reqs
+        sched_output.num_scheduled_tokens = {"r1": 1}
+
+        meta = scheduler.build_connector_meta(sched_output)
+
+        self.assertEqual(len(meta.requests), 1)
+        req_meta = meta.requests[0]
+        self.assertIsNotNone(req_meta.load_spec)
+        self.assertTrue(req_meta.load_spec.can_load)
+        self.assertEqual(req_meta.load_spec.vllm_cached_tokens, 0)
+        self.assertEqual(req_meta.load_spec.kvpool_cached_tokens, 10)
+        self.assertEqual(req_meta.save_start_token, 10)
+        self.assertEqual(req_meta.save_end_token, 11)
+        self.assertEqual(req_meta.partial_block_index, 0)
 
 
 class TestLookupKeyClient(unittest.TestCase):

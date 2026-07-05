@@ -806,6 +806,13 @@ class KVPoolScheduler:
         else:
             raise ValueError(f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached")
         prev_token_count = request_tracker.token_len - num_new_tokens
+        load_spec = None
+        if self.use_gva_layerwise and prev_token_count > 0:
+            load_spec = LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=prev_token_count,
+                can_load=True,
+            )
         prev_hash_count = prev_token_count // self._block_size
         current_hash_count = request_tracker.token_len // self._block_size
         new_hash_count = current_hash_count - prev_hash_count
@@ -823,9 +830,8 @@ class KVPoolScheduler:
                     request_tracker=request_tracker,
                     has_last_block=True,
                 )
-        if new_block_ids is not None:
+        if new_block_ids:
             request_tracker.update(new_block_ids)
-        load_spec = None
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
@@ -918,7 +924,8 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                needs_layerwise_decode_load = self.use_gva_layerwise and req_id in self._request_trackers
+                if not new_block_ids and not needs_layerwise_decode_load:
                     continue
                 if req_id in self._preempted_req_ids:
                     req_meta = self._process_preempted_cached_request(

@@ -277,6 +277,7 @@ class KVPoolWorker:
     def _init_layerwise_config(self) -> None:
         self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
         self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.layer_load_submitted: list[bool] = [False for i in range(self.num_layers)]
         self.layer_load_finished_events: list[threading.Event] | None = None
         self.layer_save_finished_events: list[threading.Event] | None = None
         self.layer_transfer_finished_events: list[threading.Event] | None = None
@@ -612,6 +613,7 @@ class KVPoolWorker:
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
             self.next_layer_to_submit = 0
+            self.layer_load_submitted = [False for _ in range(self.num_layers)]
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -842,20 +844,22 @@ class KVPoolWorker:
         recv_thread = self.kv_recv_thread
 
         def submit_layer_load(layer_id: int) -> bool:
-            if not self.layer_load_tasks[layer_id]:
+            wait_for_save_layer = self.prefetch_layer_map.get(layer_id)
+            transfer_tasks = self.layer_load_tasks[layer_id]
+            if not transfer_tasks and wait_for_save_layer is None:
                 return False
-            wait_for_save_layer = None
             attention_start_gate = None
-            if layer_id != self.current_layer:
+            if transfer_tasks and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
                     wait_for_save_layer=wait_for_save_layer,
-                    transfer_tasks=self.layer_load_tasks[layer_id],
+                    transfer_tasks=transfer_tasks,
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
                 )
             )
+            self.layer_load_submitted[layer_id] = True
             return True
 
         submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
@@ -870,7 +874,7 @@ class KVPoolWorker:
         assert self.layer_load_finished_events is not None
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
-        should_wait = bool(self.layer_load_tasks[self.current_layer])
+        should_wait = self.layer_load_submitted[self.current_layer]
         if not should_wait:
             self.layer_load_finished_events[self.current_layer].clear()
             return
@@ -879,6 +883,7 @@ class KVPoolWorker:
             logger.info("Layerwise %d load wait timed out", self.current_layer)
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
         self.layer_load_finished_events[self.current_layer].clear()
+        self.layer_load_submitted[self.current_layer] = False
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:
