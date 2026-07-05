@@ -1397,6 +1397,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
         o_proj_full_param_handles = None
+        kv_no_split_for_alias_restore = None
         # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
         # weight for prefill stage.
         full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
@@ -1444,6 +1445,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
+            kv_no_split_for_alias_restore = kv_no_split
             assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
             q_c = self.q_a_layernorm(q_c)
 
@@ -1706,6 +1708,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
+
+        if (
+            kv_cache is not None
+            and self.has_indexer
+            and use_indexer_alias_mapping
+            and kv_no_split_for_alias_restore is not None
+            and not self.enable_dsa_cp
+        ):
+            # The SFA hybrid layout aliases the indexer cache onto the K tensor.
+            # Top-k needs the indexer view, but sparse attention must read the
+            # real KV view. Re-materialize K/V after top-k selection.
+            self.exec_kv(
+                kv_no_split_for_alias_restore,
+                cos,
+                sin,
+                kv_cache,
+                slot_mapping,
+                attn_metadata,
+            )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
