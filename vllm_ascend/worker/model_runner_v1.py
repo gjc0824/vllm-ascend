@@ -595,6 +595,70 @@ class NPUModelRunner(GPUModelRunner):
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
 
+    @staticmethod
+    def _is_sfa_indexer_layer(layer_name: str) -> bool:
+        return ".indexer.k_cache" in layer_name
+
+    def _use_sfa_ascend_store_hybrid_layout(self) -> bool:
+        if not self.use_sparse:
+            return False
+        # Sparse C8 carries an extra scale cache and is intentionally left on
+        # the existing sparse layout until the alias path handles that tuple.
+        if self.ascend_config.enable_sparse_c8:
+            return False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return False
+        if not kv_transfer_config.kv_connector_extra_config.get(
+            "use_layerwise", False
+        ):
+            return False
+        return kv_transfer_config.kv_connector in {
+            "AscendStoreConnector",
+            "MooncakeConnectorStoreV1",
+        }
+
+    def _is_sfa_indexer_kv_cache_group(
+        self, kv_cache_group: KVCacheGroupSpec
+    ) -> bool:
+        return bool(kv_cache_group.layer_names) and all(
+            self._is_sfa_indexer_layer(layer_name)
+            for layer_name in kv_cache_group.layer_names
+        )
+
+    def _ensure_sfa_indexer_layers(
+        self, attn_layers: dict[str, AttentionLayerBase]
+    ) -> None:
+        if not self._use_sfa_ascend_store_hybrid_layout():
+            return
+        indexer_template = next(
+            (
+                module
+                for name, module in attn_layers.items()
+                if self._is_sfa_indexer_layer(name)
+            ),
+            None,
+        )
+        if indexer_template is None:
+            logger.warning(
+                "SFA hybrid cache layout requested but no indexer cache "
+                "layer was found; falling back to the existing sparse layout."
+            )
+            return
+        static_forward_context = (
+            self.vllm_config.compilation_config.static_forward_context
+        )
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        for layer_id in range(num_layers):
+            indexer_name = f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+            if indexer_name in attn_layers:
+                continue
+            indexer_module = deepcopy(indexer_template)
+            if hasattr(indexer_module, "prefix"):
+                indexer_module.prefix = indexer_name
+            attn_layers[indexer_name] = indexer_module
+            static_forward_context.setdefault(indexer_name, indexer_module)
+
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
@@ -3291,6 +3355,11 @@ class NPUModelRunner(GPUModelRunner):
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if (
+                self._use_sfa_ascend_store_hybrid_layout()
+                and self._is_sfa_indexer_kv_cache_group(kv_cache_group)
+            ):
+                continue
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3323,6 +3392,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
+            if self._use_sfa_ascend_store_hybrid_layout():
+                cm.indexer_block_table_tensor = block_table_gid_0
+                cm.indexer_slot_mapping = slot_mapping_gid_0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid, attn_gid, cm, num_reqs_actual,
@@ -3852,6 +3924,55 @@ class NPUModelRunner(GPUModelRunner):
         if len(old_tensors) <= 1:
             return
 
+        if self._use_sfa_ascend_store_hybrid_layout():
+            kv_layer_names: list[str] = []
+            for t in old_tensors:
+                non_indexer_layers = [
+                    layer_name
+                    for layer_name in t.shared_by
+                    if not self._is_sfa_indexer_layer(layer_name)
+                ]
+                if len(non_indexer_layers) != 1:
+                    logger.warning(
+                        "Layer reuse: expected one SFA KV layer per tensor, "
+                        "got %s; skipping tensor merge.",
+                        non_indexer_layers,
+                    )
+                    return
+                kv_layer_names.append(non_indexer_layers[0])
+            if len(kv_layer_names) != total_layers:
+                logger.warning(
+                    "Layer reuse: expected %d SFA KV layers, got %d; "
+                    "skipping tensor merge.",
+                    total_layers,
+                    len(kv_layer_names),
+                )
+                return
+
+            storage_indices = get_layerwise_storage_indices(
+                total_layers, extra_config
+            )
+            new_tensors: list[KVCacheTensor] = []
+            for slot in storage_indices:
+                shared_by: list[str] = []
+                for idx in slot:
+                    shared_by.extend(old_tensors[idx].shared_by)
+                new_tensors.append(
+                    KVCacheTensor(
+                        shared_by=shared_by,
+                        size=old_tensors[slot[0]].size,
+                    )
+                )
+            kv_cache_config.kv_cache_tensors = new_tensors
+            logger.info(
+                "Layerwise SFA hybrid KV cache reuse: merged %d tensors → %d "
+                "(num_blocks=%d unchanged)",
+                len(old_tensors),
+                len(new_tensors),
+                kv_cache_config.num_blocks,
+            )
+            return
+
         # Ordered layer names (flattened from shared_by).
         layer_names: list[str] = []
         for t in old_tensors:
@@ -4167,6 +4288,11 @@ class NPUModelRunner(GPUModelRunner):
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
+                if (
+                    self._use_sfa_ascend_store_hybrid_layout()
+                    and self._is_sfa_indexer_layer(layer_name)
+                ):
+                    continue
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
                     "linear_attn" in layer_name
@@ -4183,6 +4309,11 @@ class NPUModelRunner(GPUModelRunner):
                         tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
+                        if (
+                            self._use_sfa_ascend_store_hybrid_layout()
+                            and self._is_sfa_indexer_layer(layer_name_inner)
+                        ):
+                            continue
                         # shared the kvcache for all shared layers
                         kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
@@ -4195,6 +4326,11 @@ class NPUModelRunner(GPUModelRunner):
                         tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
                         tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
                     for layer_name_inner in kv_cache_tensor.shared_by:
+                        if (
+                            self._use_sfa_ascend_store_hybrid_layout()
+                            and self._is_sfa_indexer_layer(layer_name_inner)
+                        ):
+                            continue
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
@@ -4206,7 +4342,7 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
-                    if self.use_sparse:
+                    if self.use_sparse and not self._use_sfa_ascend_store_hybrid_layout():
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(kv_cache_spec)
@@ -4246,9 +4382,13 @@ class NPUModelRunner(GPUModelRunner):
                     dsa_k_tensor_size = None
                     dsa_k_scale_tensor_size = None
                     #### for deepseek sparse attention
-                    if self.use_sparse:
+                    if self.use_sparse and not self._use_sfa_ascend_store_hybrid_layout():
                         dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
-                    if self.use_sparse and current_sparse_c8:
+                    if (
+                        self.use_sparse
+                        and not self._use_sfa_ascend_store_hybrid_layout()
+                        and current_sparse_c8
+                    ):
                         dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
 
                     # Allocate raw int8 tensors. Even bf16/fp16 KV cache entries
@@ -4267,7 +4407,7 @@ class NPUModelRunner(GPUModelRunner):
                             alignment,
                         )
 
-                    if self.use_sparse:
+                    if self.use_sparse and not self._use_sfa_ascend_store_hybrid_layout():
                         assert dsa_k_tensor_size is not None
 
                         if current_sparse_c8:
@@ -4289,9 +4429,14 @@ class NPUModelRunner(GPUModelRunner):
                             )
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
+                        if (
+                            self._use_sfa_ascend_store_hybrid_layout()
+                            and self._is_sfa_indexer_layer(layer_name_inner)
+                        ):
+                            continue
                         # shared the attn kvcache for all shared layers
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse:
+                            if self.use_sparse and not self._use_sfa_ascend_store_hybrid_layout():
                                 if current_sparse_c8:
                                     if get_ascend_device_type() == AscendDeviceType.A5:
                                         kv_cache_raw_tensors[layer_name_inner] = (
@@ -4309,6 +4454,11 @@ class NPUModelRunner(GPUModelRunner):
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
+                    continue
+                if (
+                    self._use_sfa_ascend_store_hybrid_layout()
+                    and self._is_sfa_indexer_layer(layer_name)
+                ):
                     continue
                 layer_names.add(layer_name)
         assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
@@ -4437,6 +4587,58 @@ class NPUModelRunner(GPUModelRunner):
                     # _allocate_kv_cache_tensors; route them to the dedicated
                     # elif branch below before the sparse branch tries to
                     # unpack them as a (k, v, dsa_k[, scale]) tuple.
+                    if (
+                        self._use_sfa_ascend_store_hybrid_layout()
+                        and self._is_sfa_indexer_layer(layer_name)
+                    ):
+                        continue
+                    if (
+                        self._use_sfa_ascend_store_hybrid_layout()
+                        and self.use_sparse
+                        and "cache_only_layers" not in layer_name
+                    ):
+                        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
+                            layer_name
+                        ]
+                        assert raw_k_tensor is not None
+                        assert raw_v_tensor is not None
+                        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                        assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
+                        num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                        assert num_blocks >= kv_cache_config.num_blocks
+
+                        hf_text_config = self.model_config.hf_text_config
+                        kv_lora_rank = hf_text_config.kv_lora_rank
+                        qk_rope_head_dim = hf_text_config.qk_rope_head_dim
+                        index_head_dim = hf_text_config.index_head_dim
+                        assert kv_lora_rank % index_head_dim == 0
+
+                        k_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            kv_lora_rank,
+                        )
+                        v_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            qk_rope_head_dim,
+                        )
+                        dsa_k_shape = (
+                            num_blocks,
+                            current_kv_cache_spec.block_size
+                            * kv_lora_rank
+                            // index_head_dim,
+                            current_kv_cache_spec.num_kv_heads,
+                            index_head_dim,
+                        )
+                        k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(k_shape)
+                        v_cache = raw_v_tensor.view(current_kv_cache_spec.dtype).view(v_shape)
+                        dsa_k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(dsa_k_shape)
+                        kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+                        continue
+
                     if self.use_sparse and "cache_only_layers" not in layer_name:
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(current_kv_cache_spec)
                         if current_sparse_c8:
@@ -4904,10 +5106,52 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        self._ensure_sfa_indexer_layers(attn_layers)
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
+        if self._use_sfa_ascend_store_hybrid_layout():
+            hf_text_config = self.model_config.hf_text_config
+            kv_lora_rank = hf_text_config.kv_lora_rank
+            qk_rope_head_dim = hf_text_config.qk_rope_head_dim
+            index_head_dim = hf_text_config.index_head_dim
+            if kv_lora_rank % index_head_dim != 0:
+                raise ValueError(
+                    "SFA hybrid cache layout requires kv_lora_rank to be "
+                    f"divisible by index_head_dim, got {kv_lora_rank=} "
+                    f"{index_head_dim=}."
+                )
+            if (index_head_dim * qk_rope_head_dim) % kv_lora_rank != 0:
+                raise ValueError(
+                    "SFA hybrid cache layout requires index_head_dim * "
+                    "qk_rope_head_dim to be divisible by kv_lora_rank, got "
+                    f"{index_head_dim=} {qk_rope_head_dim=} {kv_lora_rank=}."
+                )
+            indexer_block_size = self.block_size * kv_lora_rank // index_head_dim
+            indexer_pad_dim = index_head_dim * qk_rope_head_dim // kv_lora_rank
+            for layer_name, attn_module in attn_layers.items():
+                if not self._is_sfa_indexer_layer(layer_name):
+                    continue
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                        block_size=indexer_block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=index_head_dim + indexer_pad_dim,
+                        dtype=self.kv_cache_dtype,
+                        cache_dtype_str="sfa_indexer_alias",
+                    )
+            for layer_name, attn_module in attn_layers.items():
+                if isinstance(attn_module, MLAAttention):
+                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                        block_size=self.block_size,
+                        num_kv_heads=1,
+                        head_size=kv_lora_rank + qk_rope_head_dim,
+                        dtype=self.kv_cache_dtype,
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    )
+            return kv_cache_spec
+
         for layer_name, attn_module in attn_layers.items():
             if (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):

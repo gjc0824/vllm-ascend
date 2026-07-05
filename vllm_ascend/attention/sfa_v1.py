@@ -193,6 +193,8 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -300,6 +302,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        indexer_block_table_tensor = (
+            common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            if common_attn_metadata.indexer_block_table_tensor is not None
+            else None
+        )
+        indexer_slot_mapping = (
+            common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
+            if common_attn_metadata.indexer_slot_mapping is not None
+            else None
+        )
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = 128
@@ -340,8 +352,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             pad_size_slot = num_tokens_pad - slot_mapping.shape[0]
             if pad_size_slot > 0:
                 slot_mapping = nn.functional.pad(slot_mapping, (0, pad_size_slot), value=-1)
+                if indexer_slot_mapping is not None:
+                    indexer_slot_mapping = nn.functional.pad(
+                        indexer_slot_mapping, (0, pad_size_slot), value=-1
+                    )
             else:
                 slot_mapping = slot_mapping[:num_tokens_pad]
+                if indexer_slot_mapping is not None:
+                    indexer_slot_mapping = indexer_slot_mapping[:num_tokens_pad]
             slot_mapping_cp = slot_mapping[local_start:local_end_with_pad]
 
             cos = cos[local_start:local_end_with_pad]
@@ -433,6 +451,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=group_len,
             group_key_idx=group_key_idx,
             group_key_cache_idx=group_key_cache_idx,
+            indexer_block_table_tensor=indexer_block_table_tensor,
+            indexer_slot_mapping=indexer_slot_mapping,
         )
 
     def build_for_graph_capture(
@@ -1545,7 +1565,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dsa_k_cache_idx = 2
                 dsa_k_scale_cache_idx = 3
 
-            if self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim:
+            indexer_slot_mapping = (
+                attn_metadata.indexer_slot_mapping
+                if attn_metadata.indexer_slot_mapping is not None
+                else slot_mapping
+            )
+            use_indexer_alias_mapping = attn_metadata.indexer_slot_mapping is not None
+
+            if (
+                self.is_kv_producer
+                and get_ascend_config().c8_enable_reshape_optim
+                and not use_indexer_alias_mapping
+            ):
                 torch.ops._C_ascend.store_kv_block(
                     k_li,
                     kv_cache[dsa_k_cache_idx],
@@ -1557,7 +1588,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    indexer_slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.use_sparse_c8_indexer:
@@ -1566,7 +1597,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                 else:
                     assert len(kv_cache) == 4
                 if k_li_scale is not None:
-                    if self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim:
+                    if (
+                        self.is_kv_producer
+                        and get_ascend_config().c8_enable_reshape_optim
+                        and not use_indexer_alias_mapping
+                    ):
                         torch.ops._C_ascend.store_kv_block(
                             k_li_scale,
                             kv_cache[dsa_k_scale_cache_idx],
@@ -1578,7 +1613,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            indexer_slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
 

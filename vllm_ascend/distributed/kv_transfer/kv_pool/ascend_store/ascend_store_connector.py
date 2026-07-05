@@ -23,7 +23,7 @@ from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
@@ -71,6 +71,64 @@ class AscendStoreKVEvents(KVConnectorKVEvents):
 
 
 class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+    @staticmethod
+    def _is_sfa_indexer_layer(layer_name: str) -> bool:
+        return ".indexer.k_cache" in layer_name
+
+    @classmethod
+    def _filter_sfa_hybrid_kv_cache_config(
+        cls,
+        kv_cache_config: KVCacheConfig | None,
+    ) -> tuple[KVCacheConfig | None, int | None, set[str] | None]:
+        if kv_cache_config is None or len(kv_cache_config.kv_cache_groups) <= 1:
+            return kv_cache_config, None, None
+
+        indexer_group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.layer_names
+            and all(cls._is_sfa_indexer_layer(name) for name in group.layer_names)
+        ]
+        if not indexer_group_ids:
+            return kv_cache_config, None, None
+
+        kv_group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group_id not in indexer_group_ids
+        ]
+        if len(kv_group_ids) != 1:
+            return kv_cache_config, None, None
+
+        source_group_id = kv_group_ids[0]
+        source_group = kv_cache_config.kv_cache_groups[source_group_id]
+        selected_layers = set(source_group.layer_names)
+        filtered_tensors: list[KVCacheTensor] = []
+        for tensor in kv_cache_config.kv_cache_tensors:
+            shared_by = [
+                layer_name
+                for layer_name in tensor.shared_by
+                if layer_name in selected_layers
+            ]
+            if shared_by:
+                filtered_tensors.append(
+                    KVCacheTensor(size=tensor.size, shared_by=shared_by)
+                )
+
+        filtered_group = KVCacheGroupSpec(
+            layer_names=list(source_group.layer_names),
+            kv_cache_spec=source_group.kv_cache_spec,
+        )
+        return (
+            KVCacheConfig(
+                num_blocks=kv_cache_config.num_blocks,
+                kv_cache_tensors=filtered_tensors,
+                kv_cache_groups=[filtered_group],
+            ),
+            source_group_id,
+            selected_layers,
+        )
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -100,18 +158,38 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kv_cache_events: AscendStoreKVEvents | None = None
+        if self.use_layerwise:
+            (
+                store_kv_cache_config,
+                self._source_kv_cache_group_id,
+                self._store_layer_names,
+            ) = self._filter_sfa_hybrid_kv_cache_config(kv_cache_config)
+        else:
+            store_kv_cache_config = kv_cache_config
+            self._source_kv_cache_group_id = None
+            self._store_layer_names = None
+        if self._source_kv_cache_group_id is not None:
+            logger.info(
+                "AscendStore SFA hybrid cache: using source KV cache group %d "
+                "as internal group 0.",
+                self._source_kv_cache_group_id,
+            )
 
         if role == KVConnectorRole.SCHEDULER:
-            assert kv_cache_config is not None
-            page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            assert store_kv_cache_config is not None
+            page_size_bytes = store_kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
             self.connector_scheduler = KVPoolScheduler(
-                vllm_config, self.use_layerwise, kv_cache_config, page_size_bytes=page_size_bytes
+                vllm_config,
+                self.use_layerwise,
+                store_kv_cache_config,
+                page_size_bytes=page_size_bytes,
+                source_kv_cache_group_id=self._source_kv_cache_group_id,
             )
         else:
             self.connector_worker = KVPoolWorker(
                 vllm_config,
                 self.use_layerwise,
-                kv_cache_config,
+                store_kv_cache_config,
             )
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
@@ -193,6 +271,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
+        if self._store_layer_names is not None:
+            kv_caches = {
+                layer_name: cache
+                for layer_name, cache in kv_caches.items()
+                if layer_name in self._store_layer_names
+            }
         self.connector_worker.register_kv_caches(kv_caches)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:

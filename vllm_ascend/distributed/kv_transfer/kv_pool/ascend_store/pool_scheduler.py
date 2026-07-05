@@ -51,6 +51,7 @@ class KVPoolScheduler:
         use_layerwise,
         kv_cache_config: KVCacheConfig | None = None,
         page_size_bytes: int = 0,
+        source_kv_cache_group_id: int | None = None,
     ):
         if isinstance(kv_cache_config, int):
             page_size_bytes = kv_cache_config
@@ -58,6 +59,7 @@ class KVPoolScheduler:
         self.vllm_config = vllm_config
         self.use_layerwise = use_layerwise
         self.kv_cache_config = kv_cache_config
+        self.source_kv_cache_group_id = source_kv_cache_group_id
         hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
         hf_config = getattr(vllm_config.model_config, "hf_config", hf_text_config)
         self.hf_config = hf_text_config or hf_config
@@ -195,6 +197,17 @@ class KVPoolScheduler:
             )
             self._request_trackers[req_id] = tracker
         return tracker
+
+    def _normalize_source_block_ids(
+        self,
+        block_ids: tuple[list[int], ...] | list[int] | list[list[int]],
+    ) -> list[list[int]]:
+        normalized = normalize_block_ids_by_group(block_ids)
+        if self.source_kv_cache_group_id is None:
+            return normalized
+        if self.source_kv_cache_group_id >= len(normalized):
+            return [[]]
+        return [normalized[self.source_kv_cache_group_id]]
 
     def _generate_keys_and_alloc(
         self,
@@ -592,7 +605,7 @@ class KVPoolScheduler:
         """
         local_block_ids: list[list[int]] = [[] for _ in self.kv_cache_group_ids]
         if num_external_tokens > 0:
-            local_block_ids = normalize_block_ids_by_group(blocks.get_block_ids())
+            local_block_ids = self._normalize_source_block_ids(blocks.get_block_ids())
 
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         self._unfinished_request_ids.add(request.request_id)
@@ -704,7 +717,7 @@ class KVPoolScheduler:
                 f"Request {request.req_id} is not in _unfinished_requests, but it is scheduled as a new request"
             )
         request_real = request_tuple[0]
-        block_ids_by_group = normalize_block_ids_by_group(request.block_ids)
+        block_ids_by_group = self._normalize_source_block_ids(request.block_ids)
         previous_tracker = self._request_trackers.get(request.req_id)
         request_tracker = RequestTracker(
             req_id=request.req_id,
@@ -742,7 +755,7 @@ class KVPoolScheduler:
         scheduler_output: SchedulerOutput,
         force_skip_save: bool,
     ) -> ReqMeta | None:
-        new_block_ids_by_group = normalize_block_ids_by_group(new_block_ids)
+        new_block_ids_by_group = self._normalize_source_block_ids(new_block_ids)
         self._preempted_req_ids.discard(req_id)
         load_spec = self.load_specs.pop(req_id, None)
         request_tuple = self._unfinished_requests.get(req_id)
@@ -831,7 +844,7 @@ class KVPoolScheduler:
                     has_last_block=True,
                 )
         if new_block_ids:
-            request_tracker.update(new_block_ids)
+            request_tracker.update(self._normalize_source_block_ids(new_block_ids))
         return self._build_req_meta(
             request_tracker,
             request.block_hashes,
@@ -1060,8 +1073,14 @@ class KVPoolScheduler:
         if tracker is not None and tracker.num_saved_tokens <= 0:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
-        block_ids = cast(tuple[list[int], ...], self.get_sw_clipped_blocks(block_ids))
-        valid_group_block_ids = [group_block_ids for group_block_ids in block_ids if group_block_ids]
+        normalized_block_ids = self._normalize_source_block_ids(block_ids)
+        normalized_block_ids = cast(
+            list[list[int]],
+            self.get_sw_clipped_blocks(normalized_block_ids),
+        )
+        valid_group_block_ids = [
+            group_block_ids for group_block_ids in normalized_block_ids if group_block_ids
+        ]
         delay_free_blocks = bool(valid_group_block_ids)
         if delay_free_blocks:
             self._delayed_free_req_ids.add(request.request_id)
