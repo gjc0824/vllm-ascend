@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import re
 import threading
 from collections.abc import Generator
 from typing import Any
@@ -70,6 +71,7 @@ from vllm_ascend.memcache_comm_fence import (
 # save thread to wait for each layer's PD transfer to finish. When mooncake is
 # not running, these stay None and the save thread skips the PD wait.
 _shared_layer_transfer_events: list[threading.Event] | None = None
+_LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def get_shared_layer_transfer_events() -> list[threading.Event] | None:
@@ -530,6 +532,66 @@ class KVPoolWorker:
         self.group_block_stride[group_id] = group_block_strides
         self.group_num_layers[group_id] = len(layer_names)
 
+    @staticmethod
+    def _extract_layer_id(layer_name: str) -> int | None:
+        match = _LAYER_ID_RE.search(layer_name)
+        return int(match.group(1)) if match is not None else None
+
+    def _get_cache_storage_signature(self, cache_or_caches) -> tuple[tuple[int, int, int], ...]:
+        signature = []
+        for cache in self._as_cache_tuple(cache_or_caches):
+            signature.append(
+                (
+                    self._get_storage_key(cache),
+                    cache.storage_offset(),
+                    cache.data_ptr(),
+                )
+            )
+        return tuple(signature)
+
+    def _update_layerwise_layout_from_registered_caches(self) -> None:
+        if not self.use_layerwise:
+            return
+
+        storage_to_layers: dict[tuple[tuple[int, int, int], ...], list[int]] = {}
+        for layer_name, cache_or_caches in self.kv_caches.items():
+            layer_id = self._extract_layer_id(layer_name)
+            if layer_id is None:
+                continue
+            storage_key = self._get_cache_storage_signature(cache_or_caches)
+            storage_to_layers.setdefault(storage_key, []).append(layer_id)
+
+        if not storage_to_layers:
+            return
+
+        storage_groups = [
+            sorted(set(layer_ids))
+            for layer_ids in storage_to_layers.values()
+            if layer_ids
+        ]
+        storage_groups.sort(key=lambda group: group[0])
+        if not storage_groups:
+            return
+
+        actual_independent_layers = sorted(
+            group[0] for group in storage_groups if len(group) == 1
+        )
+        actual_prefetch_layer_map: dict[int, int | None] = {}
+        for group in storage_groups:
+            for previous_layer, layer_id in zip(group, group[1:]):
+                actual_prefetch_layer_map[layer_id] = previous_layer
+
+        self.independent_layers = actual_independent_layers
+        self.prefetch_layer_map = actual_prefetch_layer_map
+        self.layerwise_offload = any(len(group) > 1 for group in storage_groups)
+
+        logger.info(
+            "Layerwise KV cache physical layout: independent_layers=%s, "
+            "reuse_groups=%s",
+            self.independent_layers,
+            [group for group in storage_groups if len(group) > 1],
+        )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
@@ -591,6 +653,8 @@ class KVPoolWorker:
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
+
+        self._update_layerwise_layout_from_registered_caches()
 
         self.page_size_bytes = sum(self.block_len)
         self.token_database.set_group_buffers(
