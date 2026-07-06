@@ -50,6 +50,7 @@ constexpr uint32_t PRE_TOKENS_ATTR_INDEX = 5;
 constexpr uint32_t NEXT_TOKENS_ATTR_INDEX = 6;
 constexpr uint32_t ATTENTION_MODE_ATTR_INDEX = 7;
 constexpr uint32_t RETURN_SOFTMAX_LSE_ATTR_INDEX = 8;
+constexpr uint32_t SPARSE_INDICES_DISCRETE_ATTR_INDEX = 9;
 // Dim Num
 constexpr size_t DIM_NUM_TWO = 2;
 constexpr size_t DIM_NUM_THREE = 3;
@@ -140,6 +141,7 @@ struct SFAParaInfo {
     const int64_t *nextTokens = nullptr;
     const int64_t *attentionMode = nullptr;
     const bool *returnSoftmaxLse = nullptr;
+    const bool *sparseIndicesDiscrete = nullptr;
 };
 
 struct InnerSplitParams {
@@ -168,6 +170,7 @@ TILING_DATA_FIELD_DEF(int64_t, sparseBlockSize)
 TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
+TILING_DATA_FIELD_DEF(uint32_t, sparseIndicesDiscrete)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttentionBaseParamsMlaOp, SparseFlashAttentionBaseParamsMla)
 
@@ -278,6 +281,7 @@ struct SFATilingInfo {
     int64_t nextTokens = INT64_MAX;
     uint32_t attentionMode = 2;
     bool returnSoftmaxLse = false;
+    bool sparseIndicesDiscrete = false;
 
     ge::DataType inputQType = ge::DT_FLOAT16;
     ge::DataType inputKvType = ge::DT_FLOAT16;

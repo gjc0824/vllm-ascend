@@ -41,6 +41,7 @@ __attribute__((visibility("default"))) aclnnStatus aclnnSparseFlashAttentionGetW
     int64_t          nextTokens,
     int64_t          attentionMode,
     bool             returnSoftmaxLse,
+    bool             sparseIndicesDiscrete,
     const aclTensor *attentionOut,
     const aclTensor *softmaxMax,
     const aclTensor *softmaxSum,

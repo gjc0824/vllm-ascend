@@ -1016,12 +1016,15 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             needWaitMte3ToMte2 = false;
         }
         GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
-        if (unlikely(s2IdxArray0 < 0)) {
+        if (unlikely(s2IdxArray0 < 0 && !constInfo.sparseIndicesDiscrete)) {
+            // COMPACTED: -1 只出现在尾部, 首个 -1 即代表后续全为 padding, 可提前结束整轮搬运
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             mergeMte3Idx++;
             break;
         }
+        // DISCRETE: s2IdxArray0<0 表示当前槽是空洞(或已扫到末尾), 不终止;
+        // 继续取 slot1 交给 CopyInKv, 空洞槽 keyOffset<0 会被跳过, 有效行按 mte2Size 压缩落位。
         GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
         CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||

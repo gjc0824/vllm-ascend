@@ -22,6 +22,7 @@ import logging
 import math
 import sys
 import time
+import zlib
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -109,7 +110,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, set_connector_req_ids, using_paged_attention
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -187,7 +188,7 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec, OffloadMLAAttentionSpec
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -590,6 +591,10 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
+        self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
+        self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     @property
     def use_cp(self) -> bool:
@@ -609,14 +614,28 @@ class NPUModelRunner(GPUModelRunner):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             return False
-        if not kv_transfer_config.kv_connector_extra_config.get(
-            "use_layerwise", False
-        ):
-            return False
-        return kv_transfer_config.kv_connector in {
+        connector_names = {kv_transfer_config.kv_connector}
+        child_configs = kv_transfer_config.kv_connector_extra_config.get(
+            "connectors", []
+        )
+        if kv_transfer_config.kv_connector == "MultiConnector":
+            connector_names.update(
+                connector.get("kv_connector")
+                for connector in child_configs
+            )
+        return not connector_names.isdisjoint({
             "AscendStoreConnector",
             "MooncakeConnectorStoreV1",
-        }
+            "SFAKVOffloadConnector",
+        }) and (
+            kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
+            or any(
+                connector.get("kv_connector_extra_config", {}).get(
+                    "use_layerwise", False
+                )
+                for connector in child_configs
+            )
+        )
 
     def _is_sfa_indexer_kv_cache_group(
         self, kv_cache_group: KVCacheGroupSpec
@@ -1417,6 +1436,34 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs=base_num_reqs,
                 total_num_scheduled_tokens=total_num_scheduled_tokens,
             )
+
+        if self.ascend_config.use_offload:
+            num_offloaded_blocks = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                // self.block_size
+            ).astype(np.int32, copy=True)
+            decode_threshold = self.decode_token_per_req
+            is_prefill = num_scheduled_tokens[:num_reqs] > decode_threshold
+            num_offloaded_blocks[is_prefill] = 0
+
+            self.num_offloaded_blocks.np[:num_reqs] = num_offloaded_blocks
+            self.num_offloaded_blocks.copy_to_gpu(num_reqs)
+            self.tokens_per_req.np[:num_reqs] = num_scheduled_tokens[:num_reqs]
+            self.tokens_per_req.copy_to_gpu(num_reqs)
+            self.token_to_req.np[:total_num_scheduled_tokens] = req_indices[
+                :total_num_scheduled_tokens
+            ]
+            self.token_to_req.copy_to_gpu(total_num_scheduled_tokens)
+            req_ids_uint32 = [
+                zlib.adler32(req_id.encode("utf-8"))
+                for req_id in self.input_batch.req_ids[:num_reqs]
+            ]
+            self.req_ids_tensor.np[:num_reqs] = np.array(
+                req_ids_uint32,
+                dtype=np.int64,
+            )
+            self.req_ids_tensor.copy_to_gpu(num_reqs)
+            set_connector_req_ids(self.input_batch.req_ids[:num_reqs])
 
         return (
             logits_indices,
@@ -3285,6 +3332,18 @@ class NPUModelRunner(GPUModelRunner):
             prefill_context_parallel_metadata=self.long_seq_metadata,
             block_table_tensors_by_group=block_table_tensors_by_group,
             slot_mappings_by_group=slot_mappings_by_group,
+            num_offloaded_blocks=self.num_offloaded_blocks.gpu[:num_reqs]
+            if self.ascend_config.use_offload
+            else None,
+            req_ids_tensor=self.req_ids_tensor.gpu[:num_reqs]
+            if self.ascend_config.use_offload
+            else None,
+            token_to_req=self.token_to_req.gpu[:num_tokens]
+            if self.ascend_config.use_offload
+            else None,
+            tokens_per_req=self.tokens_per_req.gpu[:num_reqs]
+            if self.ascend_config.use_offload
+            else None,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -4174,7 +4233,7 @@ class NPUModelRunner(GPUModelRunner):
         return layer_kv_cache_spec
 
     def _get_attention_kv_cache_dims(self, layer_name: str, kv_cache_spec: AttentionSpec) -> tuple[int, int]:
-        if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+        if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, OffloadMLAAttentionSpec)):
             attn_layers = get_layers_from_vllm_config(
                 self.vllm_config,
                 AttentionLayerBase,
@@ -4674,7 +4733,70 @@ class NPUModelRunner(GPUModelRunner):
                         k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(k_shape)
                         v_cache = raw_v_tensor.view(current_kv_cache_spec.dtype).view(v_shape)
                         dsa_k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(dsa_k_shape)
-                        kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+                        if self.ascend_config.use_offload:
+                            decode_width = 1
+                            if self.vllm_config.speculative_config is not None:
+                                decode_width += self.vllm_config.speculative_config.num_speculative_tokens
+                            max_num_topk_rows = min(
+                                self.vllm_config.scheduler_config.max_num_batched_tokens,
+                                self.vllm_config.scheduler_config.max_num_seqs * decode_width,
+                            )
+                            lru_resident_config = self.ascend_config.lru_resident_cache_config
+                            resident_capacity = lru_resident_config.buffer_size
+                            topk_buffer_k = torch.zeros(
+                                [max_num_topk_rows, resident_capacity, 1, kv_lora_rank],
+                                dtype=current_kv_cache_spec.dtype,
+                                device=self.device,
+                            )
+                            topk_buffer_v = torch.zeros(
+                                [max_num_topk_rows, resident_capacity, 1, qk_rope_head_dim],
+                                dtype=current_kv_cache_spec.dtype,
+                                device=self.device,
+                            )
+                            tail_window_blocks = 2
+                            tail_blocks = (
+                                self.vllm_config.scheduler_config.max_num_seqs
+                                * tail_window_blocks
+                            )
+                            tail_k_cache = torch.zeros(
+                                [
+                                    tail_blocks,
+                                    current_kv_cache_spec.block_size,
+                                    current_kv_cache_spec.num_kv_heads,
+                                    kv_lora_rank,
+                                ],
+                                dtype=current_kv_cache_spec.dtype,
+                                device=self.device,
+                            )
+                            tail_v_cache = torch.zeros(
+                                [
+                                    tail_blocks,
+                                    current_kv_cache_spec.block_size,
+                                    current_kv_cache_spec.num_kv_heads,
+                                    qk_rope_head_dim,
+                                ],
+                                dtype=current_kv_cache_spec.dtype,
+                                device=self.device,
+                            )
+                            # SFA offload KV cache tuple layout:
+                            # 0: k_cache       normal reused real-KV K/nope cache
+                            # 1: v_cache       normal reused rope/PE cache
+                            # 2: dsa_k_cache   indexer alias view over K storage
+                            # 3: topk_buffer_k per-layer LRU resident K buffer for CPU decode offload
+                            # 4: topk_buffer_v per-layer LRU resident rope/PE buffer for CPU decode offload
+                            # 5: tail_k_cache  per-request NPU tail K buffer, 2 blocks/request
+                            # 6: tail_v_cache  per-request NPU tail rope/PE buffer, 2 blocks/request
+                            kv_caches[layer_name] = (
+                                k_cache,
+                                v_cache,
+                                dsa_k_cache,
+                                topk_buffer_k,
+                                topk_buffer_v,
+                                tail_k_cache,
+                                tail_v_cache,
+                            )
+                        else:
+                            kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
                         continue
 
                     if self.use_sparse and "cache_only_layers" not in layer_name:
@@ -5181,13 +5303,21 @@ class NPUModelRunner(GPUModelRunner):
                     )
             for layer_name, attn_module in attn_layers.items():
                 if isinstance(attn_module, MLAAttention):
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=kv_lora_rank + qk_rope_head_dim,
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                    )
+                    if self.ascend_config.use_offload:
+                        kv_cache_spec[layer_name] = OffloadMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=kv_lora_rank + qk_rope_head_dim,
+                            dtype=self.kv_cache_dtype,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=kv_lora_rank + qk_rope_head_dim,
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                        )
             return kv_cache_spec
 
         for layer_name, attn_module in attn_layers.items():

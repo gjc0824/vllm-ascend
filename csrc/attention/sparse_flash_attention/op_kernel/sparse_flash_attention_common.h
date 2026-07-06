@@ -161,6 +161,9 @@ struct ConstInfo {
     int64_t nextTokens = INT64_MAX;
     uint32_t attentionMode = 2;
     bool returnSoftmaxLse = false;
+    // true 时 sparse_indices 中的 -1 可散落在任意位置(DISCRETE),
+    // MergeKv 不在首个 -1 处提前终止,而是跳过空洞继续扫描。
+    bool sparseIndicesDiscrete = false;
     bool needInit = false;
 
     // FlashDecoding

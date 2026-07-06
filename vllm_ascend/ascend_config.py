@@ -24,6 +24,26 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+class LRUResidentCacheConfig:
+    """Configuration for SFA decode offload resident-cache loading."""
+
+    def __init__(self, config: dict[str, Any] | None = None):
+        config = config or {}
+        self.enabled = bool(config.get("enabled", False))
+        self.buffer_size = int(config.get("buffer_size", 2048))
+        self.topk = int(config.get("topk", 2048))
+
+        if self.buffer_size <= 0:
+            raise ValueError("lru_resident_cache_config.buffer_size must be positive")
+        if self.topk <= 0:
+            raise ValueError("lru_resident_cache_config.topk must be positive")
+        if self.buffer_size < self.topk:
+            raise ValueError(
+                "lru_resident_cache_config.buffer_size must be >= topk, "
+                f"got buffer_size={self.buffer_size}, topk={self.topk}"
+            )
+
+
 class AscendConfig:
     """
     Configuration Object for additional_config from vllm.configs.
@@ -286,6 +306,11 @@ class AscendConfig:
         # Enable Block Verify and Entropy Verify in Rejection Sampler
         rejection_sampler_config = additional_config.get("rejection_sampler_config", {})
         self.rejection_sampler_config = RejectionSamplerConfig(rejection_sampler_config)
+
+        self.use_offload = bool(additional_config.get("use_offload", False))
+        self.lru_resident_cache_config = LRUResidentCacheConfig(
+            additional_config.get("lru_resident_cache_config", {})
+        )
 
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:

@@ -449,7 +449,11 @@ class BaseDeviceAdaptor:
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ) -> torch.Tensor:
-        block_table = attn_metadata.block_table
+        block_table = (
+            sfa_impl.get_sfa_real_kv_block_table(attn_metadata)
+            if hasattr(sfa_impl, "get_sfa_real_kv_block_table")
+            else attn_metadata.block_table
+        )
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 
@@ -1524,7 +1528,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ) -> torch.Tensor:
-        block_table = attn_metadata.block_table
+        block_table = (
+            sfa_impl.get_sfa_real_kv_block_table(attn_metadata)
+            if hasattr(sfa_impl, "get_sfa_real_kv_block_table")
+            else attn_metadata.block_table
+        )
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 

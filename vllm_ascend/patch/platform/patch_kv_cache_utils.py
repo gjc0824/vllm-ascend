@@ -26,7 +26,11 @@ _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 
 _SFA_INDEXER_ALIAS_CACHE_DTYPE = "sfa_indexer_alias"
-_SFA_HYBRID_CONNECTORS = {"AscendStoreConnector", "MooncakeConnectorStoreV1"}
+_SFA_HYBRID_CONNECTORS = {
+    "AscendStoreConnector",
+    "MooncakeConnectorStoreV1",
+    "SFAKVOffloadConnector",
+}
 _SFA_INDEXER_REUSE_TENSOR_SLOTS = 4
 _SFA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
@@ -127,11 +131,23 @@ def _use_sfa_hybrid_layout(
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is None:
         return False
+    connector_names = {kv_transfer_config.kv_connector}
+    child_configs = kv_transfer_config.kv_connector_extra_config.get(
+        "connectors", []
+    )
+    if kv_transfer_config.kv_connector == "MultiConnector":
+        connector_names.update(
+            connector.get("kv_connector")
+            for connector in child_configs
+        )
+    if connector_names.isdisjoint(_SFA_HYBRID_CONNECTORS):
+        return False
     if not kv_transfer_config.kv_connector_extra_config.get(
         "use_layerwise", False
+    ) and not any(
+        connector.get("kv_connector_extra_config", {}).get("use_layerwise", False)
+        for connector in child_configs
     ):
-        return False
-    if kv_transfer_config.kv_connector not in _SFA_HYBRID_CONNECTORS:
         return False
     has_indexer = any(
         _is_sfa_indexer_spec(layer_name, spec)

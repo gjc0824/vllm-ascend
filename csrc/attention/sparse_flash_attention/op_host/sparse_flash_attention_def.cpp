@@ -86,6 +86,9 @@ public:
         this->Attr("next_tokens").AttrType(OPTIONAL).Int(INT64_MAX);
         this->Attr("attention_mode").AttrType(OPTIONAL).Int(2);
         this->Attr("return_softmax_lse").AttrType(OPTIONAL).Bool(false);
+        // 离散稀疏索引: sparse_indices 中的 -1 可散落在任意位置(而非仅尾部)。
+        // false(默认)=COMPACTED 旧行为; true=DISCRETE 跳过中间 -1 继续扫描。
+        this->Attr("sparse_indices_discrete").AttrType(OPTIONAL).Bool(false);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

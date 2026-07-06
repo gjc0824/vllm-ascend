@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+from collections import defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -24,7 +26,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
-    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, OffloadMLAAttentionSpec
 
 
 class CompressAttentionManager(FullAttentionManager):
@@ -292,3 +294,119 @@ def get_manager_for_kv_cache_spec(
             )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager
+
+
+class OffloadMLAAttentionManager(FullAttentionManager):
+    """KV cache manager for SFA decode offload.
+
+    Full blocks that have already been offloaded to CPU memory are released
+    before new decode blocks are allocated. The recent NPU tail is handled by
+    SFA-side tail buffers, not by this manager.
+    """
+
+    def __init__(self, kv_cache_spec: "OffloadMLAAttentionSpec", **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        self.req_to_offloaded_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
+        self.req_to_num_allocated_tokens: defaultdict[str, int] = defaultdict(int)
+        self.decode_threshold: int | None = None
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+        num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
+        num_req_offloaded_blocks = len(self.req_to_offloaded_blocks.get(request_id, ()))
+
+        if request_id in self.num_cached_block:
+            assert len(new_computed_blocks) == 0
+            return max(num_required_blocks - num_req_blocks - num_req_offloaded_blocks, 0)
+
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks + num_req_offloaded_blocks
+        num_skipped_blocks = num_skipped_tokens // self.block_size
+        num_new_blocks = max(
+            num_required_blocks - max(num_skipped_blocks, num_local_computed_blocks),
+            0,
+        )
+        num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)
+        num_evictable_blocks = self._get_num_evictable_blocks(
+            new_computed_blocks[num_skipped_new_computed_blocks:]
+        )
+        return num_new_blocks + num_evictable_blocks
+
+    def allocate_new_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+    ) -> list[KVCacheBlock]:
+        if self.decode_threshold is None:
+            self.decode_threshold = num_tokens - num_tokens_main_model + 1
+
+        req_blocks = self.req_to_blocks[request_id]
+        req_freed_blocks = self.req_to_offloaded_blocks[request_id]
+        num_required_blocks = cdiv(num_tokens, self.block_size)
+
+        num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
+        num_new_tokens_main_model = num_tokens_main_model - num_allocated_tokens
+        can_free_offloaded_blocks = request_id in self.num_cached_block
+        # The first prefill schedule may already produce full blocks that will
+        # be saved to CPU, but the save happens after layer forward execution.
+        # Only release NPU blocks once the request is in a later cached step.
+        if not can_free_offloaded_blocks:
+            num_to_free_blocks = 0
+        elif num_new_tokens_main_model <= 0:
+            num_to_free_blocks = 0
+        elif num_new_tokens_main_model > self.decode_threshold:
+            num_to_free_blocks = 0
+        else:
+            num_offloaded_blocks = num_allocated_tokens // self.block_size
+            num_freed_blocks = len(req_freed_blocks)
+            num_to_free_blocks = num_offloaded_blocks - num_freed_blocks
+
+        to_free_blocks: list[KVCacheBlock] = []
+        for _ in range(num_to_free_blocks):
+            to_free_block = req_blocks.pop(0)
+            req_freed_blocks.append(to_free_block)
+            to_free_blocks.append(to_free_block)
+        if to_free_blocks:
+            self.block_pool.free_blocks(to_free_blocks)
+            logger.info(
+                "SFA decode offload freed %d GPU blocks for request %s: %s",
+                len(to_free_blocks),
+                request_id,
+                [block.block_id for block in to_free_blocks],
+            )
+
+        num_new_blocks = num_required_blocks - len(req_blocks) - len(req_freed_blocks)
+        self.req_to_num_allocated_tokens[request_id] = num_tokens_main_model
+        if num_new_blocks <= 0:
+            return []
+
+        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        req_blocks.extend(new_blocks)
+        return new_blocks
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        drop_eagle_block: bool = False,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        return tuple([] for _ in range(len(kv_cache_group_ids)))
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0

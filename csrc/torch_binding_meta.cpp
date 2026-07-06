@@ -295,7 +295,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const c10::optional<at::Tensor> &key_rope, int64_t sparse_block_size,
     c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens,
-    int64_t attention_mode, bool return_softmax_lse)
+    int64_t attention_mode, bool return_softmax_lse, bool sparse_indices_discrete)
 {
     constexpr int64_t SIZE = 8;
     constexpr int64_t DIM_0 = 0;
@@ -330,10 +330,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     at::SmallVector<int64_t, SIZE> softmax_size;
     if (return_softmax_lse) {
         if (query.dim() == DIM_3) {
-            softmax_size = {key.size(DIM_1), query.size(DIM_0), query.size(DIM_1) / key.size(DIM_1)};
+            const auto layout_kv_str = std::string(layout_kv);
+            const auto kv_head_num =
+                layout_kv_str == "PA_BSND" ? key.size(DIM_2) : key.size(DIM_1);
+            softmax_size = {
+                kv_head_num,
+                query.size(DIM_0),
+                query.size(DIM_1) / kv_head_num,
+            };
         } else {
             softmax_size = {
-                query.size(DIM_0), key.size(DIM_2), query.size(DIM_1), query.size(DIM_2) / key.size(DIM_2)};
+                query.size(DIM_0),
+                key.size(DIM_2),
+                query.size(DIM_1),
+                query.size(DIM_2) / key.size(DIM_2),
+            };
         }
     } else {
         softmax_size = {0};

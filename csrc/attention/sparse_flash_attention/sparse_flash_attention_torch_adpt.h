@@ -22,7 +22,7 @@ namespace {
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_sparse_flash_attention_output_tensor(
     const at::Tensor &query, const at::Tensor &key,
-    const std::string &layout_query_str, bool return_softmax_lse)
+    const std::string &layout_query_str, const std::string &layout_kv_str, bool return_softmax_lse)
 {
     constexpr int64_t SIZE = 8;
     constexpr int64_t DIM_0 = 0;
@@ -61,12 +61,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_sparse_flash_attention_
     at::SmallVector<int64_t, SIZE> softmax_size;
     if (return_softmax_lse) {
         if (query.dim() == DIM_3) {
-            softmax_size = {key.size(DIM_1), query.size(DIM_0),
-                            query.size(DIM_1) / key.size(DIM_1)};
+            const auto kv_head_num =
+                layout_kv_str == "PA_BSND" ? key.size(DIM_2) : key.size(DIM_1);
+            softmax_size = {
+                kv_head_num,
+                query.size(DIM_0),
+                query.size(DIM_1) / kv_head_num,
+            };
         } else {
-            softmax_size = {query.size(DIM_0), key.size(DIM_2),
-                            query.size(DIM_1),
-                            query.size(DIM_2) / key.size(DIM_2)};
+            softmax_size = {
+                query.size(DIM_0),
+                key.size(DIM_2),
+                query.size(DIM_1),
+                query.size(DIM_2) / key.size(DIM_2),
+            };
         }
     } else {
         softmax_size = {0};
@@ -92,7 +100,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
     const c10::optional<at::Tensor> &key_rope, int64_t sparse_block_size,
     c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens,
-    int64_t attention_mode, bool return_softmax_lse)
+    int64_t attention_mode, bool return_softmax_lse, bool sparse_indices_discrete)
 {
     TORCH_CHECK(query.numel() > 0, "Tensor query is empty.");
     TORCH_CHECK(key.numel() > 0, "Tensor key is empty.");
@@ -104,7 +112,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
 
     auto sparse_flash_attention_output =
         construct_sparse_flash_attention_output_tensor(
-            query, key, layout_query_str, return_softmax_lse);
+            query, key, layout_query_str, layout_kv_str, return_softmax_lse);
     at::Tensor attention_output = std::get<0>(sparse_flash_attention_output);
     at::Tensor softmax_max = std::get<1>(sparse_flash_attention_output);
     at::Tensor softmax_sum = std::get<2>(sparse_flash_attention_output);
@@ -133,6 +141,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention(
         next_tokens,
         attention_mode,
         return_softmax_lse,
+        sparse_indices_discrete,
         attention_output,
         softmax_max,
         softmax_sum);

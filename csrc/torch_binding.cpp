@@ -2328,7 +2328,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           str layout_query='BSND', str layout_kv='BSND',"
         "                           int sparse_mode=3, int pre_tokens=9223372036854775807,"
         "                           int next_tokens=9223372036854775807, int attention_mode=2,"
-        "                           bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
+        "                           bool return_softmax_lse=False, bool sparse_indices_discrete=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
 
