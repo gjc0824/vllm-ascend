@@ -19,10 +19,50 @@ if TYPE_CHECKING:
 
 
 class AscendMultiConnector(MultiConnector, SupportsHMA):
+    # Connectors in this set own prefix/prefill store/load traffic. In
+    # combined SFA offload they must not run their layerwise decode path.
     _ASCEND_STORE_CONNECTORS = {
         "AscendStoreConnector",
         "MooncakeConnectorStoreV1",
     }
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(
+        cls,
+        extra_config: dict[str, Any],
+    ) -> bool:
+        child_configs = extra_config.get("connectors", [])
+        has_sfa_decode_offload = any(
+            child.get("kv_connector") == "SFAKVOffloadConnector"
+            for child in child_configs
+        )
+        has_ascend_store = any(
+            child.get("kv_connector") in cls._ASCEND_STORE_CONNECTORS
+            for child in child_configs
+        )
+        if not has_sfa_decode_offload or not has_ascend_store:
+            return super().requires_piecewise_for_cudagraph(extra_config)
+
+        from vllm.config.kv_transfer import KVTransferConfig
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        # Graph compatibility target: AscendStore is skipped during decode-only
+        # forwards in this connector combination, so its piecewise requirement
+        # should not downgrade FULL_DECODE_ONLY. Other child connectors still
+        # participate in the normal graph compatibility check.
+        for child in child_configs:
+            if child.get("kv_connector") in cls._ASCEND_STORE_CONNECTORS:
+                continue
+            temp_ktc = KVTransferConfig(**child)
+            connector_cls = KVConnectorFactory.get_connector_class(temp_ktc)
+            child_extra_config = child.get("kv_connector_extra_config", {})
+            if connector_cls.requires_piecewise_for_cudagraph(
+                child_extra_config
+            ):
+                return True
+        return False
 
     @classmethod
     def _get_connector_classes_and_configs(cls, vllm_config: "VllmConfig"):
@@ -61,6 +101,9 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 "kv_connector_extra_config", {}
             )
             if child_extra_config.get("use_layerwise", False):
+                # Config-time guard: prevent AscendStore from producing
+                # layerwise decode cache tasks. It still handles prefill/prefix
+                # traffic, while SFAKVOffloadConnector owns decode offload.
                 child_extra_config["save_decode_cache"] = False
 
         patched_kv_transfer_config.kv_connector_extra_config = (
@@ -80,10 +123,73 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager or self._all_support_hma, (
             "HMA should not be enabled unless all sub-connectors support it"
         )
+        # Runtime guard for one forward pass. True means the current pass is
+        # decode-only, so AscendStore layerwise load/save/wait hooks are muted.
+        self._skip_ascend_store_layerwise_for_current_forward = False
+
+    @classmethod
+    def _is_ascend_store_connector(cls, connector: Any) -> bool:
+        return connector.__class__.__name__ in cls._ASCEND_STORE_CONNECTORS
 
     @staticmethod
     def _is_sfa_decode_offload_connector(connector: Any) -> bool:
         return connector.__class__.__name__ == "SFAKVOffloadConnector"
+
+    @classmethod
+    def _metadata_has_prefill(cls, metadata: Any) -> bool | None:
+        """Return whether attention metadata contains prefill work."""
+        if metadata is None:
+            return None
+        if isinstance(metadata, dict):
+            seen = False
+            for value in metadata.values():
+                child_has_prefill = cls._metadata_has_prefill(value)
+                if child_has_prefill is None:
+                    continue
+                seen = True
+                if child_has_prefill:
+                    return True
+            return False if seen else None
+        if isinstance(metadata, (list, tuple)):
+            seen = False
+            for value in metadata:
+                child_has_prefill = cls._metadata_has_prefill(value)
+                if child_has_prefill is None:
+                    continue
+                seen = True
+                if child_has_prefill:
+                    return True
+            return False if seen else None
+
+        num_prefills = getattr(metadata, "num_prefills", None)
+        if num_prefills is not None:
+            try:
+                return int(num_prefills) > 0
+            except (TypeError, ValueError):
+                return bool(num_prefills > 0)
+
+        num_prefill_tokens = getattr(metadata, "num_prefill_tokens", None)
+        if num_prefill_tokens is not None:
+            try:
+                return int(num_prefill_tokens) > 0
+            except (TypeError, ValueError):
+                return bool(num_prefill_tokens > 0)
+
+        return None
+
+    def _forward_has_prefill(self, forward_context: Any) -> bool:
+        has_prefill = self._metadata_has_prefill(
+            getattr(forward_context, "attn_metadata", None)
+        )
+        # Be conservative when metadata shape is unknown: keep AscendStore
+        # enabled so prefill/prefix cache traffic is not accidentally dropped.
+        return True if has_prefill is None else has_prefill
+
+    def _skip_ascend_store_connector(self, connector: Any) -> bool:
+        return (
+            self._skip_ascend_store_layerwise_for_current_forward
+            and self._is_ascend_store_connector(connector)
+        )
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
@@ -99,6 +205,43 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             else:
                 # Call with empty blocks for other connectors.
                 c.update_state_after_alloc(request, empty_blocks, 0)
+
+    def start_load_kv(self, forward_context: Any, **kwargs) -> None:
+        # Decode-only pass: suppress AscendStore start_load_kv. Prefill or
+        # mixed pass: let AscendStore run so prefix/prefill loading still works.
+        self._skip_ascend_store_layerwise_for_current_forward = (
+            not self._forward_has_prefill(forward_context)
+        )
+        for c in self._connectors:
+            if self._skip_ascend_store_connector(c):
+                continue
+            c.start_load_kv(forward_context, **kwargs)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        for c in self._connectors:
+            if self._skip_ascend_store_connector(c):
+                continue
+            c.wait_for_layer_load(layer_name)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: Any,
+        **kwargs,
+    ) -> None:
+        has_prefill = self._metadata_has_prefill(attn_metadata)
+        skip_ascend_store = (
+            self._skip_ascend_store_layerwise_for_current_forward
+            if has_prefill is None
+            else not has_prefill
+        )
+        for c in self._connectors:
+            if skip_ascend_store and self._is_ascend_store_connector(c):
+                # Decode KV is saved by SFAKVOffloadConnector. Skipping
+                # AscendStore here avoids duplicate/conflicting decode tasks.
+                continue
+            c.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
     def prepare_lru_resident_and_load(
         self,
