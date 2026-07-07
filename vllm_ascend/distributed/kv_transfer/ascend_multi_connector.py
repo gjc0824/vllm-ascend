@@ -8,6 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     supports_hma,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
 
@@ -125,7 +126,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         )
         # Runtime guard for one forward pass. True means the current pass is
         # decode-only, so AscendStore layerwise load/save/wait hooks are muted.
-        self._skip_ascend_store_layerwise_for_current_forward = False
+        self._skip_ascend_store_layerwise_for_current_forward = True
 
     @classmethod
     def _is_ascend_store_connector(cls, connector: Any) -> bool:
@@ -175,15 +176,34 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             except (TypeError, ValueError):
                 return bool(num_prefill_tokens > 0)
 
+        attn_state = getattr(metadata, "attn_state", None)
+        attn_state_name = getattr(attn_state, "name", None)
+        if attn_state_name in {"DecodeOnly", "SpecDecoding"}:
+            return False
+
         return None
 
     def _forward_has_prefill(self, forward_context: Any) -> bool:
         has_prefill = self._metadata_has_prefill(
             getattr(forward_context, "attn_metadata", None)
         )
-        # Be conservative when metadata shape is unknown: keep AscendStore
-        # enabled so prefill/prefix cache traffic is not accidentally dropped.
-        return True if has_prefill is None else has_prefill
+        # Unknown metadata cannot produce a reliable AscendStore layerwise
+        # save. Keeping AscendStore enabled for dummy/graph-capture decode runs
+        # can enqueue a load task that waits forever for a save event.
+        return False if has_prefill is None else has_prefill
+
+    def _refresh_ascend_store_skip_state(
+        self,
+        forward_context: Any | None = None,
+    ) -> None:
+        if forward_context is None:
+            if not is_forward_context_available():
+                self._skip_ascend_store_layerwise_for_current_forward = True
+                return
+            forward_context = get_forward_context()
+        self._skip_ascend_store_layerwise_for_current_forward = (
+            not self._forward_has_prefill(forward_context)
+        )
 
     def _skip_ascend_store_connector(self, connector: Any) -> bool:
         return (
@@ -209,15 +229,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
     def start_load_kv(self, forward_context: Any, **kwargs) -> None:
         # Decode-only pass: suppress AscendStore start_load_kv. Prefill or
         # mixed pass: let AscendStore run so prefix/prefill loading still works.
-        self._skip_ascend_store_layerwise_for_current_forward = (
-            not self._forward_has_prefill(forward_context)
-        )
+        self._refresh_ascend_store_skip_state(forward_context)
         for c in self._connectors:
             if self._skip_ascend_store_connector(c):
                 continue
             c.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        # Dummy graph/profile runs can reach attention layer hooks without a
+        # preceding start_load_kv(), so classify from the live forward context.
+        self._refresh_ascend_store_skip_state()
         for c in self._connectors:
             if self._skip_ascend_store_connector(c):
                 continue
@@ -230,6 +251,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         attn_metadata: Any,
         **kwargs,
     ) -> None:
+        self._refresh_ascend_store_skip_state()
         has_prefill = self._metadata_has_prefill(attn_metadata)
         skip_ascend_store = (
             self._skip_ascend_store_layerwise_for_current_forward

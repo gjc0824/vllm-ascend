@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -1699,10 +1700,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             num_decodes = attn_metadata.num_decodes
             if num_decodes <= 0:
                 num_actual_tokens = attn_metadata.num_actual_tokens
-                if not getattr(self, "_sfa_offload_prefill_debug_logged", False):
+                if (
+                    not getattr(self, "_sfa_offload_prefill_debug_logged", False)
+                    and logger.isEnabledFor(logging.DEBUG)
+                ):
                     real_block_table = self.get_sfa_real_kv_block_table(attn_metadata)
                     real_slot_mapping = self.get_sfa_real_kv_slot_mapping(attn_metadata)
-                    logger.info(
+                    logger.debug(
                         "SFA offload pure prefill call: layer=%s "
                         "q=%s q_rope=%s k=%s v=%s topk=%s "
                         "block_table=%s block_head=%s q_lens=%s kv_lens=%s "
