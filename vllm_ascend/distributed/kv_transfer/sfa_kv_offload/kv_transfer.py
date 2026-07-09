@@ -1,4 +1,5 @@
 import queue
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -11,6 +12,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     LayerMultiBlockReqMeta,
     ReqMeta,
 )
+
+
+_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
 
 
 class KVTransferThread(threading.Thread):
@@ -100,6 +104,27 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                     k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
                     v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
         self.save_stream.synchronize()
+        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
+            summaries = []
+            for req_meta in req_metas[:2]:
+                if not req_meta.block_ids_cpu:
+                    continue
+                cpu_block_id = req_meta.block_ids_cpu[0]
+                k_cache_cpu, v_cache_cpu = req_meta.cache_cpu
+                summaries.append(
+                    (
+                        req_meta.req_id[-8:],
+                        req_meta.block_ids_npu[:4],
+                        req_meta.block_ids_cpu[:4],
+                        float(k_cache_cpu[cpu_block_id].float().abs().sum().item()),
+                        float(v_cache_cpu[cpu_block_id].float().abs().sum().item()),
+                    )
+                )
+            logger.info(
+                "SFA_DEBUG kv_send done layer=%s summaries=%s",
+                layer_id,
+                summaries,
+            )
 
         req_metas.clear()
         self.request_queue.task_done()

@@ -275,6 +275,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         req_ids: torch.Tensor,
         token_to_req: torch.Tensor | None = None,
         capturing: bool = False,
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        num_decode_tokens: int | None = None,
     ) -> bool:
         handled = False
         for c in self._connectors:
@@ -291,6 +296,45 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     req_ids,
                     token_to_req,
                     capturing,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    positions,
+                    num_decode_tokens,
+                )
+            ) or handled
+        return handled
+
+    def ensure_layer_saved(self, layer_name: str) -> None:
+        for c in self._connectors:
+            hook = getattr(c, "ensure_layer_saved", None)
+            if hook is not None:
+                hook(layer_name)
+
+    def update_cpu_kv_tokens(
+        self,
+        layer_name: str,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        token_to_req: torch.Tensor | None = None,
+        num_tokens: int | None = None,
+    ) -> bool:
+        handled = False
+        for c in self._connectors:
+            hook = getattr(c, "update_cpu_kv_tokens", None)
+            if hook is None:
+                continue
+            handled = bool(
+                hook(
+                    layer_name,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    positions,
+                    token_to_req,
+                    num_tokens,
                 )
             ) or handled
         return handled
@@ -300,6 +344,16 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             hook = getattr(c, "set_req_ids", None)
             if hook is not None:
                 hook(req_ids)
+
+    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
+        for c in self._connectors:
+            hook = getattr(c, "get_num_cpu_blocks", None)
+            if hook is None:
+                continue
+            result = hook(req_ids)
+            if result is not None:
+                return result
+        return None
 
     def get_num_new_matched_tokens(
         self,

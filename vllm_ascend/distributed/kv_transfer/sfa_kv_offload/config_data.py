@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -101,6 +101,10 @@ class RequestTracker:
     req_id: str
     allocated_block_ids_npu: list[int]
     allocated_block_ids_cpu: list[int]
+    # Decode offload source/destination for this scheduler step. The tail block
+    # can appear here repeatedly so its CPU block is refreshed every decode step.
+    offload_src_hbm_ids: list[int] = field(default_factory=list)
+    offload_dst_cpu_ids: list[int] = field(default_factory=list)
 
     def update(
         self,
@@ -118,6 +122,10 @@ class ReqMeta:
     block_ids_npu: list[int]
     block_ids_cpu: list[int]
     num_new_offload_blocks: int = 0
+    # Explicit HBM->CPU block mapping for this save step. This can be a suffix
+    # that includes an already-allocated CPU block when refreshing the tail.
+    offload_src_hbm_ids: list[int] = field(default_factory=list)
+    offload_dst_cpu_ids: list[int] = field(default_factory=list)
 
     @staticmethod
     def from_request_tracker(
@@ -130,6 +138,8 @@ class ReqMeta:
             block_ids_npu=tracker.allocated_block_ids_npu,
             block_ids_cpu=tracker.allocated_block_ids_cpu,
             num_new_offload_blocks=num_new_offload_blocks,
+            offload_src_hbm_ids=tracker.offload_src_hbm_ids,
+            offload_dst_cpu_ids=tracker.offload_dst_cpu_ids,
         )
 
 

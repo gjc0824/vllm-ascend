@@ -20,6 +20,7 @@
 import gc
 import logging
 import math
+import os
 import sys
 import time
 import zlib
@@ -110,7 +111,27 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, set_connector_req_ids, using_paged_attention
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    set_connector_req_ids,
+    using_paged_attention,
+)
+
+_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
+_GRAPH_DEBUG = bool(int(os.getenv("VLLM_ASCEND_GRAPH_DEBUG", "1")))
+_SFA_PROBE = bool(int(os.getenv("VLLM_ASCEND_SFA_PROBE", "1")))
+
+
+def _sfa_probe_enabled(count: int) -> bool:
+    return count <= 12 or count in (16, 32, 64, 96, 128)
+
+
+def _sfa_debug_rank0() -> bool:
+    return (
+        not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_rank() == 0
+    )
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -595,6 +616,7 @@ class NPUModelRunner(GPUModelRunner):
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self.all_kv_in_cpu = False
 
     @property
     def use_cp(self) -> bool:
@@ -1438,11 +1460,28 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if self.ascend_config.use_offload:
+            num_finalized_scheduled_tokens = num_scheduled_tokens[:num_reqs].copy()
+            for req_id, draft_token_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_finalized_scheduled_tokens[req_idx] = max(
+                    int(num_finalized_scheduled_tokens[req_idx]) - len(draft_token_ids),
+                    0,
+                )
+
+            # Buffer mixed SFA offload keeps every decode token addressable from
+            # CPU. Prefill/chunk blocks are saved by the connector; decode tail
+            # tokens are patched into the CPU pool token-wise after real KV is
+            # re-materialized, because the hybrid indexer view aliases K storage.
+            self.all_kv_in_cpu = True
             num_offloaded_blocks = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                // self.block_size
-            ).astype(np.int32, copy=True)
-            decode_threshold = self.decode_token_per_req
+                + num_finalized_scheduled_tokens
+                + self.block_size
+                - 1
+            ) // self.block_size
+            decode_threshold = 1
+            if self.speculative_config is not None:
+                decode_threshold += self.speculative_config.num_speculative_tokens
             is_prefill = num_scheduled_tokens[:num_reqs] > decode_threshold
             num_offloaded_blocks[is_prefill] = 0
 
@@ -1464,6 +1503,53 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.req_ids_tensor.copy_to_gpu(num_reqs)
             set_connector_req_ids(self.input_batch.req_ids[:num_reqs])
+            if _SFA_PROBE and _sfa_debug_rank0():
+                probe_count = getattr(self, "_sfa_probe_runner_count", 0) + 1
+                self._sfa_probe_runner_count = probe_count
+                if _sfa_probe_enabled(probe_count):
+                    positions_np = (
+                        self.positions.np
+                        if hasattr(self.positions, "np")
+                        else self._positions_np_buf
+                    )
+                    logger.info(
+                        "SFA_PROBE runner count=%s reqs=%s total_tokens=%s "
+                        "scheduled=%s finalized=%s computed=%s offload_blocks=%s "
+                        "is_prefill=%s req_tail=%s token_to_req=%s positions=%s",
+                        probe_count,
+                        num_reqs,
+                        total_num_scheduled_tokens,
+                        num_scheduled_tokens[:num_reqs].tolist(),
+                        num_finalized_scheduled_tokens.tolist(),
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                        num_offloaded_blocks.tolist(),
+                        is_prefill.tolist(),
+                        [
+                            req_id[-8:]
+                            for req_id in self.input_batch.req_ids[:num_reqs]
+                        ],
+                        req_indices[:min(total_num_scheduled_tokens, 8)].tolist(),
+                        positions_np[:min(total_num_scheduled_tokens, 8)].tolist(),
+                    )
+            if _SFA_DEBUG and _sfa_debug_rank0():
+                logger.info(
+                    "SFA_DEBUG runner num_reqs=%s total_tokens=%s all_cpu=%s "
+                    "scheduled=%s finalized=%s computed_cpu=%s offload_blocks=%s "
+                    "is_prefill=%s req_hash=%s req_tail=%s",
+                    num_reqs,
+                    total_num_scheduled_tokens,
+                    self.all_kv_in_cpu,
+                    num_scheduled_tokens[:num_reqs].tolist(),
+                    num_finalized_scheduled_tokens.tolist(),
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                    num_offloaded_blocks.tolist(),
+                    is_prefill.tolist(),
+                    req_ids_uint32,
+                    [
+                        req_id[-8:]
+                        for req_id in self.input_batch.req_ids[:num_reqs]
+                    ],
+                )
 
         return (
             logits_indices,
@@ -3051,7 +3137,9 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
+        num_tokens_raw = num_tokens
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        num_tokens_sp_padded = num_tokens_padded
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -3121,6 +3209,48 @@ class NPUModelRunner(GPUModelRunner):
                 num_padded_tokens=batch_descriptor.num_tokens,
                 num_paddings=batch_descriptor.num_tokens - num_tokens,
                 runtime_mode=str(cudagraph_mode),
+            )
+        if _GRAPH_DEBUG and _sfa_debug_rank0():
+            scheduled_head = (
+                num_scheduled_tokens_np[:min(num_reqs, 8)].tolist()
+                if num_reqs > 0
+                else []
+            )
+            computed_head = (
+                self.input_batch.num_computed_tokens_cpu[:min(num_reqs, 8)].tolist()
+                if num_reqs > 0
+                else []
+            )
+            logger.info(
+                "SFA_DEBUG graph_dispatch mode=%s config_mode=%s desc=%s "
+                "tokens_raw=%s tokens_sp_padded=%s tokens_graph=%s reqs=%s "
+                "max_sched=%s uniform_decode=%s all_decode=%s "
+                "force_eager=%s cascade=%s encoder_reqs=%s has_lora=%s "
+                "active_loras=%s ubatch=%s dp_tokens=%s scheduled=%s "
+                "computed=%s",
+                cudagraph_mode,
+                self.compilation_config.cudagraph_mode,
+                batch_descriptor,
+                num_tokens_raw,
+                num_tokens_sp_padded,
+                batch_descriptor.num_tokens,
+                num_reqs,
+                max_num_scheduled_tokens,
+                uniform_decode,
+                bool(is_all_decode),
+                force_eager,
+                use_cascade_attn,
+                num_encoder_reqs,
+                has_lora,
+                num_active_loras,
+                should_ubatch,
+                (
+                    num_tokens_across_dp.tolist()
+                    if num_tokens_across_dp is not None
+                    else None
+                ),
+                scheduled_head,
+                computed_head,
             )
 
         return (
@@ -3479,6 +3609,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
+            if self.ascend_config.use_offload:
+                cm.all_kv_in_cpu = self.all_kv_in_cpu or for_cudagraph_capture
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid, attn_gid, cm, num_reqs_actual,
@@ -4753,47 +4885,18 @@ class NPUModelRunner(GPUModelRunner):
                                 dtype=current_kv_cache_spec.dtype,
                                 device=self.device,
                             )
-                            tail_window_blocks = 2
-                            tail_blocks = (
-                                self.vllm_config.scheduler_config.max_num_seqs
-                                * tail_window_blocks
-                            )
-                            tail_k_cache = torch.zeros(
-                                [
-                                    tail_blocks,
-                                    current_kv_cache_spec.block_size,
-                                    current_kv_cache_spec.num_kv_heads,
-                                    kv_lora_rank,
-                                ],
-                                dtype=current_kv_cache_spec.dtype,
-                                device=self.device,
-                            )
-                            tail_v_cache = torch.zeros(
-                                [
-                                    tail_blocks,
-                                    current_kv_cache_spec.block_size,
-                                    current_kv_cache_spec.num_kv_heads,
-                                    qk_rope_head_dim,
-                                ],
-                                dtype=current_kv_cache_spec.dtype,
-                                device=self.device,
-                            )
                             # SFA offload KV cache tuple layout:
                             # 0: k_cache       normal reused real-KV K/nope cache
                             # 1: v_cache       normal reused rope/PE cache
                             # 2: dsa_k_cache   indexer alias view over K storage
                             # 3: topk_buffer_k per-layer LRU resident K buffer for CPU decode offload
                             # 4: topk_buffer_v per-layer LRU resident rope/PE buffer for CPU decode offload
-                            # 5: tail_k_cache  per-request NPU tail K buffer, 2 blocks/request
-                            # 6: tail_v_cache  per-request NPU tail rope/PE buffer, 2 blocks/request
                             kv_caches[layer_name] = (
                                 k_cache,
                                 v_cache,
                                 dsa_k_cache,
                                 topk_buffer_k,
                                 topk_buffer_v,
-                                tail_k_cache,
-                                tail_v_cache,
                             )
                         else:
                             kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
@@ -5503,6 +5606,54 @@ class NPUModelRunner(GPUModelRunner):
             mgr.update_stream = self.update_stream
 
         return cuda_graph_size
+
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+    ):
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+
+        num_tokens = desc.num_tokens
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and desc.uniform
+            and desc.num_reqs is not None
+            and (enable_sp(self.vllm_config) or enable_sp_by_pass())
+        ):
+            # FULL_DECODE_ONLY capture keys are registered after sequence-parallel
+            # padding. Build dummy metadata from real decode tokens and let the
+            # dispatcher pad it back to desc.num_tokens.
+            num_tokens = desc.num_reqs * self.uniform_decode_query_len
+
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        for _ in range(num_warmups):
+            self._dummy_run(
+                num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=force_attention,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+                profile_seq_lens=profile_seq_lens,
+            )
+        self._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            is_graph_capturing=True,
+            profile_seq_lens=profile_seq_lens,
+        )
 
     def _prepare_multimodal_fields(self):
         """
