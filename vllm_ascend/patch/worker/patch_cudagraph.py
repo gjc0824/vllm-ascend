@@ -3,11 +3,8 @@ from itertools import product
 
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
-from vllm.logger import init_logger
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
-logger = init_logger(__name__)
-_GRAPH_DEBUG = bool(int(os.getenv("VLLM_ASCEND_GRAPH_DEBUG", "1")))
 _ORIG_INITIALIZE_CUDAGRAPH_KEYS = CudagraphDispatcher.initialize_cudagraph_keys
 
 
@@ -129,16 +126,6 @@ def _initialize_cudagraph_keys(
                 num_active_loras > 0,
                 num_active_loras,
             ),
-        )
-
-    if _GRAPH_DEBUG:
-        logger.info_once(
-            "SFA_DEBUG cudagraph_decode_keys sizes=%s max_num_seqs=%s "
-            "tp_size=%s query_len=%s",
-            tuple(decode_capture_sizes),
-            self.vllm_config.scheduler_config.max_num_seqs,
-            self.vllm_config.parallel_config.tensor_parallel_size,
-            uniform_decode_query_len,
         )
 
 

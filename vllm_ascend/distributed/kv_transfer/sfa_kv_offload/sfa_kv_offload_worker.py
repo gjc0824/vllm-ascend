@@ -42,33 +42,6 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler
 )
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
-_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
-_SFA_PROBE = bool(int(os.getenv("VLLM_ASCEND_SFA_PROBE", "1")))
-_SFA_FORCE_LRU_MISS = bool(
-    int(os.getenv("VLLM_ASCEND_SFA_FORCE_LRU_MISS", "0"))
-)
-_SFA_DEBUG_BUILD = "all_cpu_inline_token_patch_20260709"
-
-
-def _probe_enabled(count: int) -> bool:
-    return count <= 12 or count in (16, 32, 64, 96, 128)
-
-
-def _debug_tensor_head(tensor: torch.Tensor, limit: int = 8):
-    if tensor.numel() == 0:
-        return []
-    return tensor.reshape(-1)[:limit].detach().cpu().tolist()
-
-
-def _debug_list_head(values: list[int], limit: int = 8) -> list[int]:
-    return values[:limit]
-
-
-def _debug_synchronize_npu() -> None:
-    try:
-        torch_npu.npu.synchronize()
-    except Exception:
-        torch_npu.npu.current_stream().synchronize()
 
 
 def get_subscribed_compute_streams() -> set:
@@ -109,12 +82,6 @@ os.environ['CXX'] = 'clang++'
 os.environ['CC'] = 'clang'
 abs_path = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(abs_path, "cpu_sparse_attn.cpp")
-logger.info(
-    "SFA_DEBUG_BUILD worker version=%s file=%s debug=%s",
-    _SFA_DEBUG_BUILD,
-    os.path.abspath(__file__),
-    _SFA_DEBUG,
-)
 logger.info(f'>>>>> load cpu_sparse_attn from src: {src_path}')
 cpu_sparse_attn = None
 cpu_sparse_attn = load(
@@ -330,17 +297,6 @@ class SFAKVOffloadWorker:
                 self.v_caches_npu.append(cache_or_caches[1])
                 self.topk_buffers_k.append(cache_or_caches[3])
                 self.topk_buffers_v.append(cache_or_caches[4])
-                if _SFA_DEBUG and self.tp_rank == 0 and len(self.k_caches_npu) <= 2:
-                    logger.info(
-                        "SFA_DEBUG worker cache_layout layer=%s k=%s v=%s "
-                        "indexer=%s topk_k=%s topk_v=%s",
-                        layer_name,
-                        tuple(cache_or_caches[0].shape),
-                        tuple(cache_or_caches[1].shape),
-                        tuple(cache_or_caches[2].shape),
-                        tuple(cache_or_caches[3].shape),
-                        tuple(cache_or_caches[4].shape),
-                    )
 
             if self.use_layerwise:
                 ready_event = threading.Event()
@@ -576,94 +532,6 @@ class SFAKVOffloadWorker:
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
-    def _debug_verify_lru_copy(
-        self,
-        layer_id: int,
-        num_tokens: int,
-        cpu_block_table: torch.Tensor,
-    ) -> None:
-        if not (_SFA_DEBUG and self.tp_rank == 0 and layer_id < 2 and num_tokens > 0):
-            return
-        try:
-            miss_count = self.lru_miss_count_cpu_list[layer_id][:num_tokens]
-            miss_tokens = self.lru_miss_tokens_cpu_list[layer_id][:num_tokens]
-            miss_slots = self.lru_miss_slots_cpu_list[layer_id][:num_tokens]
-            samples = []
-            max_rows = min(num_tokens, 2)
-            for row in range(max_rows):
-                count = max(0, int(miss_count[row].item()))
-                count = min(count, self.sfa_sparse_topk)
-                for miss_idx in range(count):
-                    token = int(miss_tokens[row, miss_idx].item())
-                    slot = int(miss_slots[row, miss_idx].item())
-                    if token < 0 or slot < 0 or slot >= self.lru_resident_capacity:
-                        continue
-                    block_id = token // self.block_size
-                    if block_id < 0 or block_id >= cpu_block_table.shape[1]:
-                        continue
-                    table_row = min(row, cpu_block_table.shape[0] - 1)
-                    cpu_block_id = int(cpu_block_table[table_row, block_id].item())
-                    offset = token % self.block_size
-                    k_src = float(
-                        self.k_caches_cpu[layer_id][cpu_block_id, offset]
-                        .float()
-                        .abs()
-                        .sum()
-                        .item()
-                    )
-                    v_src = float(
-                        self.v_caches_cpu[layer_id][cpu_block_id, offset]
-                        .float()
-                        .abs()
-                        .sum()
-                        .item()
-                    )
-                    k_dst = float(
-                        self.topk_buffers_k[layer_id][row, slot]
-                        .float()
-                        .abs()
-                        .sum()
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
-                    v_dst = float(
-                        self.topk_buffers_v[layer_id][row, slot]
-                        .float()
-                        .abs()
-                        .sum()
-                        .detach()
-                        .cpu()
-                        .item()
-                    )
-                    samples.append(
-                        (
-                            row,
-                            token,
-                            slot,
-                            cpu_block_id,
-                            offset,
-                            k_src,
-                            k_dst,
-                            abs(k_src - k_dst),
-                            v_src,
-                            v_dst,
-                            abs(v_src - v_dst),
-                        )
-                    )
-                    if len(samples) >= 4:
-                        break
-                if len(samples) >= 4:
-                    break
-            if samples:
-                logger.info(
-                    "SFA_DEBUG worker lru_verify layer=%s samples=%s",
-                    layer_id,
-                    samples,
-                )
-        except Exception:
-            logger.exception("SFA_DEBUG worker lru_verify failed layer=%s", layer_id)
-
     def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
         # return
         self.current_layer_save = 0
@@ -680,17 +548,6 @@ class SFAKVOffloadWorker:
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
             self.cpu_blocks_by_req[request.req_id] = len(request.block_ids_cpu)
-            if _SFA_DEBUG and self.tp_rank == 0:
-                logger.info(
-                    "SFA_DEBUG worker metadata req=%s cpu_blocks=%s "
-                    "new_offload=%s src=%s dst=%s npu_total=%s",
-                    request.req_id,
-                    len(request.block_ids_cpu),
-                    request.num_new_offload_blocks,
-                    _debug_list_head(request.offload_src_hbm_ids),
-                    _debug_list_head(request.offload_dst_cpu_ids),
-                    len(request.block_ids_npu),
-                )
             if request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
@@ -726,18 +583,6 @@ class SFAKVOffloadWorker:
                 missing_req_ids.append(req_id)
                 continue
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
-        if _SFA_DEBUG and self.tp_rank == 0:
-            logger.info(
-                "SFA_DEBUG worker cpu_block_table num_reqs=%s req_tail=%s "
-                "row0=%s blocks_by_req=%s",
-                num_reqs,
-                [req_id[-8:] for req_id in self.req_ids[:num_reqs]],
-                cpu_block_table_np[0][:16].tolist() if num_reqs else [],
-                {
-                    req_id[-8:]: len(req_id_to_block_ids.get(req_id, []))
-                    for req_id in self.req_ids[:num_reqs]
-                },
-            )
         if missing_req_ids and self.tp_rank == 0:
             logger.info(
                 "SFA KV offload skipped %s stale req ids absent from "
@@ -745,29 +590,6 @@ class SFAKVOffloadWorker:
                 len(missing_req_ids),
             )
         self.cpu_block_table.copy_to_gpu(num_reqs)
-        if _SFA_PROBE and self.tp_rank == 0:
-            probe_count = getattr(self, "_sfa_probe_start_load_count", 0) + 1
-            self._sfa_probe_start_load_count = probe_count
-            if _probe_enabled(probe_count):
-                logger.info(
-                    "SFA_PROBE start_load count=%s reqs=%s req_tail=%s "
-                    "metadata_reqs=%s row0=%s row1=%s blocks_by_req=%s "
-                    "save_tasks=%s",
-                    probe_count,
-                    num_reqs,
-                    [req_id[-8:] for req_id in self.req_ids[:num_reqs]],
-                    [request.req_id[-8:] for request in metadata.requests],
-                    cpu_block_table_np[0][:8].tolist() if num_reqs else [],
-                    cpu_block_table_np[1][:8].tolist() if num_reqs > 1 else [],
-                    {
-                        req_id[-8:]: len(req_id_to_block_ids.get(req_id, []))
-                        for req_id in self.req_ids[:num_reqs]
-                    },
-                    [
-                        len(layer_save_task)
-                        for layer_save_task in self.layer_save_tasks[:4]
-                    ],
-                )
 
     def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
         result = {req_id: self.cpu_blocks_by_req[req_id] for req_id in req_ids if req_id in self.cpu_blocks_by_req}
@@ -790,22 +612,10 @@ class SFAKVOffloadWorker:
         if layer_id in self.submitted_save_layer_ids:
             return
         assert self.kv_send_thread is not None
+        ready_event = torch_npu.npu.current_stream().record_event()
+        self.kv_send_thread.save_stream.wait_event(ready_event)
         self.pending_save_layer_ids.add(layer_id)
         self.submitted_save_layer_ids.add(layer_id)
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info(
-                "SFA_DEBUG worker save_submit layer=%s tasks=%s mappings=%s",
-                layer_id,
-                len(self.layer_save_tasks[layer_id]),
-                [
-                    (
-                        task.req_id[-8:],
-                        _debug_list_head(task.block_ids_npu, 4),
-                        _debug_list_head(task.block_ids_cpu, 4),
-                    )
-                    for task in self.layer_save_tasks[layer_id][:4]
-                ],
-            )
         self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
 
     def save_kv_layer(self, layer_name: str) -> None:
@@ -823,12 +633,6 @@ class SFAKVOffloadWorker:
         current_stream = torch_npu.npu.current_stream()
         ready_event = current_stream.record_event()
         self.kv_send_thread.save_stream.wait_event(ready_event)
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info(
-                "SFA_DEBUG worker ensure_before layer=%s tasks=%s",
-                layer_id,
-                len(self.layer_save_tasks[layer_id]),
-            )
         self.save_cpu(layer_id)
         event = self.layer_save_finished_events[layer_id]
         while not event.wait(timeout=1):
@@ -837,8 +641,6 @@ class SFAKVOffloadWorker:
         self.pending_save_layer_ids.discard(layer_id)
         self.submitted_save_layer_ids.discard(layer_id)
         self.layer_save_tasks[layer_id].clear()
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info("SFA_DEBUG worker ensure_done layer=%s", layer_id)
 
     def update_cpu_kv_tokens(
         self,
@@ -914,7 +716,6 @@ class SFAKVOffloadWorker:
         dst_cpu_blocks: list[int] = []
         dst_offsets: list[int] = []
         src_indices: list[int] = []
-        samples = []
         cpu_block_table = self.cpu_block_table.np
         for token_idx in range(num_tokens):
             slot = int(slot_mapping_cpu[token_idx].item())
@@ -954,16 +755,6 @@ class SFAKVOffloadWorker:
             dst_cpu_blocks.append(cpu_block)
             dst_offsets.append(offset)
             src_indices.append(token_idx)
-            if len(samples) < 4:
-                samples.append(
-                    (
-                        req_row,
-                        position,
-                        slot,
-                        cpu_block,
-                        offset,
-                    )
-                )
 
         if not src_slots:
             return False
@@ -971,26 +762,6 @@ class SFAKVOffloadWorker:
         for src_idx, cpu_block, offset in zip(src_indices, dst_cpu_blocks, dst_offsets):
             key_cpu[cpu_block, offset, 0].copy_(key_values_cpu[src_idx])
             value_cpu[cpu_block, offset, 0].copy_(value_values_cpu[src_idx])
-        if _SFA_PROBE and self.tp_rank == 0 and layer_id == 0:
-            probe_count = getattr(self, "_sfa_probe_token_update_count", 0) + 1
-            self._sfa_probe_token_update_count = probe_count
-            if _probe_enabled(probe_count):
-                logger.info(
-                    "SFA_PROBE token_update count=%s layer=%s tokens=%s "
-                    "req_tail=%s samples=%s",
-                    probe_count,
-                    layer_id,
-                    len(src_slots),
-                    [req_id[-8:] for req_id in self.req_ids[:8]],
-                    samples,
-                )
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info(
-                "SFA_DEBUG worker token_update layer=%s tokens=%s samples=%s",
-                layer_id,
-                len(src_slots),
-                samples,
-            )
         return True
 
     def wait_for_save(self):
@@ -1045,8 +816,6 @@ class SFAKVOffloadWorker:
             do_offload,
             token_update_args,
         ) = args
-        token_updated = False
-        num_update_tokens_debug = 0
         if token_update_args is not None:
             (
                 num_update_tokens,
@@ -1058,13 +827,12 @@ class SFAKVOffloadWorker:
                 key_cpu,
                 value_cpu,
             ) = token_update_args
-            num_update_tokens_debug = int(num_update_tokens)
             if update_token_to_req_cpu is None:
                 update_token_to_req_cpu = torch.arange(
                     num_update_tokens,
                     dtype=torch.int64,
                 )
-            token_updated = self._update_cpu_kv_tokens_from_cpu(
+            self._update_cpu_kv_tokens_from_cpu(
                 self.offload_layer_names[layer_id],
                 layer_id,
                 update_slots_cpu,
@@ -1077,9 +845,6 @@ class SFAKVOffloadWorker:
                 value_cpu,
                 strict=False,
             )
-        force_lru_miss = _SFA_FORCE_LRU_MISS and num_reqs > 0
-        if force_lru_miss:
-            self.lru_last_req_ids_cpu_list[layer_id][:num_reqs].fill_(-1)
         cpu_sparse_attn.lru_resident_compact(
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,
@@ -1121,63 +886,6 @@ class SFAKVOffloadWorker:
             size_buffer,
             num_tokens_buffer,
         )
-        if _SFA_PROBE and self.tp_rank == 0 and layer_id == 0:
-            probe_count = getattr(self, "_sfa_probe_lru_cpu_count", 0) + 1
-            self._sfa_probe_lru_cpu_count = probe_count
-            if _probe_enabled(probe_count):
-                logger.info(
-                    "SFA_PROBE lru_cpu count=%s layer=%s rows=%s "
-                    "do_offload=%s force_lru_miss=%s token_update_args=%s update_tokens=%s "
-                    "token_updated=%s load_tokens=%s req_ids=%s miss_count=%s "
-                    "topk0=%s current_slots0=%s block_row0=%s "
-                    "num_tokens_buffer=%s",
-                    probe_count,
-                    layer_id,
-                    num_reqs,
-                    do_offload,
-                    force_lru_miss,
-                    token_update_args is not None,
-                    num_update_tokens_debug,
-                    token_updated,
-                    int(num_tokens_to_load),
-                    self.lru_req_ids_cpu[:min(num_reqs, 8)].tolist(),
-                    miss_count[:min(num_reqs, 8)].tolist(),
-                    self.lru_topk_indices_cpu[:1, :8].reshape(-1).tolist()
-                    if num_reqs
-                    else [],
-                    self.lru_current_slots_cpu[:1, :8].reshape(-1).tolist()
-                    if num_reqs
-                    else [],
-                    block_table[0, :8].tolist() if num_reqs else [],
-                    num_tokens_buffer[:min(num_reqs, 8)].tolist(),
-                )
-
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            miss_counts_head = miss_count[:min(num_reqs, 4)].tolist()
-            miss_tokens_head = (
-                miss_tokens[:1, :min(self.sfa_sparse_topk, 8)].tolist()
-                if num_reqs
-                else []
-            )
-            miss_slots_head = (
-                miss_slots[:1, :min(self.sfa_sparse_topk, 8)].tolist()
-                if num_reqs
-                else []
-            )
-            logger.info(
-                "SFA_DEBUG worker lru_cpu layer=%s num_reqs=%s load_tokens=%s "
-                "miss_count=%s miss_tokens0=%s miss_slots0=%s block_row0=%s "
-                "do_offload=%s force_lru_miss=%s",
-                layer_id,
-                num_reqs,
-                int(num_tokens_to_load),
-                miss_counts_head,
-                miss_tokens_head,
-                miss_slots_head,
-                block_table[0, :16].tolist() if num_reqs else [],
-                do_offload,
-                force_lru_miss,
-            )
 
         if not do_offload and layer_id == 0 and self.tp_rank == 0:
             logger.info(f'>>>>> load_kv_token_wise, num_tokens_to_load={num_tokens_to_load}')
@@ -1304,21 +1012,6 @@ class SFAKVOffloadWorker:
                     self.k_caches_cpu[layer_id],
                     self.v_caches_cpu[layer_id],
                 )
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info(
-                "SFA_DEBUG worker lru_prepare layer=%s tokens=%s reqs=%s "
-                "capturing=%s token_to_req=%s token_update=%s topk0=%s "
-                "req_ids=%s block_row0=%s",
-                layer_id,
-                num_tokens,
-                num_reqs,
-                capturing,
-                token_to_req_npu is not None,
-                token_update_args is not None,
-                _debug_tensor_head(topk_indices_cpu[:1, :min(topk, 8)]),
-                _debug_tensor_head(req_ids_cpu[:min(num_tokens, 8)]),
-                cpu_block_table[:1, :16].reshape(-1).tolist() if num_reqs else [],
-            )
 
         args = (
             num_tokens,
@@ -1373,38 +1066,16 @@ class SFAKVOffloadWorker:
             self.prepare_lru_resident_and_load_cpu(args)
 
         self.batch_copy_args_buffer_npu.copy_(self.batch_copy_args_buffer_cpu, non_blocking=capturing)
-        copy_ret = h2d.batch_copy(
+        h2d.batch_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
             self.size_buffer_npu,
             self.num_tokens_buffer_npu,
             self.topk_buffers_k[0].device,
         )
-        if _SFA_DEBUG:
-            _debug_synchronize_npu()
-            if self.tp_rank == 0 and layer_id < 2:
-                logger.info(
-                    "SFA_DEBUG worker h2d_done layer=%s ret=%s count=%s "
-                    "gvas_head=%s addr_head=%s size_head=%s",
-                    layer_id,
-                    copy_ret,
-                    _debug_tensor_head(self.num_tokens_buffer_cpu),
-                    _debug_tensor_head(self.gvas_buffer_cpu[:4]),
-                    _debug_tensor_head(self.addr_buffer_cpu[:4]),
-                    _debug_tensor_head(self.size_buffer_cpu[:4]),
-                )
-                self._debug_verify_lru_copy(layer_id, num_tokens, cpu_block_table)
 
         current_slots_cpu = self.lru_current_slots_cpu[:num_tokens]
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
-        if _SFA_DEBUG and self.tp_rank == 0 and layer_id < 2:
-            logger.info(
-                "SFA_DEBUG worker lru_done layer=%s current_slots0=%s "
-                "num_tokens_buffer=%s",
-                layer_id,
-                _debug_tensor_head(current_slots_cpu[:1, :min(topk, 8)]),
-                _debug_tensor_head(self.num_tokens_buffer_cpu),
-            )
         return True
 
     def process_layer_data(self, request: ReqMeta) -> Generator[
@@ -1421,14 +1092,6 @@ class SFAKVOffloadWorker:
             raise ValueError(
                 "SFA KV offload block mapping size mismatch: "
                 f"req_id={request.req_id}, npu={block_ids_npu}, cpu={block_ids_cpu}"
-            )
-        if _SFA_DEBUG and self.tp_rank == 0:
-            logger.info(
-                "SFA_DEBUG worker process req=%s new_offload=%s src=%s dst=%s",
-                request.req_id,
-                num_new_offload_blocks,
-                _debug_list_head(block_ids_npu),
-                _debug_list_head(block_ids_cpu),
             )
 
         for layer_id in range(self.num_layers):

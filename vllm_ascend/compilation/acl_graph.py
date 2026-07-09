@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-import os
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -26,7 +25,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from ..utils import weak_ref_tensors
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
-_GRAPH_DEBUG = bool(int(os.getenv("VLLM_ASCEND_GRAPH_DEBUG", "1")))
 _STREAM_RESOURCE_ERROR_CODE = "207008"
 _STREAM_RESOURCE_ERROR_MARKERS = (
     "insufficient_stream_resources",
@@ -63,13 +61,6 @@ class ACLGraphEntry:
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
-
-
-def _graph_debug_rank0() -> bool:
-    try:
-        return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    except RuntimeError:
-        return True
 
 
 class ACLGraphWrapper:
@@ -182,12 +173,6 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            if _GRAPH_DEBUG:
-                logger.info(
-                    "SFA_DEBUG aclgraph_capture mode=%s desc=%s",
-                    self.runtime_mode,
-                    entry.batch_descriptor,
-                )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -273,16 +258,7 @@ class ACLGraphWrapper:
             )
 
         entry.replay_count += 1
-        if _GRAPH_DEBUG:
-            if _graph_debug_rank0() and (entry.replay_count <= 5 or entry.replay_count % 32 == 0):
-                logger.info(
-                    "SFA_DEBUG aclgraph_replay mode=%s desc=%s count=%d",
-                    self.runtime_mode,
-                    entry.batch_descriptor,
-                    entry.replay_count,
-                )
-        else:
-            logger.info_once("Replaying aclgraph")
+        logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

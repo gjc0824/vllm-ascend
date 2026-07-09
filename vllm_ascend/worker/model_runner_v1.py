@@ -20,7 +20,6 @@
 import gc
 import logging
 import math
-import os
 import sys
 import time
 import zlib
@@ -116,22 +115,6 @@ from vllm_ascend.attention.utils import (
     set_connector_req_ids,
     using_paged_attention,
 )
-
-_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
-_GRAPH_DEBUG = bool(int(os.getenv("VLLM_ASCEND_GRAPH_DEBUG", "1")))
-_SFA_PROBE = bool(int(os.getenv("VLLM_ASCEND_SFA_PROBE", "1")))
-
-
-def _sfa_probe_enabled(count: int) -> bool:
-    return count <= 12 or count in (16, 32, 64, 96, 128)
-
-
-def _sfa_debug_rank0() -> bool:
-    return (
-        not dist.is_available()
-        or not dist.is_initialized()
-        or dist.get_rank() == 0
-    )
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -1503,53 +1486,6 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.req_ids_tensor.copy_to_gpu(num_reqs)
             set_connector_req_ids(self.input_batch.req_ids[:num_reqs])
-            if _SFA_PROBE and _sfa_debug_rank0():
-                probe_count = getattr(self, "_sfa_probe_runner_count", 0) + 1
-                self._sfa_probe_runner_count = probe_count
-                if _sfa_probe_enabled(probe_count):
-                    positions_np = (
-                        self.positions.np
-                        if hasattr(self.positions, "np")
-                        else self._positions_np_buf
-                    )
-                    logger.info(
-                        "SFA_PROBE runner count=%s reqs=%s total_tokens=%s "
-                        "scheduled=%s finalized=%s computed=%s offload_blocks=%s "
-                        "is_prefill=%s req_tail=%s token_to_req=%s positions=%s",
-                        probe_count,
-                        num_reqs,
-                        total_num_scheduled_tokens,
-                        num_scheduled_tokens[:num_reqs].tolist(),
-                        num_finalized_scheduled_tokens.tolist(),
-                        self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                        num_offloaded_blocks.tolist(),
-                        is_prefill.tolist(),
-                        [
-                            req_id[-8:]
-                            for req_id in self.input_batch.req_ids[:num_reqs]
-                        ],
-                        req_indices[:min(total_num_scheduled_tokens, 8)].tolist(),
-                        positions_np[:min(total_num_scheduled_tokens, 8)].tolist(),
-                    )
-            if _SFA_DEBUG and _sfa_debug_rank0():
-                logger.info(
-                    "SFA_DEBUG runner num_reqs=%s total_tokens=%s all_cpu=%s "
-                    "scheduled=%s finalized=%s computed_cpu=%s offload_blocks=%s "
-                    "is_prefill=%s req_hash=%s req_tail=%s",
-                    num_reqs,
-                    total_num_scheduled_tokens,
-                    self.all_kv_in_cpu,
-                    num_scheduled_tokens[:num_reqs].tolist(),
-                    num_finalized_scheduled_tokens.tolist(),
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
-                    num_offloaded_blocks.tolist(),
-                    is_prefill.tolist(),
-                    req_ids_uint32,
-                    [
-                        req_id[-8:]
-                        for req_id in self.input_batch.req_ids[:num_reqs]
-                    ],
-                )
 
         return (
             logits_indices,
@@ -3137,9 +3073,7 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
-        num_tokens_raw = num_tokens
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        num_tokens_sp_padded = num_tokens_padded
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -3209,48 +3143,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_padded_tokens=batch_descriptor.num_tokens,
                 num_paddings=batch_descriptor.num_tokens - num_tokens,
                 runtime_mode=str(cudagraph_mode),
-            )
-        if _GRAPH_DEBUG and _sfa_debug_rank0():
-            scheduled_head = (
-                num_scheduled_tokens_np[:min(num_reqs, 8)].tolist()
-                if num_reqs > 0
-                else []
-            )
-            computed_head = (
-                self.input_batch.num_computed_tokens_cpu[:min(num_reqs, 8)].tolist()
-                if num_reqs > 0
-                else []
-            )
-            logger.info(
-                "SFA_DEBUG graph_dispatch mode=%s config_mode=%s desc=%s "
-                "tokens_raw=%s tokens_sp_padded=%s tokens_graph=%s reqs=%s "
-                "max_sched=%s uniform_decode=%s all_decode=%s "
-                "force_eager=%s cascade=%s encoder_reqs=%s has_lora=%s "
-                "active_loras=%s ubatch=%s dp_tokens=%s scheduled=%s "
-                "computed=%s",
-                cudagraph_mode,
-                self.compilation_config.cudagraph_mode,
-                batch_descriptor,
-                num_tokens_raw,
-                num_tokens_sp_padded,
-                batch_descriptor.num_tokens,
-                num_reqs,
-                max_num_scheduled_tokens,
-                uniform_decode,
-                bool(is_all_decode),
-                force_eager,
-                use_cascade_attn,
-                num_encoder_reqs,
-                has_lora,
-                num_active_loras,
-                should_ubatch,
-                (
-                    num_tokens_across_dp.tolist()
-                    if num_tokens_across_dp is not None
-                    else None
-                ),
-                scheduled_head,
-                computed_head,
             )
 
         return (

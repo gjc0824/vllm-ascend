@@ -1,5 +1,4 @@
 import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -69,15 +68,6 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
-_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
-_SFA_ATTENTION_DEBUG_BUILD = "sfa_all_cpu_inline_token_patch_20260709"
-logger.info_once(
-    "SFA_DEBUG_BUILD attention version=%s file=%s debug=%s",
-    _SFA_ATTENTION_DEBUG_BUILD,
-    os.path.abspath(__file__),
-    _SFA_DEBUG,
-)
 
 
 def _normalize_sfa_lse(
@@ -1539,12 +1529,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         ].unsqueeze(1)
         valid_mask = build_valid_topk_mask(topk_indices, seq_len_thresholds)
         graph_runtime = forward_context.cudagraph_runtime_mode not in (None, CUDAGraphMode.NONE)
-        layer_id = self._get_sfa_layer_id()
-        debug_this_layer = (
-            _SFA_DEBUG
-            and self.tp_rank == 0
-            and (layer_id is None or layer_id < 2)
-        )
 
         if all_kv_in_cpu:
             if not graph_runtime:
@@ -1556,24 +1540,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             attn_out_npu = None
             softmax_lse_npu = None
-            if debug_this_layer:
-                valid_count = int(valid_mask.sum().detach().cpu().item())
-                logger.info(
-                    "SFA_DEBUG attn topk layer=%s all_cpu=%s mtp=%s tokens=%s "
-                    "reqs=%s valid=%s seq_lens=%s topk0=%s graph_runtime=%s",
-                    layer_id,
-                    all_kv_in_cpu,
-                    is_mtp_decode,
-                    num_tokens,
-                    num_reqs,
-                    valid_count,
-                    attn_metadata.seq_lens[:num_reqs].detach().cpu().tolist(),
-                    topk_indices[:1, :min(topk_indices.shape[-1], 8)]
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                    graph_runtime,
-                )
         else:
             if attn_metadata.num_offloaded_blocks is None:
                 raise RuntimeError("SFA offload decode path requires num_offloaded_blocks metadata")
@@ -1629,23 +1595,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_indices,
                 torch.full_like(topk_indices, -1),
             )
-            if debug_this_layer:
-                logger.info(
-                    "SFA_DEBUG attn topk layer=%s all_cpu=%s mtp=%s tokens=%s "
-                    "reqs=%s offload_blocks=%s cpu_valid=%s npu_valid=%s topk0=%s",
-                    layer_id,
-                    all_kv_in_cpu,
-                    is_mtp_decode,
-                    num_tokens,
-                    num_reqs,
-                    num_offloaded_blocks.detach().cpu().tolist(),
-                    int(cpu_mask.sum().detach().cpu().item()),
-                    int(npu_mask.sum().detach().cpu().item()),
-                    topk_indices[:1, :min(topk_indices.shape[-1], 8)]
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                )
 
         req_ids_arg = (
             attn_metadata.req_ids_tensor[:num_reqs][token_to_req_index]
@@ -1682,19 +1631,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         sparse_topk_indices = self._compact_sparse_indices(
             self.lru_current_slots[:num_tokens]
         ).unsqueeze(1)
-        if debug_this_layer:
-            logger.info(
-                "SFA_DEBUG attn lru_slots layer=%s slots0=%s sparse0=%s",
-                layer_id,
-                self.lru_current_slots[:1, :min(self.sfa_sparse_topk, 8)]
-                .detach()
-                .cpu()
-                .tolist(),
-                sparse_topk_indices[:1, :, :min(self.sfa_sparse_topk, 8)]
-                .detach()
-                .cpu()
-                .tolist(),
-            )
 
         if not all_kv_in_cpu:
             torch_npu.npu.current_stream().wait_stream(side_compute_stream)
@@ -1824,27 +1760,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         return_softmax_lse=True,
                         sparse_indices_discrete=True,
                     )
-                    layer_id = self._get_sfa_layer_id()
-                    if (
-                        _SFA_DEBUG
-                        and self.tp_rank == 0
-                        and (layer_id is None or layer_id < 2)
-                    ):
-                        logger.info(
-                            "SFA_DEBUG attn decode_out layer=%s all_cpu=%s "
-                            "shape=%s abs_sum=%s",
-                            layer_id,
-                            decode_all_kv_in_cpu,
-                            tuple(attn_output_decode.shape),
-                            float(
-                                attn_output_decode.float()
-                                .abs()
-                                .sum()
-                                .detach()
-                                .cpu()
-                                .item()
-                            ),
-                        )
                 else:
                     attn_output_decode_cpu, softmax_max, softmax_sum = torch.ops._C_ascend.npu_sparse_flash_attention(
                         query=ql_nope_decode,

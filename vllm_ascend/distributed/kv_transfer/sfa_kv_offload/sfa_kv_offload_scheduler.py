@@ -1,9 +1,7 @@
 from abc import ABC
 from collections import deque
-import os
 from typing import Any
 
-import torch.distributed as dist
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
@@ -22,21 +20,6 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     ReqMeta,
     RequestTracker,
 )
-
-
-_SFA_DEBUG = bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0")))
-
-
-def _debug_head(values: list[int], limit: int = 8) -> list[int]:
-    return values[:limit]
-
-
-def _debug_rank0() -> bool:
-    return (
-        not dist.is_available()
-        or not dist.is_initialized()
-        or dist.get_rank() == 0
-    )
 
 
 def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: str) -> int:
@@ -198,20 +181,6 @@ class SFAKVOffloadlScheduler:
                 offload_dst_cpu_ids=block_ids_cpu,
             )
             self._request_trackers[request.req_id] = request_tracker
-            if _SFA_DEBUG and _debug_rank0():
-                logger.info(
-                    "SFA_DEBUG scheduler new req=%s computed=%s finalized=%s "
-                    "real_group=%s npu_blocks=%s cpu_blocks=%s offload_src=%s "
-                    "offload_dst=%s",
-                    request.req_id,
-                    request.num_computed_tokens,
-                    _num_finalized_scheduled_tokens(scheduler_output, request.req_id),
-                    self.real_kv_cache_group_id,
-                    len(block_ids_npu),
-                    len(block_ids_cpu),
-                    _debug_head(request_tracker.offload_src_hbm_ids),
-                    _debug_head(request_tracker.offload_dst_cpu_ids),
-                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -282,27 +251,6 @@ class SFAKVOffloadlScheduler:
                 request_tracker.offload_dst_cpu_ids = request_tracker.allocated_block_ids_cpu[
                     offload_start:target_num_blocks
                 ]
-                if _SFA_DEBUG and _debug_rank0():
-                    logger.info(
-                        "SFA_DEBUG scheduler cached req=%s computed=%s new=%s "
-                        "after=%s target_blocks=%s old_cpu_blocks=%s new_cpu_blocks=%s "
-                        "decode_step=%s offload_start=%s npu_total=%s cpu_total=%s "
-                        "src=%s dst=%s new_hbm=%s",
-                        req_id,
-                        num_computed_token,
-                        num_new_tokens,
-                        num_tokens_after_step,
-                        target_num_blocks,
-                        num_offloaded_blocks,
-                        num_new_cpu_blocks,
-                        is_decode_step,
-                        offload_start,
-                        len(request_tracker.allocated_block_ids_npu),
-                        len(request_tracker.allocated_block_ids_cpu),
-                        _debug_head(request_tracker.offload_src_hbm_ids),
-                        _debug_head(request_tracker.offload_dst_cpu_ids),
-                        _debug_head(new_block_ids_npu),
-                    )
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
