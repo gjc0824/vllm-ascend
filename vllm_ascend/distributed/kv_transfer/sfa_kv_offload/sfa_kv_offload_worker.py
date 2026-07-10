@@ -651,16 +651,30 @@ class SFAKVOffloadWorker:
         positions: torch.Tensor,
         token_to_req: torch.Tensor | None = None,
         num_tokens: int | None = None,
+        update_token_indices: torch.Tensor | None = None,
+        strict: bool = True,
     ) -> bool:
         if _is_current_stream_capturing():
             return False
         layer_id = self._get_offload_layer_id(layer_name)
         if num_tokens is None:
-            num_tokens = int(slot_mapping.shape[0])
-        num_tokens = min(
-            int(num_tokens),
+            num_tokens = (
+                int(update_token_indices.shape[0])
+                if update_token_indices is not None
+                else int(slot_mapping.shape[0])
+            )
+        source_rows = min(
             int(slot_mapping.shape[0]),
             int(positions.shape[0]),
+        )
+        if source_rows <= 0:
+            return False
+        num_tokens = min(
+            int(num_tokens),
+            int(update_token_indices.shape[0])
+            if update_token_indices is not None
+            else source_rows,
+            self.max_num_topk_rows,
         )
         if num_tokens <= 0:
             return False
@@ -668,13 +682,52 @@ class SFAKVOffloadWorker:
             return False
         assert self.kv_send_thread is not None
 
-        slot_mapping_cpu = slot_mapping[:num_tokens].detach().cpu().to(torch.int64)
-        positions_cpu = positions[:num_tokens].detach().cpu().to(torch.int64)
-        if token_to_req is None:
+        if update_token_indices is not None:
+            raw_update_indices = update_token_indices[:num_tokens].to(torch.int64)
+            valid_update_mask = (
+                (raw_update_indices >= 0)
+                & (raw_update_indices < source_rows)
+            )
+            safe_update_indices = raw_update_indices.clamp(
+                min=0,
+                max=source_rows - 1,
+            )
+            selected_slots = torch.index_select(
+                slot_mapping,
+                0,
+                safe_update_indices,
+            )
+            selected_slots = torch.where(
+                valid_update_mask,
+                selected_slots,
+                torch.full_like(selected_slots, -1),
+            )
+            selected_positions = torch.index_select(
+                positions,
+                0,
+                safe_update_indices,
+            )
+            selected_token_to_req = (
+                torch.index_select(token_to_req, 0, safe_update_indices)
+                if token_to_req is not None
+                else None
+            )
+        else:
+            selected_slots = slot_mapping[:num_tokens]
+            selected_positions = positions[:num_tokens]
+            selected_token_to_req = (
+                token_to_req[:num_tokens]
+                if token_to_req is not None
+                else None
+            )
+
+        slot_mapping_cpu = selected_slots.detach().cpu().to(torch.int64)
+        positions_cpu = selected_positions.detach().cpu().to(torch.int64)
+        if selected_token_to_req is None:
             token_to_req_cpu = torch.arange(num_tokens, dtype=torch.int64)
         else:
-            token_to_req_cpu = token_to_req[:num_tokens].detach().cpu().to(torch.int64)
-        slot_indices = slot_mapping[:num_tokens].clamp_min(0).to(torch.int64)
+            token_to_req_cpu = selected_token_to_req.detach().cpu().to(torch.int64)
+        slot_indices = selected_slots.clamp_min(0).to(torch.int64)
         key_flat = key_cache.view(-1, key_cache.shape[-1])
         value_flat = value_cache.view(-1, value_cache.shape[-1])
         key_cpu = self.k_caches_cpu[layer_id]
@@ -693,7 +746,7 @@ class SFAKVOffloadWorker:
             num_tokens,
             key_cpu,
             value_cpu,
-            strict=True,
+            strict=strict,
         )
 
     def _update_cpu_kv_tokens_from_cpu(
@@ -918,6 +971,7 @@ class SFAKVOffloadWorker:
         slot_mapping: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         num_decode_tokens: int | None = None,
+        update_token_indices_npu: torch.Tensor | None = None,
     ) -> bool:
         capturing = capturing or _is_current_stream_capturing()
         layer_id = self._get_offload_layer_id(layer_name)
@@ -958,25 +1012,80 @@ class SFAKVOffloadWorker:
             and positions is not None
             and num_decode_tokens is not None
         ):
-            num_update_tokens = min(
-                int(num_decode_tokens),
+            source_rows = min(
                 int(num_tokens),
                 int(slot_mapping.shape[0]),
                 int(positions.shape[0]),
+            )
+            max_update_tokens = min(
+                source_rows,
                 self.max_num_topk_rows,
             )
+            if update_token_indices_npu is not None:
+                max_update_tokens = min(
+                    max_update_tokens,
+                    int(update_token_indices_npu.shape[0]),
+                )
+            num_update_tokens = min(
+                int(num_decode_tokens),
+                max_update_tokens,
+            )
             if num_update_tokens > 0:
+                if update_token_indices_npu is not None:
+                    raw_update_indices = update_token_indices_npu[
+                        :num_update_tokens
+                    ].to(torch.int64)
+                    valid_update_mask = (
+                        (raw_update_indices >= 0)
+                        & (raw_update_indices < source_rows)
+                    )
+                    update_indices = raw_update_indices.clamp(
+                        min=0,
+                        max=source_rows - 1,
+                    )
+                    update_slots_npu = torch.index_select(
+                        slot_mapping,
+                        0,
+                        update_indices,
+                    )
+                    update_slots_npu = torch.where(
+                        valid_update_mask,
+                        update_slots_npu,
+                        torch.full_like(update_slots_npu, -1),
+                    )
+                    update_positions_npu = torch.index_select(
+                        positions,
+                        0,
+                        update_indices,
+                    )
+                    update_token_to_req_npu = (
+                        torch.index_select(
+                            token_to_req_npu,
+                            0,
+                            update_indices,
+                        )
+                        if token_to_req_npu is not None
+                        else None
+                    )
+                else:
+                    update_slots_npu = slot_mapping[:num_update_tokens]
+                    update_positions_npu = positions[:num_update_tokens]
+                    update_token_to_req_npu = (
+                        token_to_req_npu[:num_update_tokens]
+                        if token_to_req_npu is not None
+                        else None
+                    )
                 update_slots_cpu = self.token_update_slots_cpu[:num_update_tokens]
                 update_positions_cpu = self.token_update_positions_cpu[:num_update_tokens]
                 update_slots_cpu.copy_(
-                    slot_mapping[:num_update_tokens],
+                    update_slots_npu,
                     non_blocking=capturing,
                 )
                 update_positions_cpu.copy_(
-                    positions[:num_update_tokens],
+                    update_positions_npu,
                     non_blocking=capturing,
                 )
-                if token_to_req_npu is None:
+                if update_token_to_req_npu is None:
                     update_token_to_req_cpu = self.token_update_token_to_req_cpu[:num_update_tokens]
                     update_token_to_req_cpu.copy_(
                         torch.arange(num_update_tokens, dtype=torch.int32),
@@ -984,10 +1093,10 @@ class SFAKVOffloadWorker:
                 else:
                     update_token_to_req_cpu = self.token_update_token_to_req_cpu[:num_update_tokens]
                     update_token_to_req_cpu.copy_(
-                        token_to_req_npu[:num_update_tokens],
+                        update_token_to_req_npu,
                         non_blocking=capturing,
                     )
-                slot_indices = slot_mapping[:num_update_tokens].clamp_min(0).to(torch.int64)
+                slot_indices = update_slots_npu.clamp_min(0).to(torch.int64)
                 key_values_npu = torch.index_select(
                     key_cache.view(-1, key_cache.shape[-1]),
                     0,

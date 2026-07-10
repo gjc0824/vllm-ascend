@@ -136,6 +136,16 @@ def build_valid_topk_mask(
     return (topk_indices >= 0) & (topk_indices < seq_len_thresholds)
 
 
+def build_mtp_live_token_thresholds(
+    positions: torch.Tensor,
+    query_starts: torch.Tensor,
+    token_to_req: torch.Tensor,
+) -> torch.Tensor:
+    """Return the first live query position for every flattened MTP row."""
+    request_start_positions = positions.index_select(0, query_starts)
+    return request_start_positions.index_select(0, token_to_req).unsqueeze(1)
+
+
 def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
     for config in configs:
         if config is not None and hasattr(config, attr):
@@ -299,10 +309,12 @@ class AscendSFAMetadata:
     group_key_cache_idx: torch.Tensor | None = None
     block_table_tensors_by_group: list[torch.Tensor] | None = None
     slot_mappings_by_group: list[torch.Tensor] | None = None
+    sfa_indexer_group_ids_by_layer_id: dict[int, int] | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
+    cpu_update_tokens_per_req: torch.Tensor | None = None
     all_kv_in_cpu: bool = False
 
 
@@ -583,6 +595,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_key_cache_idx=group_key_cache_idx,
             block_table_tensors_by_group=block_table_tensors_by_group,
             slot_mappings_by_group=slot_mappings_by_group,
+            sfa_indexer_group_ids_by_layer_id=(
+                common_attn_metadata.sfa_indexer_group_ids_by_layer_id
+            ),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -590,6 +605,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
+            cpu_update_tokens_per_req=(
+                common_attn_metadata.cpu_update_tokens_per_req
+            ),
             all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
         )
 
@@ -816,6 +834,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _get_sfa_indexer_group_id(
         self,
+        attn_metadata,
         tensors_by_group: list[torch.Tensor] | None,
     ) -> int | None:
         if tensors_by_group is None or len(tensors_by_group) <= 1:
@@ -823,6 +842,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         layer_id = self._get_sfa_layer_id()
         if layer_id is None:
             return None
+        group_ids_by_layer_id = getattr(
+            attn_metadata,
+            "sfa_indexer_group_ids_by_layer_id",
+            None,
+        )
+        if group_ids_by_layer_id is not None and layer_id in group_ids_by_layer_id:
+            return group_ids_by_layer_id[layer_id]
         # SFA hybrid groups are ordered as all indexer groups followed by the
         # real KV group.
         return layer_id % (len(tensors_by_group) - 1)
@@ -831,7 +857,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         block_tables_by_group = getattr(
             attn_metadata, "block_table_tensors_by_group", None
         )
-        group_id = self._get_sfa_indexer_group_id(block_tables_by_group)
+        group_id = self._get_sfa_indexer_group_id(attn_metadata, block_tables_by_group)
         if group_id is None:
             return attn_metadata.block_table
         return block_tables_by_group[group_id]
@@ -840,7 +866,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         slot_mappings_by_group = getattr(
             attn_metadata, "slot_mappings_by_group", None
         )
-        group_id = self._get_sfa_indexer_group_id(slot_mappings_by_group)
+        group_id = self._get_sfa_indexer_group_id(attn_metadata, slot_mappings_by_group)
         if group_id is None:
             return attn_metadata.slot_mapping
         return slot_mappings_by_group[group_id]
@@ -868,6 +894,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def uses_sfa_group_indexed_mapping(self, attn_metadata) -> bool:
         return (
             self._get_sfa_indexer_group_id(
+                attn_metadata,
                 getattr(attn_metadata, "slot_mappings_by_group", None)
             )
             is not None
@@ -1572,11 +1599,25 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices = topk_indices.squeeze(1)
 
         is_mtp_decode = num_tokens != num_reqs
-        all_kv_in_cpu = attn_metadata.all_kv_in_cpu
+        query_starts = None
+        all_kv_in_cpu = attn_metadata.all_kv_in_cpu and not is_mtp_decode
         if is_mtp_decode:
             if attn_metadata.token_to_req is None:
                 raise RuntimeError("SFA offload MTP decode requires token_to_req metadata")
+            if attn_metadata.positions is None:
+                raise RuntimeError("SFA offload MTP decode requires positions metadata")
             token_to_req = attn_metadata.token_to_req[:num_tokens]
+            query_starts = torch.cat(
+                (
+                    torch.zeros(
+                        (1,),
+                        dtype=torch.int64,
+                        device=topk_indices.device,
+                    ),
+                    attn_metadata.cum_query_lens[: num_reqs - 1].to(torch.int64),
+                ),
+                dim=0,
+            )
         else:
             token_to_req = torch.arange(
                 num_tokens,
@@ -1590,6 +1631,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         ].unsqueeze(1)
         valid_mask = build_valid_topk_mask(topk_indices, seq_len_thresholds)
         graph_runtime = forward_context.cudagraph_runtime_mode not in (None, CUDAGraphMode.NONE)
+        update_tokens_per_req = getattr(
+            attn_metadata,
+            "cpu_update_tokens_per_req",
+            None,
+        )
 
         if all_kv_in_cpu:
             if not graph_runtime:
@@ -1608,12 +1654,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             offload_thresholds = (num_offloaded_blocks * self.block_size)[
                 token_to_req_index
             ].unsqueeze(1)
+            if is_mtp_decode and attn_metadata.all_kv_in_cpu:
+                assert query_starts is not None
+                # Physical target KV tensors are reused across layers. All
+                # committed history must therefore come from the layer-private
+                # CPU cache; only rows materialized by this MTP pass are safe to
+                # read from the current layer's NPU tensor.
+                npu_thresholds = build_mtp_live_token_thresholds(
+                    attn_metadata.positions[:num_tokens],
+                    query_starts,
+                    token_to_req_index,
+                )
+            else:
+                npu_thresholds = offload_thresholds
 
             side_compute_stream = get_side_compute_stream()
             side_compute_event = torch.npu.current_stream().record_event()
             with torch_npu.npu.stream(side_compute_stream):
                 torch.npu.current_stream().wait_event(side_compute_event)
-                npu_mask = (topk_indices >= offload_thresholds) & valid_mask
+                npu_mask = (topk_indices >= npu_thresholds) & valid_mask
                 npu_token_indices = torch.where(
                     npu_mask,
                     topk_indices,
@@ -1650,7 +1709,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     num_heads=self.local_num_heads,
                 )
 
-            cpu_mask = (topk_indices < offload_thresholds) & valid_mask
+            cpu_mask = (topk_indices < npu_thresholds) & valid_mask
             cpu_token_indices = torch.where(
                 cpu_mask,
                 topk_indices,
@@ -1662,6 +1721,39 @@ class AscendSFAImpl(MLAAttentionImpl):
             if is_mtp_decode
             else attn_metadata.req_ids_tensor[:num_reqs]
         )
+        cpu_update_token_indices = None
+        cpu_update_tokens = num_tokens
+        if is_mtp_decode:
+            assert query_starts is not None
+            if update_tokens_per_req is None:
+                # Stage every target row while this layer still owns the shared
+                # physical tensor. The next MTP query-start boundary exposes
+                # only the accepted prefix as CPU history; rejected rows remain
+                # in the live NPU region and are overwritten on the next pass.
+                cpu_update_token_indices = None
+                cpu_update_tokens = num_tokens
+            else:
+                # Draft forward receives the accepted count from target
+                # verification. Write back only that accepted prefix; masked
+                # speculative extension rows stay out of CPU KV.
+                row_indices = torch.arange(
+                    num_tokens,
+                    dtype=torch.int64,
+                    device=topk_indices.device,
+                )
+                token_to_req_long = token_to_req_index.to(torch.int64)
+                row_offsets = row_indices - query_starts[token_to_req_long]
+                accepted_counts = update_tokens_per_req[:num_reqs].to(
+                    device=topk_indices.device,
+                    dtype=torch.int64,
+                )
+                accepted_mask = row_offsets < accepted_counts[token_to_req_long]
+                cpu_update_token_indices = torch.where(
+                    accepted_mask,
+                    row_indices,
+                    torch.full_like(row_indices, num_tokens),
+                )
+                cpu_update_tokens = num_tokens
         maybe_prepare_lru_resident_and_load_graph(
             layer_name,
             num_tokens,
@@ -1677,7 +1769,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.positions[:num_tokens]
             if attn_metadata.positions is not None
             else None,
-            num_tokens,
+            cpu_update_tokens,
+            cpu_update_token_indices,
         )
 
         topk_buffer_k = topk_buffer_k.reshape(
@@ -1783,7 +1876,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             )[num_decodes:]
 
             if num_decodes > 0:
-                decode_all_kv_in_cpu = attn_metadata.all_kv_in_cpu
+                decode_all_kv_in_cpu = (
+                    attn_metadata.all_kv_in_cpu
+                    and num_decode_tokens == num_decodes
+                )
                 (
                     topk_buffer,
                     sparse_topk_indices,

@@ -113,6 +113,8 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         positions: torch.Tensor,
         token_to_req: torch.Tensor | None = None,
         num_tokens: int | None = None,
+        update_token_indices: torch.Tensor | None = None,
+        strict: bool = True,
     ) -> bool:
         return self.connector_worker.update_cpu_kv_tokens(
             layer_name,
@@ -122,6 +124,8 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             positions,
             token_to_req,
             num_tokens,
+            update_token_indices,
+            strict,
         )
 
     def prepare_lru_resident_and_load(
@@ -139,6 +143,7 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         slot_mapping: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         num_decode_tokens: int | None = None,
+        update_token_indices: torch.Tensor | None = None,
     ) -> bool:
         return self.connector_worker.prepare_lru_resident_and_load(
             layer_name,
@@ -154,6 +159,7 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             slot_mapping,
             positions,
             num_decode_tokens,
+            update_token_indices,
         )
 
     def set_req_ids(self, req_ids: list):

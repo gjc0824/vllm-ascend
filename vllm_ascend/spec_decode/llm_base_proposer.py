@@ -1515,6 +1515,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 new_cad._seq_lens_cpu = cad.seq_lens_cpu + N
             if cad.seq_lens_cpu is not None:
                 new_cad.seq_lens_cpu = cad.seq_lens_cpu + N
+            new_cad.num_input_tokens = total_num_output_tokens
+            new_cad.positions = self.positions[:total_num_output_tokens]
+            if getattr(cad, "positions_cpu", None) is not None:
+                new_cad.positions_cpu = None
+            if getattr(cad, "token_to_req", None) is not None:
+                query_lens = cad.query_start_loc[1 : batch_size + 1] - cad.query_start_loc[:batch_size]
+                req_indices = torch.arange(
+                    batch_size,
+                    dtype=torch.int32,
+                    device=cad.query_start_loc.device,
+                )
+                new_cad.token_to_req = torch.repeat_interleave(
+                    req_indices,
+                    query_lens + N,
+                    output_size=total_num_output_tokens,
+                )
 
             return total_num_output_tokens, token_indices_to_sample, new_cad, None
 
@@ -1802,6 +1818,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             n + 1 - len(sampled_token_ids[i]) if n > 0 else 0 for i, n in enumerate(num_draft_tokens)
         ]
         num_rejected_tokens = torch.tensor(num_rejected_tokens, dtype=torch.int32)
+        cpu_update_tokens_per_req = torch.tensor(
+            [len(sampled_token_ids[i]) for i in range(num_actual_reqs)],
+            dtype=torch.int32,
+        )
+        if cpu_update_tokens_per_req.shape[0] < common_attn_metadata.num_reqs:
+            cpu_update_tokens_per_req = F.pad(
+                cpu_update_tokens_per_req,
+                (0, common_attn_metadata.num_reqs - cpu_update_tokens_per_req.shape[0]),
+                value=0,
+            )
 
         device = common_attn_metadata.query_start_loc.device
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_actual_reqs + 1]
@@ -1859,13 +1885,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.slot_mapping[token_indices]
         )
         common_attn_metadata.slot_mapping[token_indices.shape[0] :].fill_(-1)
+        token_to_req = None
+        if common_attn_metadata.token_to_req is not None:
+            token_to_req = common_attn_metadata.token_to_req[token_indices]
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
         # we should fixed them.
-        # Mirror ``new_seq_lens_cpu`` into the upstream-canonical
-        # ``_seq_lens_cpu`` slot so consumers preferring the parent field
-        # (e.g. attention_cp builder) see the rejection-adjusted value.
         spec_common_attn_metadata = AscendCommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
             query_start_loc_cpu=new_query_start_loc_cpu,
@@ -1890,6 +1916,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             is_prefilling=common_attn_metadata.is_prefilling,
+            block_table_tensors_by_group=common_attn_metadata.block_table_tensors_by_group,
+            slot_mappings_by_group=common_attn_metadata.slot_mappings_by_group,
+            sfa_indexer_group_ids_by_layer_id=(
+                common_attn_metadata.sfa_indexer_group_ids_by_layer_id
+            ),
+            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
+            req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            token_to_req=token_to_req,
+            tokens_per_req=common_attn_metadata.tokens_per_req,
+            cpu_update_tokens_per_req=cpu_update_tokens_per_req.to(
+                device,
+                non_blocking=True,
+            ),
             max_seq_len=0,
         )
         return spec_common_attn_metadata, token_indices
@@ -1950,6 +1989,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         total_num_tokens = query_start_loc_cpu[-1].item()
         token_indices = self.arange[:total_num_tokens]
+        cpu_update_tokens_per_req = valid_sampled_tokens_count.to(
+            dtype=torch.int32,
+        )
+        if cpu_update_tokens_per_req.shape[0] < common_attn_metadata.num_reqs:
+            cpu_update_tokens_per_req = F.pad(
+                cpu_update_tokens_per_req,
+                (0, common_attn_metadata.num_reqs - cpu_update_tokens_per_req.shape[0]),
+                value=0,
+            )
 
         # NOTE: Currently positions and seq_lens are not used in attn forward
         # so we do not need to fixed them. But if they are used in the future,
@@ -1983,6 +2031,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             is_prefilling=common_attn_metadata.is_prefilling,
+            block_table_tensors_by_group=common_attn_metadata.block_table_tensors_by_group,
+            slot_mappings_by_group=common_attn_metadata.slot_mappings_by_group,
+            sfa_indexer_group_ids_by_layer_id=(
+                common_attn_metadata.sfa_indexer_group_ids_by_layer_id
+            ),
+            num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
+            req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            token_to_req=common_attn_metadata.token_to_req,
+            tokens_per_req=common_attn_metadata.tokens_per_req,
+            cpu_update_tokens_per_req=cpu_update_tokens_per_req,
             max_seq_len=0,
         )
 
