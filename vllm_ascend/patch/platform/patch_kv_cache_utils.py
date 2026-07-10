@@ -202,22 +202,6 @@ def _get_sfa_indexer_group_count(indexer_layers_by_id: dict[int, str]) -> int:
     return len(indexer_layers_by_id)
 
 
-def _validate_sfa_indexer_residue_layout(
-    indexer_layers_by_id: dict[int, str],
-    indexer_group_count: int,
-) -> None:
-    residues = {layer_id % indexer_group_count for layer_id in indexer_layers_by_id}
-    expected = set(range(indexer_group_count))
-    if residues != expected:
-        raise ValueError(
-            "SFA hybrid cache layout expected real indexer cache layers to "
-            "cover every layer_id % indexer_group_count residue. "
-            f"indexer_group_count={indexer_group_count}, "
-            f"indexer_layer_ids={sorted(indexer_layers_by_id)}, "
-            f"residues={sorted(residues)}, expected={sorted(expected)}."
-        )
-
-
 def _ascend_get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -231,26 +215,10 @@ def _ascend_get_kv_cache_groups(
 
     total_layers, kv_layers_by_id, indexer_layers_by_id = split_layers
     indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
-    _validate_sfa_indexer_residue_layout(
-        indexer_layers_by_id,
-        indexer_group_count,
-    )
 
     grouped_layer_names: list[list[str]] = []
-    for group_id in range(indexer_group_count):
-        group_layer_names = [
-            indexer_layers_by_id[layer_id]
-            for layer_id in sorted(indexer_layers_by_id)
-            if layer_id % indexer_group_count == group_id
-        ]
-        if not group_layer_names:
-            logger.warning(
-                "SFA hybrid cache layout expected indexer group %d to have "
-                "at least one layer; falling back to vLLM cache grouping.",
-                group_id,
-            )
-            return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-        grouped_layer_names.append(group_layer_names)
+    for layer_id in sorted(indexer_layers_by_id):
+        grouped_layer_names.append([indexer_layers_by_id[layer_id]])
 
     grouped_layer_names.append(
         [kv_layers_by_id[layer_id] for layer_id in sorted(kv_layers_by_id)]
@@ -310,34 +278,53 @@ def _get_sfa_hybrid_kv_cache_config_from_groups(
         vllm_config, set(kv_layers_by_id) | set(indexer_layers_by_id)
     )
     indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
-    _validate_sfa_indexer_residue_layout(
-        indexer_layers_by_id,
-        indexer_group_count,
-    )
     if len(indexer_groups) != indexer_group_count:
         return None
 
     page_size = vllm.v1.core.kv_cache_utils.get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
     )
-    # The worker inflates available_memory by total_layers / physical_tensors
-    # for layerwise reuse. Preserve vLLM's original total-layer divisor here so
-    # the four physical tensors fit in the real profiled memory budget.
+    target_kv_layers_by_id = {
+        layer_id: layer_name
+        for layer_id, layer_name in kv_layers_by_id.items()
+        if layer_id < total_layers
+    }
+    extra_kv_layers_by_id = {
+        layer_id: layer_name
+        for layer_id, layer_name in kv_layers_by_id.items()
+        if layer_id >= total_layers
+    }
+
+    target_tensor_slots = max(
+        (layer_id // indexer_group_count) + 1
+        for layer_id in target_kv_layers_by_id
+    ) if target_kv_layers_by_id else 0
+    physical_tensor_count = target_tensor_slots + len(extra_kv_layers_by_id)
+
+    # The worker inflates available_memory by total_layers / target_tensor_slots
+    # for layerwise reuse. Extra draft/MTP tensors are not part of the target
+    # reuse factor, so fold them back into num_blocks to keep allocation within
+    # the real profiled memory budget.
     num_blocks = vllm.v1.core.kv_cache_utils.get_num_blocks(
         vllm_config, total_layers, available_memory, page_size
     )
+    if (
+        vllm_config.cache_config.num_gpu_blocks_override is None
+        and physical_tensor_count > target_tensor_slots
+        and target_tensor_slots > 0
+    ):
+        num_blocks = max(
+            (num_blocks * target_tensor_slots) // physical_tensor_count,
+            0,
+        )
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    num_tensor_slots = max(
-        (layer_id // indexer_group_count) + 1
-        for layer_id in kv_layers_by_id
-    )
-    for tensor_idx in range(num_tensor_slots):
+    for tensor_idx in range(target_tensor_slots):
         shared_by: list[str] = []
         start_layer = tensor_idx * indexer_group_count
         end_layer = min(start_layer + indexer_group_count, total_layers)
         for layer_id in range(start_layer, end_layer):
-            kv_layer_name = kv_layers_by_id.get(layer_id)
+            kv_layer_name = target_kv_layers_by_id.get(layer_id)
             indexer_layer_name = indexer_layers_by_id.get(layer_id)
             if kv_layer_name is not None:
                 shared_by.append(kv_layer_name)
@@ -348,11 +335,23 @@ def _get_sfa_hybrid_kv_cache_config_from_groups(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
 
+    for layer_id in sorted(extra_kv_layers_by_id):
+        # Draft/MTP layers live after the target model layer range. Keep them
+        # in separate physical tensors, but still let model_runner reshape them
+        # into SFA offload tuples.
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=page_size * num_blocks,
+                shared_by=[extra_kv_layers_by_id[layer_id]],
+            )
+        )
+
     logger.info(
-        "SFA hybrid KV cache tensors: %d physical tensors for %d layers "
-        "(num_blocks=%d)",
+        "SFA hybrid KV cache tensors: %d physical tensors for %d target "
+        "layers + %d extra SFA offload layers (num_blocks=%d)",
         len(kv_cache_tensors),
         total_layers,
+        len(extra_kv_layers_by_id),
         num_blocks,
     )
     return KVCacheConfig(

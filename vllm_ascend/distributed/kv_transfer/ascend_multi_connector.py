@@ -280,6 +280,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         slot_mapping: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         num_decode_tokens: int | None = None,
+        update_token_indices: torch.Tensor | None = None,
     ) -> bool:
         handled = False
         for c in self._connectors:
@@ -301,6 +302,7 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     slot_mapping,
                     positions,
                     num_decode_tokens,
+                    update_token_indices,
                 )
             ) or handled
         return handled

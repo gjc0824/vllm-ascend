@@ -3285,10 +3285,12 @@ class NPUModelRunner(GPUModelRunner):
         block_table_tensors_by_group = None
         slot_mappings_by_group = None
         slot_mapping_cpus_by_group = None
+        sfa_indexer_group_ids_by_layer_id = None
         if self._use_sfa_ascend_store_hybrid_layout():
             block_table_tensors_by_group = [block_table_gid_0]
             slot_mappings_by_group = [slot_mapping_gid_0]
             slot_mapping_cpus_by_group = [slot_mapping_cpu_gid_0]
+            sfa_indexer_group_ids_by_layer_id = {}
             for kv_cache_gid in range(1, len(kv_cache_groups)):
                 block_table_tensor, slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid,
@@ -3297,6 +3299,13 @@ class NPUModelRunner(GPUModelRunner):
                 block_table_tensors_by_group.append(block_table_tensor)
                 slot_mappings_by_group.append(slot_mapping)
                 slot_mapping_cpus_by_group.append(self.cpu_slot_mapping)
+            for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
+                if not self._is_sfa_indexer_kv_cache_group(kv_cache_group):
+                    continue
+                for layer_name in kv_cache_group.layer_names:
+                    layer_id = self._extract_sfa_layer_id(layer_name)
+                    if layer_id is not None:
+                        sfa_indexer_group_ids_by_layer_id[layer_id] = kv_cache_gid
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3344,6 +3353,7 @@ class NPUModelRunner(GPUModelRunner):
             prefill_context_parallel_metadata=self.long_seq_metadata,
             block_table_tensors_by_group=block_table_tensors_by_group,
             slot_mappings_by_group=slot_mappings_by_group,
+            sfa_indexer_group_ids_by_layer_id=sfa_indexer_group_ids_by_layer_id,
             num_offloaded_blocks=self.num_offloaded_blocks.gpu[:num_reqs]
             if self.ascend_config.use_offload
             else None,
@@ -4262,7 +4272,6 @@ class NPUModelRunner(GPUModelRunner):
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
         self._bind_sfa_indexer_alias_views(kv_cache_config, kv_caches)
-
         if self.model_config.hf_text_config.model_type == "deepseek_v4":
             from vllm_ascend.utils import extract_dsv4_layer_index
 
@@ -4868,6 +4877,7 @@ class NPUModelRunner(GPUModelRunner):
                             kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
                         continue
 
+                    current_sparse_c8 = False
                     if self.use_sparse and "cache_only_layers" not in layer_name:
                         current_sparse_c8 = kv_cache_spec_uses_sparse_c8(current_kv_cache_spec)
                         if current_sparse_c8:
@@ -5002,7 +5012,7 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
                         )
-                    if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
+                    if not isinstance(current_kv_cache_spec, (AscendMLAAttentionSpec, OffloadMLAAttentionSpec)):
                         k_shape = kv_cache_shape[1:]
                         if hasattr(current_kv_cache_spec, "head_size_v"):
                             v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)

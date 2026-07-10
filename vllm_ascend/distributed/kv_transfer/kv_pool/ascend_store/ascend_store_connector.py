@@ -76,6 +76,28 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         return ".indexer.k_cache" in layer_name
 
     @staticmethod
+    def _extract_sfa_layer_id(layer_name: str) -> int | None:
+        parts = layer_name.split(".")
+        for idx, part in enumerate(parts[:-1]):
+            if part == "layers":
+                try:
+                    return int(parts[idx + 1])
+                except ValueError:
+                    return None
+        return None
+
+    @classmethod
+    def _is_target_model_layer(
+        cls,
+        layer_name: str,
+        target_num_layers: int | None,
+    ) -> bool:
+        if target_num_layers is None:
+            return True
+        layer_id = cls._extract_sfa_layer_id(layer_name)
+        return layer_id is None or layer_id < target_num_layers
+
+    @staticmethod
     def _trim_sfa_hybrid_store_cache(cache: Any) -> Any:
         if isinstance(cache, (tuple, list)) and len(cache) >= 3:
             return tuple(cache[:2])
@@ -85,6 +107,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def _filter_sfa_hybrid_kv_cache_config(
         cls,
         kv_cache_config: KVCacheConfig | None,
+        target_num_layers: int | None = None,
     ) -> tuple[KVCacheConfig | None, int | None, set[str] | None]:
         if kv_cache_config is None or len(kv_cache_config.kv_cache_groups) <= 1:
             return kv_cache_config, None, None
@@ -108,7 +131,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
         source_group_id = kv_group_ids[0]
         source_group = kv_cache_config.kv_cache_groups[source_group_id]
-        selected_layers = set(source_group.layer_names)
+        selected_layer_names = [
+            layer_name
+            for layer_name in source_group.layer_names
+            if cls._is_target_model_layer(layer_name, target_num_layers)
+        ]
+        selected_layers = set(selected_layer_names)
         filtered_tensors: list[KVCacheTensor] = []
         for tensor in kv_cache_config.kv_cache_tensors:
             shared_by = [
@@ -122,7 +150,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
         filtered_group = KVCacheGroupSpec(
-            layer_names=list(source_group.layer_names),
+            layer_names=selected_layer_names,
             kv_cache_spec=source_group.kv_cache_spec,
         )
         return (
@@ -165,11 +193,20 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kv_cache_events: AscendStoreKVEvents | None = None
         if self.use_layerwise:
+            try:
+                target_num_layers = vllm_config.model_config.get_num_layers(
+                    vllm_config.parallel_config
+                )
+            except Exception:
+                target_num_layers = None
             (
                 store_kv_cache_config,
                 self._source_kv_cache_group_id,
                 self._store_layer_names,
-            ) = self._filter_sfa_hybrid_kv_cache_config(kv_cache_config)
+            ) = self._filter_sfa_hybrid_kv_cache_config(
+                kv_cache_config,
+                target_num_layers,
+            )
         else:
             store_kv_cache_config = kv_cache_config
             self._source_kv_cache_group_id = None
@@ -200,6 +237,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             assert self.connector_worker is not None
             if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
+
+    def _should_handle_layerwise_layer(self, layer_name: str) -> bool:
+        if self._store_layer_names is None:
+            return True
+        return layer_name in self._store_layer_names
 
     ############################################################
     # Scheduler Side Methods
@@ -306,12 +348,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
+        if not self._should_handle_layerwise_layer(layer_name):
+            return
         self.connector_worker.wait_for_layer_load()
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
         if not self.use_layerwise:
+            return
+        if not self._should_handle_layerwise_layer(layer_name):
             return
 
         if self.kv_role == "kv_consumer":

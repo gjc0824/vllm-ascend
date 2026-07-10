@@ -233,11 +233,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     kvcomp_metadata: KVCompMetaData | None = None
     block_table_tensors_by_group: list[torch.Tensor] | None = None
     slot_mappings_by_group: list[torch.Tensor] | None = None
+    sfa_indexer_group_ids_by_layer_id: dict[int, int] | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
-    all_kv_in_cpu: bool = False
+    cpu_update_tokens_per_req: torch.Tensor | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -293,13 +294,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_logits_indices=self.num_logits_indices,
             block_table_tensors_by_group=self.block_table_tensors_by_group,
             slot_mappings_by_group=self.slot_mappings_by_group,
+            sfa_indexer_group_ids_by_layer_id=self.sfa_indexer_group_ids_by_layer_id,
             num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=self.token_to_req[:num_actual_tokens]
             if self.token_to_req is not None
             else None,
             tokens_per_req=_slice_reqs(self.tokens_per_req),
-            all_kv_in_cpu=self.all_kv_in_cpu,
+            cpu_update_tokens_per_req=_slice_reqs(self.cpu_update_tokens_per_req),
         )
 
 
@@ -484,6 +486,7 @@ def maybe_prepare_lru_resident_and_load_graph(
     slot_mapping: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     num_decode_tokens: int | None = None,
+    update_token_indices: torch.Tensor | None = None,
 ) -> bool:
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return False
@@ -509,6 +512,7 @@ def maybe_prepare_lru_resident_and_load_graph(
         slot_mapping,
         positions,
         num_decode_tokens,
+        update_token_indices,
     )
 
 

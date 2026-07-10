@@ -108,9 +108,7 @@ class SFAKVOffloadlScheduler:
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._unfinished_request_ids: set[str] = set()
 
-        num_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        num_layers = self._infer_num_offload_layers(vllm_config)
         cpu_block_num, cpu_cache_size = get_sfa_kv_offload_cpu_block_num(
             vllm_config,
             self.hf_config,
@@ -125,6 +123,17 @@ class SFAKVOffloadlScheduler:
             num_layers,
         )
         self.cpu_block_manager = CPUBlockManager(cpu_block_num)
+
+    def _infer_num_offload_layers(self, vllm_config: "VllmConfig") -> int:
+        if self.kv_cache_config is not None and self.real_kv_cache_group_id >= 0:
+            real_group = self.kv_cache_config.kv_cache_groups[
+                self.real_kv_cache_group_id
+            ]
+            if real_group.layer_names:
+                return len(real_group.layer_names)
+        return vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
 
     def _infer_group_block_sizes(
         self,
