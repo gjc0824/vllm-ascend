@@ -19,19 +19,19 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerAliasCacheSpec
+
 logger = init_logger(__name__)
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 
-_SFA_INDEXER_ALIAS_CACHE_DTYPE = "sfa_indexer_alias"
 _SFA_HYBRID_CONNECTORS = {
     "AscendStoreConnector",
     "MooncakeConnectorStoreV1",
     "SFAKVOffloadConnector",
 }
-_SFA_INDEXER_REUSE_TENSOR_SLOTS = 4
 _SFA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
@@ -116,12 +116,16 @@ def _extract_sfa_layer_id(layer_name: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
-def _is_sfa_indexer_spec(layer_name: str, spec: KVCacheSpec) -> bool:
-    return (
-        _is_sfa_indexer_layer(layer_name)
-        or getattr(spec, "cache_dtype_str", None)
-        == _SFA_INDEXER_ALIAS_CACHE_DTYPE
-    )
+def _is_sfa_indexer_spec(spec: KVCacheSpec) -> bool:
+    return isinstance(spec, AscendSFAIndexerAliasCacheSpec)
+
+
+def _kv_group_is_sfa_indexer(group: KVCacheGroupSpec) -> bool:
+    group_spec = group.kv_cache_spec
+    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        specs = [group_spec.kv_cache_specs[name] for name in group.layer_names]
+        return bool(specs) and all(_is_sfa_indexer_spec(spec) for spec in specs)
+    return _is_sfa_indexer_spec(group_spec)
 
 
 def _use_sfa_hybrid_layout(
@@ -150,12 +154,10 @@ def _use_sfa_hybrid_layout(
     ):
         return False
     has_indexer = any(
-        _is_sfa_indexer_spec(layer_name, spec)
-        for layer_name, spec in kv_cache_spec.items()
+        _is_sfa_indexer_spec(spec) for spec in kv_cache_spec.values()
     )
     has_kv = any(
-        not _is_sfa_indexer_spec(layer_name, spec)
-        for layer_name, spec in kv_cache_spec.items()
+        not _is_sfa_indexer_spec(spec) for spec in kv_cache_spec.values()
     )
     return has_indexer and has_kv
 
@@ -182,14 +184,12 @@ def _split_sfa_layers(
         layer_id = _extract_sfa_layer_id(layer_name)
         if layer_id is None:
             continue
-        if _is_sfa_indexer_spec(layer_name, spec):
+        if _is_sfa_indexer_spec(spec):
             indexer_layers_by_id[layer_id] = layer_name
         else:
             kv_layers_by_id[layer_id] = layer_name
 
     if not kv_layers_by_id or not indexer_layers_by_id:
-        return None
-    if set(kv_layers_by_id) - set(indexer_layers_by_id):
         return None
 
     total_layers = _get_sfa_total_layers(
@@ -198,8 +198,24 @@ def _split_sfa_layers(
     return total_layers, kv_layers_by_id, indexer_layers_by_id
 
 
-def _get_sfa_indexer_group_count(total_layers: int) -> int:
-    return total_layers // _SFA_INDEXER_REUSE_TENSOR_SLOTS + 1
+def _get_sfa_indexer_group_count(indexer_layers_by_id: dict[int, str]) -> int:
+    return len(indexer_layers_by_id)
+
+
+def _validate_sfa_indexer_residue_layout(
+    indexer_layers_by_id: dict[int, str],
+    indexer_group_count: int,
+) -> None:
+    residues = {layer_id % indexer_group_count for layer_id in indexer_layers_by_id}
+    expected = set(range(indexer_group_count))
+    if residues != expected:
+        raise ValueError(
+            "SFA hybrid cache layout expected real indexer cache layers to "
+            "cover every layer_id % indexer_group_count residue. "
+            f"indexer_group_count={indexer_group_count}, "
+            f"indexer_layer_ids={sorted(indexer_layers_by_id)}, "
+            f"residues={sorted(residues)}, expected={sorted(expected)}."
+        )
 
 
 def _ascend_get_kv_cache_groups(
@@ -214,7 +230,11 @@ def _ascend_get_kv_cache_groups(
         return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
     total_layers, kv_layers_by_id, indexer_layers_by_id = split_layers
-    indexer_group_count = _get_sfa_indexer_group_count(total_layers)
+    indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
+    _validate_sfa_indexer_residue_layout(
+        indexer_layers_by_id,
+        indexer_group_count,
+    )
 
     grouped_layer_names: list[list[str]] = []
     for group_id in range(indexer_group_count):
@@ -240,19 +260,16 @@ def _ascend_get_kv_cache_groups(
     )
     logger.info(
         "SFA hybrid KV cache groups: %d indexer groups + 1 KV group "
-        "(%d layers, %d reuse tensors)",
+        "(%d layers, real indexer layers=%s)",
         indexer_group_count,
         total_layers,
-        _SFA_INDEXER_REUSE_TENSOR_SLOTS,
+        sorted(indexer_layers_by_id),
     )
     return kv_cache_groups
 
 
 def _is_sfa_indexer_kv_cache_group(group: KVCacheGroupSpec) -> bool:
-    return bool(group.layer_names) and all(
-        _is_sfa_indexer_layer(layer_name)
-        for layer_name in group.layer_names
-    )
+    return _kv_group_is_sfa_indexer(group)
 
 
 def _get_sfa_hybrid_kv_cache_config_from_groups(
@@ -286,13 +303,17 @@ def _get_sfa_hybrid_kv_cache_config_from_groups(
             if layer_id is not None:
                 indexer_layers_by_id[layer_id] = layer_name
 
-    if not kv_layers_by_id or set(kv_layers_by_id) - set(indexer_layers_by_id):
+    if not kv_layers_by_id:
         return None
 
     total_layers = _get_sfa_total_layers(
         vllm_config, set(kv_layers_by_id) | set(indexer_layers_by_id)
     )
-    indexer_group_count = _get_sfa_indexer_group_count(total_layers)
+    indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
+    _validate_sfa_indexer_residue_layout(
+        indexer_layers_by_id,
+        indexer_group_count,
+    )
     if len(indexer_groups) != indexer_group_count:
         return None
 

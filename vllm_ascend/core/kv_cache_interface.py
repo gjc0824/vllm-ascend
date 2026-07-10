@@ -8,7 +8,7 @@ from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
@@ -246,6 +246,51 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class AscendSFAIndexerAliasCacheSpec(FullAttentionSpec):
+    """Logical cache spec for SFA indexer aliases.
+
+    This spec lets the scheduler manage real ``*.indexer.k_cache`` layers as
+    their own cache groups while the model runner still binds them to an alias
+    view over the real SFA K cache storage.
+    """
+
+    cache_dtype_str: str | None = None
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendSFAIndexerAliasCacheSpec) for spec in specs), (
+            "All SFA indexer alias cache layers in the same KV cache group "
+            "must be AscendSFAIndexerAliasCacheSpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        dtype_set = set(spec.dtype for spec in specs)
+        block_size_set = set(spec.block_size for spec in specs)
+        head_size_set = set(spec.head_size for spec in specs)
+        num_kv_heads_set = set(spec.num_kv_heads for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(dtype_set) == 1
+            and len(block_size_set) == 1
+            and len(head_size_set) == 1
+            and len(num_kv_heads_set) == 1
+        ), (
+            "All SFA indexer alias cache layers in the same KV cache group "
+            "must use the same shape, dtype and cache dtype string."
+        )
+        return cls(
+            block_size=block_size_set.pop(),
+            num_kv_heads=num_kv_heads_set.pop(),
+            head_size=head_size_set.pop(),
+            dtype=dtype_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+        )
+
+
 @dataclass(frozen=True)
 class OffloadMLAAttentionSpec(AttentionSpec):
     @property
@@ -267,6 +312,11 @@ def register_ascend_kv_cache_specs() -> None:
         kvcache_spec_cls=AscendSlidingWindowMLASpec,
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSFAIndexerAliasCacheSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
     )
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=OffloadMLAAttentionSpec,

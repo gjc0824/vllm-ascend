@@ -188,7 +188,12 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec, OffloadMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFAIndexerAliasCacheSpec,
+    AscendSlidingWindowMLASpec,
+    OffloadMLAAttentionSpec,
+)
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -604,6 +609,17 @@ class NPUModelRunner(GPUModelRunner):
     def _is_sfa_indexer_layer(layer_name: str) -> bool:
         return ".indexer.k_cache" in layer_name
 
+    @staticmethod
+    def _extract_sfa_layer_id(layer_name: str) -> int | None:
+        parts = layer_name.split(".")
+        for idx, part in enumerate(parts[:-1]):
+            if part == "layers":
+                try:
+                    return int(parts[idx + 1])
+                except ValueError:
+                    return None
+        return None
+
     def _use_sfa_ascend_store_hybrid_layout(self) -> bool:
         if not self.use_sparse:
             return False
@@ -640,43 +656,17 @@ class NPUModelRunner(GPUModelRunner):
     def _is_sfa_indexer_kv_cache_group(
         self, kv_cache_group: KVCacheGroupSpec
     ) -> bool:
-        return bool(kv_cache_group.layer_names) and all(
-            self._is_sfa_indexer_layer(layer_name)
-            for layer_name in kv_cache_group.layer_names
-        )
-
-    def _ensure_sfa_indexer_layers(
-        self, attn_layers: dict[str, AttentionLayerBase]
-    ) -> None:
-        if not self._use_sfa_ascend_store_hybrid_layout():
-            return
-        indexer_template = next(
-            (
-                module
-                for name, module in attn_layers.items()
-                if self._is_sfa_indexer_layer(name)
-            ),
-            None,
-        )
-        if indexer_template is None:
-            logger.warning(
-                "SFA hybrid cache layout requested but no indexer cache "
-                "layer was found; falling back to the existing sparse layout."
+        group_spec = kv_cache_group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            specs = [
+                group_spec.kv_cache_specs[layer_name]
+                for layer_name in kv_cache_group.layer_names
+            ]
+            return bool(specs) and all(
+                isinstance(spec, AscendSFAIndexerAliasCacheSpec)
+                for spec in specs
             )
-            return
-        static_forward_context = (
-            self.vllm_config.compilation_config.static_forward_context
-        )
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        for layer_id in range(num_layers):
-            indexer_name = f"model.layers.{layer_id}.self_attn.indexer.k_cache"
-            if indexer_name in attn_layers:
-                continue
-            indexer_module = deepcopy(indexer_template)
-            if hasattr(indexer_module, "prefix"):
-                indexer_module.prefix = indexer_name
-            attn_layers[indexer_name] = indexer_module
-            static_forward_context.setdefault(indexer_name, indexer_module)
+        return isinstance(group_spec, AscendSFAIndexerAliasCacheSpec)
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -4170,6 +4160,60 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    @staticmethod
+    def _as_kv_cache_tuple(kv_cache: Any) -> tuple[Any, ...]:
+        if isinstance(kv_cache, tuple):
+            return kv_cache
+        if isinstance(kv_cache, list):
+            return tuple(kv_cache)
+        return (kv_cache,)
+
+    def _bind_sfa_indexer_alias_views(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        if not self._use_sfa_ascend_store_hybrid_layout():
+            return
+
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        indexer_layer_names = [
+            layer_name
+            for layer_name, spec in layer_kv_cache_spec.items()
+            if isinstance(spec, AscendSFAIndexerAliasCacheSpec)
+        ]
+        if not indexer_layer_names:
+            return
+
+        alias_by_layer_id: dict[int, torch.Tensor] = {}
+        for layer_name, cache_or_caches in kv_caches.items():
+            if self._is_sfa_indexer_layer(layer_name):
+                continue
+            layer_id = self._extract_sfa_layer_id(layer_name)
+            cache_tuple = self._as_kv_cache_tuple(cache_or_caches)
+            if layer_id is not None and len(cache_tuple) >= 3:
+                alias_by_layer_id[layer_id] = cache_tuple[2]
+
+        for indexer_layer_name in indexer_layer_names:
+            layer_id = self._extract_sfa_layer_id(indexer_layer_name)
+            alias_cache = (
+                alias_by_layer_id.get(layer_id)
+                if layer_id is not None
+                else None
+            )
+            if alias_cache is None:
+                raise RuntimeError(
+                    "SFA indexer alias cache could not find matching real KV "
+                    f"alias view for {indexer_layer_name}; available layer ids="
+                    f"{sorted(alias_by_layer_id)}."
+                )
+            kv_caches[indexer_layer_name] = alias_cache
+
+        logger.info(
+            "SFA hybrid cache bound %d real indexer cache layers to K aliases.",
+            len(indexer_layer_names),
+        )
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -4190,6 +4234,8 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
+        self._bind_sfa_indexer_alias_views(kv_cache_config, kv_caches)
+
         if self.model_config.hf_text_config.model_type == "deepseek_v4":
             from vllm_ascend.utils import extract_dsv4_layer_index
 
@@ -4203,10 +4249,35 @@ class NPUModelRunner(GPUModelRunner):
                 self.compilation_config.static_forward_context[
                     layer_name].kv_cache = [kv_cache]
         else:
-            from vllm.v1.worker.utils import bind_kv_cache
+            from vllm.v1.worker.utils import bind_kv_cache, extract_layer_index
 
             num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
-            bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
+            has_sfa_indexer_alias_cache = any(
+                self._is_sfa_indexer_layer(layer_name)
+                for layer_name in kv_caches
+            )
+            if (
+                self._use_sfa_ascend_store_hybrid_layout()
+                and has_sfa_indexer_alias_cache
+            ):
+                assert len(self.kv_caches) == 0
+                index2name = defaultdict(list)
+                for layer_name in kv_caches:
+                    if self._is_sfa_indexer_layer(layer_name):
+                        continue
+                    index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+                for layer_index in sorted(index2name.keys()):
+                    for layer_name in index2name[layer_index]:
+                        self.kv_caches.append(kv_caches[layer_name])
+
+                for layer_name, kv_cache in kv_caches.items():
+                    # Match vLLM's bind_kv_cache list wrapper. This keeps
+                    # DeepseekV32IndexerCache.kv_cache[0] as the alias tensor.
+                    self.compilation_config.static_forward_context[
+                        layer_name].kv_cache = [kv_cache]
+            else:
+                bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
 
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import init_and_bind_hashk_cache
@@ -5177,11 +5248,16 @@ class NPUModelRunner(GPUModelRunner):
             # they are cached correctly, there will be different objects per
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
-                full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if isinstance(layer_kv_cache_spec, AscendSFAIndexerAliasCacheSpec):
+                    from vllm_ascend.attention.sfa_v1 import AscendSFAIndexerAliasBackend
+
+                    attn_backend = AscendSFAIndexerAliasBackend
+                else:
+                    attn_backend = layers[layer_name].get_attn_backend()
+                full_cls_name = attn_backend.full_cls_name()
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
                 attn_backend_layers[key].append(layer_name)
@@ -5266,7 +5342,8 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
-        self._ensure_sfa_indexer_layers(attn_layers)
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
@@ -5291,15 +5368,18 @@ class NPUModelRunner(GPUModelRunner):
             indexer_block_size = self.block_size * kv_lora_rank // index_head_dim
             indexer_pad_dim = index_head_dim * qk_rope_head_dim // kv_lora_rank
             for layer_name, attn_module in attn_layers.items():
-                if not self._is_sfa_indexer_layer(layer_name):
+                if not (
+                    self._is_sfa_indexer_layer(layer_name)
+                    and isinstance(attn_module, DeepseekV32IndexerCache)
+                ):
                     continue
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                    kv_cache_spec[layer_name] = AscendSFAIndexerAliasCacheSpec(
                         block_size=indexer_block_size,
                         num_kv_heads=spec.num_kv_heads,
                         head_size=index_head_dim + indexer_pad_dim,
                         dtype=self.kv_cache_dtype,
-                        cache_dtype_str="sfa_indexer_alias",
+                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                     )
             for layer_name, attn_module in attn_layers.items():
                 if isinstance(attn_module, MLAAttention):
@@ -5372,10 +5452,8 @@ class NPUModelRunner(GPUModelRunner):
 
             elif isinstance(attn_module, CacheOnlyAttentionLayer):
                 # Only CacheOnlyAttentionLayer (extract_hidden_states draft model)
-                # is handled here. Other AttentionLayerBase subclasses such as
-                # DeepseekV32IndexerCache are intentionally skipped: on Ascend,
-                # the indexer's k_cache is replaced by IndexerWrapper, so its
-                # KV cache is unused.
+                # is handled here. SFA indexer cache layers are handled only
+                # by the hybrid alias path above.
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     # Rebuild to a fresh, picklable spec (the returned one
                     # references a stale MLAAttentionSpec class shadowed by
