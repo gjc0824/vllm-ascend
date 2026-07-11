@@ -737,6 +737,8 @@ class SFAKVOffloadWorker:
         if layer_id in self.submitted_save_layer_ids:
             return
         assert self.kv_send_thread is not None
+        ready_event = torch_npu.npu.current_stream().record_event()
+        self.kv_send_thread.save_stream.wait_event(ready_event)
         self.pending_save_layer_ids.add(layer_id)
         self.submitted_save_layer_ids.add(layer_id)
         self.kv_send_thread.add_request(list(self.layer_save_tasks[layer_id]))
