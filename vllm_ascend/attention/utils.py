@@ -460,35 +460,6 @@ def maybe_ensure_kv_layer_saved_to_connector(layer_name: str) -> None:
         hook(layer_name)
 
 
-def maybe_update_cpu_kv_tokens(
-    layer_name: str,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    token_to_req: torch.Tensor | None = None,
-    num_tokens: int | None = None,
-) -> bool:
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return False
-
-    connector = get_kv_transfer_group()
-    hook = getattr(connector, "update_cpu_kv_tokens", None)
-    if hook is None:
-        return False
-    return bool(
-        hook(
-            layer_name,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            positions,
-            token_to_req,
-            num_tokens,
-        )
-    )
-
-
 def set_connector_req_ids(req_ids):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
