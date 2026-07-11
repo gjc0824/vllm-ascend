@@ -608,7 +608,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cpu_update_tokens_per_req=(
                 common_attn_metadata.cpu_update_tokens_per_req
             ),
-            all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
+            all_kv_in_cpu=common_attn_metadata.all_kv_in_cpu,
         )
 
     def build_for_graph_capture(
@@ -1594,13 +1594,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         if attn_metadata.req_ids_tensor is None:
             raise RuntimeError("SFA offload decode path requires req_ids_tensor metadata")
 
-        topk_buffer_k = kv_cache[3][:num_tokens]
-        topk_buffer_v = kv_cache[4][:num_tokens]
         topk_indices = topk_indices.squeeze(1)
 
         is_mtp_decode = num_tokens != num_reqs
         query_starts = None
         all_kv_in_cpu = attn_metadata.all_kv_in_cpu and not is_mtp_decode
+        if not is_mtp_decode and all_kv_in_cpu and attn_metadata.positions is None:
+            raise RuntimeError("SFA all-CPU offload requires positions metadata")
         if is_mtp_decode:
             if attn_metadata.token_to_req is None:
                 raise RuntimeError("SFA offload MTP decode requires token_to_req metadata")
@@ -1625,6 +1625,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 device=topk_indices.device,
             )
         token_to_req_index = token_to_req.long()
+
+        topk_buffer_k = kv_cache[3][:num_tokens]
+        topk_buffer_v = kv_cache[4][:num_tokens]
 
         seq_len_thresholds = attn_metadata.seq_lens[:num_reqs][
             token_to_req_index

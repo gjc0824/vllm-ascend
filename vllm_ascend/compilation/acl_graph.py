@@ -56,7 +56,6 @@ class ACLGraphEntry:
     batch_descriptor: BatchDescriptor
     aclgraph: torch.npu.NPUGraph | None = None
     output: Any | None = None
-    replay_count: int = 0
 
     # for aclgraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
@@ -257,7 +256,6 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        entry.replay_count += 1
         logger.info_once("Replaying aclgraph")
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes

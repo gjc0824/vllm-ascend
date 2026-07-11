@@ -3366,6 +3366,11 @@ class NPUModelRunner(GPUModelRunner):
             tokens_per_req=self.tokens_per_req.gpu[:num_reqs]
             if self.ascend_config.use_offload
             else None,
+            all_kv_in_cpu=(
+                (self.all_kv_in_cpu or for_cudagraph_capture)
+                if self.ascend_config.use_offload
+                else False
+            ),
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -3501,8 +3506,6 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
-            if self.ascend_config.use_offload:
-                cm.all_kv_in_cpu = self.all_kv_in_cpu or for_cudagraph_capture
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid, attn_gid, cm, num_reqs_actual,

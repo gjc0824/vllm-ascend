@@ -192,7 +192,6 @@ class SFAKVOffloadWorker:
         )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
-        self.cpu_blocks_by_req: dict[str, int] = {}
 
         self.cpu_sparse_attn = cpu_sparse_attn
 
@@ -543,11 +542,8 @@ class SFAKVOffloadWorker:
         self.submitted_save_layer_ids.clear()
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
-        for req_id in metadata.preempted_req_ids or set():
-            self.cpu_blocks_by_req.pop(req_id, None)
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
-            self.cpu_blocks_by_req[request.req_id] = len(request.block_ids_cpu)
             if request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
@@ -591,14 +587,6 @@ class SFAKVOffloadWorker:
             )
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
-        result = {req_id: self.cpu_blocks_by_req[req_id] for req_id in req_ids if req_id in self.cpu_blocks_by_req}
-        return result or None
-
-    def clear_finished_req_ids(self, finished_req_ids: set[str]) -> None:
-        for req_id in finished_req_ids:
-            self.cpu_blocks_by_req.pop(req_id, None)
-
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
@@ -641,113 +629,6 @@ class SFAKVOffloadWorker:
         self.pending_save_layer_ids.discard(layer_id)
         self.submitted_save_layer_ids.discard(layer_id)
         self.layer_save_tasks[layer_id].clear()
-
-    def update_cpu_kv_tokens(
-        self,
-        layer_name: str,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        positions: torch.Tensor,
-        token_to_req: torch.Tensor | None = None,
-        num_tokens: int | None = None,
-        update_token_indices: torch.Tensor | None = None,
-        strict: bool = True,
-    ) -> bool:
-        if _is_current_stream_capturing():
-            return False
-        layer_id = self._get_offload_layer_id(layer_name)
-        if num_tokens is None:
-            num_tokens = (
-                int(update_token_indices.shape[0])
-                if update_token_indices is not None
-                else int(slot_mapping.shape[0])
-            )
-        source_rows = min(
-            int(slot_mapping.shape[0]),
-            int(positions.shape[0]),
-        )
-        if source_rows <= 0:
-            return False
-        num_tokens = min(
-            int(num_tokens),
-            int(update_token_indices.shape[0])
-            if update_token_indices is not None
-            else source_rows,
-            self.max_num_topk_rows,
-        )
-        if num_tokens <= 0:
-            return False
-        if not self.req_ids:
-            return False
-        assert self.kv_send_thread is not None
-
-        if update_token_indices is not None:
-            raw_update_indices = update_token_indices[:num_tokens].to(torch.int64)
-            valid_update_mask = (
-                (raw_update_indices >= 0)
-                & (raw_update_indices < source_rows)
-            )
-            safe_update_indices = raw_update_indices.clamp(
-                min=0,
-                max=source_rows - 1,
-            )
-            selected_slots = torch.index_select(
-                slot_mapping,
-                0,
-                safe_update_indices,
-            )
-            selected_slots = torch.where(
-                valid_update_mask,
-                selected_slots,
-                torch.full_like(selected_slots, -1),
-            )
-            selected_positions = torch.index_select(
-                positions,
-                0,
-                safe_update_indices,
-            )
-            selected_token_to_req = (
-                torch.index_select(token_to_req, 0, safe_update_indices)
-                if token_to_req is not None
-                else None
-            )
-        else:
-            selected_slots = slot_mapping[:num_tokens]
-            selected_positions = positions[:num_tokens]
-            selected_token_to_req = (
-                token_to_req[:num_tokens]
-                if token_to_req is not None
-                else None
-            )
-
-        slot_mapping_cpu = selected_slots.detach().cpu().to(torch.int64)
-        positions_cpu = selected_positions.detach().cpu().to(torch.int64)
-        if selected_token_to_req is None:
-            token_to_req_cpu = torch.arange(num_tokens, dtype=torch.int64)
-        else:
-            token_to_req_cpu = selected_token_to_req.detach().cpu().to(torch.int64)
-        slot_indices = selected_slots.clamp_min(0).to(torch.int64)
-        key_flat = key_cache.view(-1, key_cache.shape[-1])
-        value_flat = value_cache.view(-1, value_cache.shape[-1])
-        key_cpu = self.k_caches_cpu[layer_id]
-        value_cpu = self.v_caches_cpu[layer_id]
-        key_values_cpu = torch.index_select(key_flat, 0, slot_indices).detach().cpu()
-        value_values_cpu = torch.index_select(value_flat, 0, slot_indices).detach().cpu()
-
-        return self._update_cpu_kv_tokens_from_cpu(
-            layer_name,
-            layer_id,
-            slot_mapping_cpu,
-            positions_cpu,
-            token_to_req_cpu,
-            key_values_cpu,
-            value_values_cpu,
-            num_tokens,
-            key_cpu,
-            value_cpu,
-            strict=strict,
-        )
 
     def _update_cpu_kv_tokens_from_cpu(
         self,

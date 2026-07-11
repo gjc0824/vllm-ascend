@@ -239,6 +239,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
     cpu_update_tokens_per_req: torch.Tensor | None = None
+    all_kv_in_cpu: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -302,6 +303,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             else None,
             tokens_per_req=_slice_reqs(self.tokens_per_req),
             cpu_update_tokens_per_req=_slice_reqs(self.cpu_update_tokens_per_req),
+            all_kv_in_cpu=self.all_kv_in_cpu,
         )
 
 
@@ -462,39 +464,6 @@ def maybe_ensure_kv_layer_saved_to_connector(layer_name: str) -> None:
         hook(layer_name)
 
 
-def maybe_update_cpu_kv_tokens(
-    layer_name: str,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    token_to_req: torch.Tensor | None = None,
-    num_tokens: int | None = None,
-    update_token_indices: torch.Tensor | None = None,
-    strict: bool = True,
-) -> bool:
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return False
-
-    connector = get_kv_transfer_group()
-    hook = getattr(connector, "update_cpu_kv_tokens", None)
-    if hook is None:
-        return False
-    return bool(
-        hook(
-            layer_name,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            positions,
-            token_to_req,
-            num_tokens,
-            update_token_indices,
-            strict,
-        )
-    )
-
-
 def set_connector_req_ids(req_ids):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -547,17 +516,6 @@ def maybe_prepare_lru_resident_and_load_graph(
         num_decode_tokens,
         update_token_indices,
     )
-
-
-def maybe_get_num_cpu_blocks(req_ids):
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return None
-
-    connector = get_kv_transfer_group()
-    hook = getattr(connector, "get_num_cpu_blocks", None)
-    if hook is None:
-        return None
-    return hook(req_ids)
 
 
 def round_up(val: int, align: int) -> int:

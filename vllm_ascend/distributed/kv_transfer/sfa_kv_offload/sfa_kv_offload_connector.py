@@ -104,30 +104,6 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def ensure_layer_saved(self, layer_name: str) -> None:
         self.connector_worker.ensure_layer_saved(layer_name)
 
-    def update_cpu_kv_tokens(
-        self,
-        layer_name: str,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        positions: torch.Tensor,
-        token_to_req: torch.Tensor | None = None,
-        num_tokens: int | None = None,
-        update_token_indices: torch.Tensor | None = None,
-        strict: bool = True,
-    ) -> bool:
-        return self.connector_worker.update_cpu_kv_tokens(
-            layer_name,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            positions,
-            token_to_req,
-            num_tokens,
-            update_token_indices,
-            strict,
-        )
-
     def prepare_lru_resident_and_load(
         self,
         layer_name: str,
@@ -165,10 +141,7 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def set_req_ids(self, req_ids: list):
         return self.connector_worker.set_req_ids(req_ids)
 
-    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
-        return self.connector_worker.get_num_cpu_blocks(req_ids)
-
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # In sfa kv offload, we don't need delay free, thus no need to return finished_send/recv too.
-        self.connector_worker.clear_finished_req_ids(finished_req_ids)
+        del finished_req_ids
         return (set(), set())
