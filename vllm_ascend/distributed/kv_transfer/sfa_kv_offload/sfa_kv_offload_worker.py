@@ -42,6 +42,8 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler
 )
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
+
+
 def get_subscribed_compute_streams() -> set:
     return _SUBSCRIBED_COMPUTE_STREAMS
 
@@ -190,6 +192,7 @@ class SFAKVOffloadWorker:
         )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
+        self.cpu_blocks_by_req: dict[str, int] = {}
 
         self.cpu_sparse_attn = cpu_sparse_attn
 
@@ -286,10 +289,9 @@ class SFAKVOffloadWorker:
             self.topk_buffers_v: list[torch.Tensor] = []
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
-                # SFA offload tuple: CPU saves currently read normal KV
-                # [0:2], decode LRU loads fill top-k buffers [3:5].
-                # Tail buffers [5:7] are the source for the planned
-                # full-block tail-window offload fix.
+                # SFA offload tuple: CPU saves normal KV [0:2], including
+                # refreshed tail blocks, and decode LRU loads fill top-k
+                # buffers [3:5].
                 assert len(cache_or_caches) >= 5
                 self.k_caches_npu.append(cache_or_caches[0])
                 self.v_caches_npu.append(cache_or_caches[1])
@@ -458,6 +460,40 @@ class SFAKVOffloadWorker:
             self.lru_miss_position_workspace_ptr = self.lru_miss_position_workspace.data_ptr()
             self.lru_epochs_ptr = self.lru_epochs.data_ptr()
 
+            # Keep integer staging dtypes aligned with their NPU sources.
+            # Capture accepts raw D2H copies here, but D2H+dtype conversion
+            # synchronizes the captured stream on Ascend.
+            self.token_update_slots_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.token_update_positions_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int64,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.token_update_token_to_req_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.token_update_k_cpu = torch.empty(
+                [self.max_num_topk_rows, head_dim_k],
+                dtype=torch.bfloat16,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.token_update_v_cpu = torch.empty(
+                [self.max_num_topk_rows, head_dim_v],
+                dtype=torch.bfloat16,
+                device='cpu',
+                pin_memory=True,
+            )
+
             # sparse h2d (batch_copy related)
             self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
             self.addr_v_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_v]
@@ -507,8 +543,11 @@ class SFAKVOffloadWorker:
         self.submitted_save_layer_ids.clear()
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
+        for req_id in metadata.preempted_req_ids or set():
+            self.cpu_blocks_by_req.pop(req_id, None)
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
+            self.cpu_blocks_by_req[request.req_id] = len(request.block_ids_cpu)
             if request.num_new_offload_blocks <= 0:
                 continue # no new blocks to save
             self.process_layer_data(request)
@@ -552,6 +591,14 @@ class SFAKVOffloadWorker:
             )
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
+    def get_num_cpu_blocks(self, req_ids: list[str]) -> dict[str, int] | None:
+        result = {req_id: self.cpu_blocks_by_req[req_id] for req_id in req_ids if req_id in self.cpu_blocks_by_req}
+        return result or None
+
+    def clear_finished_req_ids(self, finished_req_ids: set[str]) -> None:
+        for req_id in finished_req_ids:
+            self.cpu_blocks_by_req.pop(req_id, None)
+
     def save_cpu(self, layer_id: int | None = None) -> None:
         if layer_id is None:
             layer_id = self.current_layer_save
@@ -574,6 +621,147 @@ class SFAKVOffloadWorker:
             return
         self.save_cpu(self._get_offload_layer_id(layer_name))
 
+    def ensure_layer_saved(self, layer_name: str) -> None:
+        if _is_current_stream_capturing():
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        if not self.layer_save_tasks[layer_id]:
+            return
+        assert self.kv_send_thread is not None
+        current_stream = torch_npu.npu.current_stream()
+        ready_event = current_stream.record_event()
+        self.kv_send_thread.save_stream.wait_event(ready_event)
+        self.save_cpu(layer_id)
+        event = self.layer_save_finished_events[layer_id]
+        while not event.wait(timeout=1):
+            logger.info(f'>>>>> layer {layer_id} waiting for pre-attention save')
+        event.clear()
+        self.pending_save_layer_ids.discard(layer_id)
+        self.submitted_save_layer_ids.discard(layer_id)
+        self.layer_save_tasks[layer_id].clear()
+
+    def update_cpu_kv_tokens(
+        self,
+        layer_name: str,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        token_to_req: torch.Tensor | None = None,
+        num_tokens: int | None = None,
+    ) -> bool:
+        if _is_current_stream_capturing():
+            return False
+        layer_id = self._get_offload_layer_id(layer_name)
+        if num_tokens is None:
+            num_tokens = int(slot_mapping.shape[0])
+        num_tokens = min(
+            int(num_tokens),
+            int(slot_mapping.shape[0]),
+            int(positions.shape[0]),
+        )
+        if num_tokens <= 0:
+            return False
+        if not self.req_ids:
+            return False
+        assert self.kv_send_thread is not None
+
+        slot_mapping_cpu = slot_mapping[:num_tokens].detach().cpu().to(torch.int64)
+        positions_cpu = positions[:num_tokens].detach().cpu().to(torch.int64)
+        if token_to_req is None:
+            token_to_req_cpu = torch.arange(num_tokens, dtype=torch.int64)
+        else:
+            token_to_req_cpu = token_to_req[:num_tokens].detach().cpu().to(torch.int64)
+        slot_indices = slot_mapping[:num_tokens].clamp_min(0).to(torch.int64)
+        key_flat = key_cache.view(-1, key_cache.shape[-1])
+        value_flat = value_cache.view(-1, value_cache.shape[-1])
+        key_cpu = self.k_caches_cpu[layer_id]
+        value_cpu = self.v_caches_cpu[layer_id]
+        key_values_cpu = torch.index_select(key_flat, 0, slot_indices).detach().cpu()
+        value_values_cpu = torch.index_select(value_flat, 0, slot_indices).detach().cpu()
+
+        return self._update_cpu_kv_tokens_from_cpu(
+            layer_name,
+            layer_id,
+            slot_mapping_cpu,
+            positions_cpu,
+            token_to_req_cpu,
+            key_values_cpu,
+            value_values_cpu,
+            num_tokens,
+            key_cpu,
+            value_cpu,
+            strict=True,
+        )
+
+    def _update_cpu_kv_tokens_from_cpu(
+        self,
+        layer_name: str,
+        layer_id: int,
+        slot_mapping_cpu: torch.Tensor,
+        positions_cpu: torch.Tensor,
+        token_to_req_cpu: torch.Tensor,
+        key_values_cpu: torch.Tensor,
+        value_values_cpu: torch.Tensor,
+        num_tokens: int,
+        key_cpu: torch.Tensor,
+        value_cpu: torch.Tensor,
+        strict: bool,
+    ) -> bool:
+        if not self.req_ids:
+            return False
+        src_slots: list[int] = []
+        dst_cpu_blocks: list[int] = []
+        dst_offsets: list[int] = []
+        src_indices: list[int] = []
+        cpu_block_table = self.cpu_block_table.np
+        for token_idx in range(num_tokens):
+            slot = int(slot_mapping_cpu[token_idx].item())
+            if slot < 0:
+                continue
+            req_row = int(token_to_req_cpu[token_idx].item())
+            if req_row < 0 or req_row >= len(self.req_ids):
+                if not strict:
+                    continue
+                raise RuntimeError(
+                    "SFA CPU token update request row out of range: "
+                    f"layer={layer_name}, row={req_row}, reqs={len(self.req_ids)}"
+                )
+            position = int(positions_cpu[token_idx].item())
+            if position < 0:
+                continue
+            logical_block = position // self.block_size
+            if logical_block >= cpu_block_table.shape[1]:
+                if not strict:
+                    continue
+                raise RuntimeError(
+                    "SFA CPU token update block index out of range: "
+                    f"layer={layer_name}, position={position}, block={logical_block}, "
+                    f"table_width={cpu_block_table.shape[1]}"
+                )
+            cpu_block = int(cpu_block_table[req_row, logical_block])
+            if cpu_block <= 0:
+                if not strict:
+                    continue
+                raise RuntimeError(
+                    "SFA CPU token update missing CPU block: "
+                    f"layer={layer_name}, req={self.req_ids[req_row]}, "
+                    f"position={position}, block={logical_block}"
+                )
+            offset = position % self.block_size
+            src_slots.append(slot)
+            dst_cpu_blocks.append(cpu_block)
+            dst_offsets.append(offset)
+            src_indices.append(token_idx)
+
+        if not src_slots:
+            return False
+
+        for src_idx, cpu_block, offset in zip(src_indices, dst_cpu_blocks, dst_offsets):
+            key_cpu[cpu_block, offset, 0].copy_(key_values_cpu[src_idx])
+            value_cpu[cpu_block, offset, 0].copy_(value_values_cpu[src_idx])
+        return True
+
     def wait_for_save(self):
         assert self.use_layerwise
         if not self.pending_save_layer_ids:
@@ -581,9 +769,8 @@ class SFAKVOffloadWorker:
             return
         for layer_id in sorted(self.pending_save_layer_ids):
             event = self.layer_save_finished_events[layer_id]
-            is_finish = event.wait(timeout=1)
-            if not is_finish:
-                logger.info(f'>>>>> layer {layer_id} wait for save timeout')
+            while not event.wait(timeout=1):
+                logger.info(f'>>>>> layer {layer_id} waiting for save')
             event.clear()
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
@@ -625,7 +812,37 @@ class SFAKVOffloadWorker:
             num_tokens_buffer,
             layer_id,
             do_offload,
+            token_update_args,
         ) = args
+        if token_update_args is not None:
+            (
+                num_update_tokens,
+                update_slots_cpu,
+                update_positions_cpu,
+                update_token_to_req_cpu,
+                update_k_cpu,
+                update_v_cpu,
+                key_cpu,
+                value_cpu,
+            ) = token_update_args
+            if update_token_to_req_cpu is None:
+                update_token_to_req_cpu = torch.arange(
+                    num_update_tokens,
+                    dtype=torch.int64,
+                )
+            self._update_cpu_kv_tokens_from_cpu(
+                self.offload_layer_names[layer_id],
+                layer_id,
+                update_slots_cpu,
+                update_positions_cpu,
+                update_token_to_req_cpu,
+                update_k_cpu,
+                update_v_cpu,
+                num_update_tokens,
+                key_cpu,
+                value_cpu,
+                strict=False,
+            )
         cpu_sparse_attn.lru_resident_compact(
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,
@@ -675,6 +892,14 @@ class SFAKVOffloadWorker:
             # in graph mode, we don't want to interrupt graph twice (since it's time consuming),
             # so we start offload here instead of original maybe_save_kv.
             self.save_cpu(layer_id)
+            if layer_id in self.pending_save_layer_ids:
+                event = self.layer_save_finished_events[layer_id]
+                while not event.wait(timeout=1):
+                    logger.info(f'>>>>> layer {layer_id} waiting for graph pre-attention save')
+                event.clear()
+                self.pending_save_layer_ids.discard(layer_id)
+                self.submitted_save_layer_ids.discard(layer_id)
+                self.layer_save_tasks[layer_id].clear()
 
     def prepare_lru_resident_and_load(
         self,
@@ -686,6 +911,11 @@ class SFAKVOffloadWorker:
         req_ids_npu: torch.Tensor,
         token_to_req_npu: torch.Tensor | None = None,
         capturing: bool = False,
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        num_decode_tokens: int | None = None,
     ) -> bool:
         capturing = capturing or _is_current_stream_capturing()
         layer_id = self._get_offload_layer_id(layer_name)
@@ -718,6 +948,68 @@ class SFAKVOffloadWorker:
         topk_indices_cpu.copy_(topk_indices_npu[:num_tokens], non_blocking=capturing)
         req_ids_cpu = self.lru_req_ids_cpu[:num_tokens]
         req_ids_cpu.copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
+        token_update_args = None
+        if (
+            key_cache is not None
+            and value_cache is not None
+            and slot_mapping is not None
+            and positions is not None
+            and num_decode_tokens is not None
+        ):
+            num_update_tokens = min(
+                int(num_decode_tokens),
+                int(num_tokens),
+                int(slot_mapping.shape[0]),
+                int(positions.shape[0]),
+                self.max_num_topk_rows,
+            )
+            if num_update_tokens > 0:
+                update_slots_cpu = self.token_update_slots_cpu[:num_update_tokens]
+                update_positions_cpu = self.token_update_positions_cpu[:num_update_tokens]
+                update_slots_cpu.copy_(
+                    slot_mapping[:num_update_tokens],
+                    non_blocking=capturing,
+                )
+                update_positions_cpu.copy_(
+                    positions[:num_update_tokens],
+                    non_blocking=capturing,
+                )
+                if token_to_req_npu is None:
+                    update_token_to_req_cpu = self.token_update_token_to_req_cpu[:num_update_tokens]
+                    update_token_to_req_cpu.copy_(
+                        torch.arange(num_update_tokens, dtype=torch.int32),
+                    )
+                else:
+                    update_token_to_req_cpu = self.token_update_token_to_req_cpu[:num_update_tokens]
+                    update_token_to_req_cpu.copy_(
+                        token_to_req_npu[:num_update_tokens],
+                        non_blocking=capturing,
+                    )
+                slot_indices = slot_mapping[:num_update_tokens].clamp_min(0).to(torch.int64)
+                key_values_npu = torch.index_select(
+                    key_cache.view(-1, key_cache.shape[-1]),
+                    0,
+                    slot_indices,
+                )
+                value_values_npu = torch.index_select(
+                    value_cache.view(-1, value_cache.shape[-1]),
+                    0,
+                    slot_indices,
+                )
+                update_k_cpu = self.token_update_k_cpu[:num_update_tokens]
+                update_v_cpu = self.token_update_v_cpu[:num_update_tokens]
+                update_k_cpu.copy_(key_values_npu, non_blocking=capturing)
+                update_v_cpu.copy_(value_values_npu, non_blocking=capturing)
+                token_update_args = (
+                    num_update_tokens,
+                    update_slots_cpu,
+                    update_positions_cpu,
+                    update_token_to_req_cpu,
+                    update_k_cpu,
+                    update_v_cpu,
+                    self.k_caches_cpu[layer_id],
+                    self.v_caches_cpu[layer_id],
+                )
 
         args = (
             num_tokens,
@@ -752,6 +1044,7 @@ class SFAKVOffloadWorker:
             self.num_tokens_buffer_cpu,
             layer_id,
             capturing,
+            token_update_args,
         )
 
         if capturing:
@@ -789,14 +1082,15 @@ class SFAKVOffloadWorker:
         Generate kv offload related metadata.
         """
         num_new_offload_blocks = request.num_new_offload_blocks
-        block_ids_npu = request.block_ids_npu
-        block_ids_cpu = request.block_ids_cpu
-        if len(block_ids_npu) > len(block_ids_cpu):
-            # in most cases block_ids_npu has one more unfull block, remove it
-            block_ids_npu = block_ids_npu[:-1]
-        assert len(block_ids_npu) == len(block_ids_cpu)
-        block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
-        block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
+        if num_new_offload_blocks <= 0:
+            return
+        block_ids_npu = request.offload_src_hbm_ids or request.block_ids_npu[-num_new_offload_blocks:]
+        block_ids_cpu = request.offload_dst_cpu_ids or request.block_ids_cpu[-num_new_offload_blocks:]
+        if len(block_ids_npu) != len(block_ids_cpu):
+            raise ValueError(
+                "SFA KV offload block mapping size mismatch: "
+                f"req_id={request.req_id}, npu={block_ids_npu}, cpu={block_ids_cpu}"
+            )
 
         for layer_id in range(self.num_layers):
             req_meta_save = LayerMultiBlockReqMeta(

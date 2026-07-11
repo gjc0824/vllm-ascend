@@ -1890,6 +1890,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             is_prefilling=common_attn_metadata.is_prefilling,
+            all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
             max_seq_len=0,
         )
         return spec_common_attn_metadata, token_indices
@@ -1983,6 +1984,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
             is_prefilling=common_attn_metadata.is_prefilling,
+            all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
             max_seq_len=0,
         )
 

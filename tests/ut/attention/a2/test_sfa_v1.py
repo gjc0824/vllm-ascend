@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -12,8 +13,31 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
 
-from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadata, AscendSFAMetadataBuilder
+from vllm_ascend.attention.sfa_v1 import (
+    AscendSFABackend,
+    AscendSFAImpl,
+    AscendSFAMetadata,
+    AscendSFAMetadataBuilder,
+    build_mtp_live_token_thresholds,
+)
 from vllm_ascend.utils import enable_dsa_cp
+
+
+def test_build_mtp_live_token_thresholds():
+    positions = torch.tensor([10, 11, 12, 20, 21, 30, 31])
+    query_starts = torch.tensor([0, 3, 5])
+    token_to_req = torch.tensor([0, 0, 0, 1, 1, 2, 2])
+
+    thresholds = build_mtp_live_token_thresholds(
+        positions,
+        query_starts,
+        token_to_req,
+    )
+
+    torch.testing.assert_close(
+        thresholds,
+        torch.tensor([[10], [10], [10], [20], [20], [30], [30]]),
+    )
 
 
 class TestAscendSFABackend(TestBase):
@@ -102,6 +126,31 @@ class TestAscendSFAMetadata(TestBase):
         self.assertIs(metadata.head_dim, head_dim)
         self.assertIs(metadata.attn_mask, attn_mask)
         self.assertEqual(metadata.attn_state, attn_state)
+
+
+class TestAscendSFAImpl(TestBase):
+    def test_all_cpu_decode_requires_positions(self):
+        impl = object.__new__(AscendSFAImpl)
+        attn_metadata = SimpleNamespace(
+            num_decodes=1,
+            req_ids_tensor=torch.tensor([0]),
+            all_kv_in_cpu=True,
+            positions=None,
+        )
+
+        with patch(
+            "vllm_ascend.attention.sfa_v1.get_forward_context",
+            return_value=SimpleNamespace(cudagraph_runtime_mode=None),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "all-CPU offload requires positions"):
+                impl._get_topk_buffer(
+                    None,
+                    None,
+                    torch.zeros((1, 1), dtype=torch.int32),
+                    (),
+                    attn_metadata,
+                    "layer",
+                )
 
 
 class TestAscendSFAMetadataBuilder(TestBase):

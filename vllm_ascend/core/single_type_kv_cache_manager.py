@@ -299,9 +299,10 @@ def get_manager_for_kv_cache_spec(
 class OffloadMLAAttentionManager(FullAttentionManager):
     """KV cache manager for SFA decode offload.
 
-    Full blocks that have already been offloaded to CPU memory are released
-    before new decode blocks are allocated. The recent NPU tail is handled by
-    SFA-side tail buffers, not by this manager.
+    Full blocks that have already been copied from HBM to the SFA CPU pool can
+    be released before new decode blocks are allocated. The buffer branch keeps
+    the normal HBM allocation semantics because its CPU pool is populated from
+    real KV cache blocks in the mixed prefill/decode path.
     """
 
     def __init__(self, kv_cache_spec: "OffloadMLAAttentionSpec", **kwargs) -> None:
@@ -356,9 +357,6 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
         num_new_tokens_main_model = num_tokens_main_model - num_allocated_tokens
         can_free_offloaded_blocks = request_id in self.num_cached_block
-        # The first prefill schedule may already produce full blocks that will
-        # be saved to CPU, but the save happens after layer forward execution.
-        # Only release NPU blocks once the request is in a later cached step.
         if not can_free_offloaded_blocks:
             num_to_free_blocks = 0
         elif num_new_tokens_main_model <= 0:

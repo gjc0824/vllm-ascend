@@ -28,6 +28,10 @@ def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: s
     return max(num_scheduled_tokens - len(draft_tokens), 0)
 
 
+def _num_covered_blocks(num_tokens: int, block_size: int) -> int:
+    return (num_tokens + block_size - 1) // block_size
+
+
 def _is_sfa_indexer_group(kv_cache_group) -> bool:
     return bool(kv_cache_group.layer_names) and all(
         ".indexer.k_cache" in layer_name
@@ -91,6 +95,9 @@ class SFAKVOffloadlScheduler:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        self.decode_width = 1
+        if vllm_config.speculative_config is not None:
+            self.decode_width += vllm_config.speculative_config.num_speculative_tokens
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         self.real_kv_cache_group_id = get_sfa_real_kv_group_id(kv_cache_config)
         self._block_size = self.group_block_sizes[self.real_kv_cache_group_id]
@@ -164,18 +171,20 @@ class SFAKVOffloadlScheduler:
             block_ids_npu = request.block_ids[self.real_kv_cache_group_id].copy()
             num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
                 scheduler_output, request.req_id)
-            num_new_offload_blocks = num_tokens_to_compute // self._block_size
-            block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
+            num_cpu_blocks = min(_num_covered_blocks(num_tokens_to_compute, self._block_size), len(block_ids_npu))
+            block_ids_cpu = self.cpu_block_manager.allocate_block(num_cpu_blocks)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
                 allocated_block_ids_npu=block_ids_npu,
                 allocated_block_ids_cpu=block_ids_cpu,
+                offload_src_hbm_ids=block_ids_npu[:num_cpu_blocks],
+                offload_dst_cpu_ids=block_ids_cpu,
             )
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                num_new_offload_blocks=num_new_offload_blocks,
+                num_new_offload_blocks=len(request_tracker.offload_src_hbm_ids),
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -203,15 +212,49 @@ class SFAKVOffloadlScheduler:
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = num_tokens_after_step // self._block_size # pcp/dcp not considered now
+                num_blocks_after_step = _num_covered_blocks(num_tokens_after_step, self._block_size)
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
-                num_new_offload_blocks = max(num_blocks_after_step - num_offloaded_blocks, 0)
-                new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
+                target_num_blocks = min(
+                    num_blocks_after_step,
+                    len(request_tracker.allocated_block_ids_npu) + len(new_block_ids_npu),
+                )
+                num_new_cpu_blocks = max(target_num_blocks - num_offloaded_blocks, 0)
+                new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_cpu_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
+                is_decode_step = (
+                    0 < num_new_tokens <= self.decode_width
+                    and num_computed_token >= request.num_prompt_tokens
+                )
+                if is_decode_step:
+                    # In the buffer hybrid layout, indexer cache aliases the
+                    # real-K storage. A decode-step whole-block HBM refresh can
+                    # copy alias-polluted historical tokens into CPU. Decode
+                    # tokens are patched into CPU cache token-wise after real-KV
+                    # re-materialization in attention.
+                    offload_start = target_num_blocks
+                elif num_new_tokens > 0 and target_num_blocks > 0:
+                    # Refresh every real-KV block touched by this prefill/chunk
+                    # step. A small final prefill chunk can be decode-width-sized
+                    # but still needs whole-block save semantics.
+                    offload_start = min(num_computed_token // self._block_size, target_num_blocks - 1)
+                else:
+                    offload_start = max(target_num_blocks - num_new_cpu_blocks, 0)
+                if target_num_blocks > len(request_tracker.allocated_block_ids_npu):
+                    raise ValueError(
+                        "SFA KV offload target block count exceeds NPU block table: "
+                        f"req_id={req_id}, target={target_num_blocks}, "
+                        f"npu={request_tracker.allocated_block_ids_npu}"
+                    )
+                request_tracker.offload_src_hbm_ids = request_tracker.allocated_block_ids_npu[
+                    offload_start:target_num_blocks
+                ]
+                request_tracker.offload_dst_cpu_ids = request_tracker.allocated_block_ids_cpu[
+                    offload_start:target_num_blocks
+                ]
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
-                    num_new_offload_blocks=num_new_offload_blocks,
+                    num_new_offload_blocks=len(request_tracker.offload_src_hbm_ids),
                 )
             if req_meta is not None:
                 meta.add_request(req_meta)

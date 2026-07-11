@@ -237,6 +237,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
+    all_kv_in_cpu: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -298,6 +299,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             if self.token_to_req is not None
             else None,
             tokens_per_req=_slice_reqs(self.tokens_per_req),
+            all_kv_in_cpu=self.all_kv_in_cpu,
         )
 
 
@@ -448,6 +450,45 @@ def maybe_save_kv_layer_to_connector(
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
+def maybe_ensure_kv_layer_saved_to_connector(layer_name: str) -> None:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+    hook = getattr(connector, "ensure_layer_saved", None)
+    if hook is not None:
+        hook(layer_name)
+
+
+def maybe_update_cpu_kv_tokens(
+    layer_name: str,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    token_to_req: torch.Tensor | None = None,
+    num_tokens: int | None = None,
+) -> bool:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+
+    connector = get_kv_transfer_group()
+    hook = getattr(connector, "update_cpu_kv_tokens", None)
+    if hook is None:
+        return False
+    return bool(
+        hook(
+            layer_name,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            positions,
+            token_to_req,
+            num_tokens,
+        )
+    )
+
+
 def set_connector_req_ids(req_ids):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
@@ -467,6 +508,11 @@ def maybe_prepare_lru_resident_and_load_graph(
     req_ids: torch.Tensor,
     token_to_req: torch.Tensor | None = None,
     capturing: bool = False,
+    key_cache: torch.Tensor | None = None,
+    value_cache: torch.Tensor | None = None,
+    slot_mapping: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    num_decode_tokens: int | None = None,
 ) -> bool:
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return False
@@ -487,6 +533,11 @@ def maybe_prepare_lru_resident_and_load_graph(
         req_ids,
         token_to_req,
         capturing,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        positions,
+        num_decode_tokens,
     )
 
 

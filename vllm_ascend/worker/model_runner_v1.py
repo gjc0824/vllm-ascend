@@ -110,7 +110,11 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, set_connector_req_ids, using_paged_attention
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    set_connector_req_ids,
+    using_paged_attention,
+)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -600,6 +604,7 @@ class NPUModelRunner(GPUModelRunner):
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self.all_kv_in_cpu = False
 
     @property
     def use_cp(self) -> bool:
@@ -1428,11 +1433,28 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if self.ascend_config.use_offload:
+            num_finalized_scheduled_tokens = num_scheduled_tokens[:num_reqs].copy()
+            for req_id, draft_token_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                num_finalized_scheduled_tokens[req_idx] = max(
+                    int(num_finalized_scheduled_tokens[req_idx]) - len(draft_token_ids),
+                    0,
+                )
+
+            # Buffer mixed SFA offload keeps every decode token addressable from
+            # CPU. Prefill/chunk blocks are saved by the connector; decode tail
+            # tokens are patched into the CPU pool token-wise after real KV is
+            # re-materialized, because the hybrid indexer view aliases K storage.
+            self.all_kv_in_cpu = True
             num_offloaded_blocks = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                // self.block_size
-            ).astype(np.int32, copy=True)
-            decode_threshold = self.decode_token_per_req
+                + num_finalized_scheduled_tokens
+                + self.block_size
+                - 1
+            ) // self.block_size
+            decode_threshold = 1
+            if self.speculative_config is not None:
+                decode_threshold += self.speculative_config.num_speculative_tokens
             is_prefill = num_scheduled_tokens[:num_reqs] > decode_threshold
             num_offloaded_blocks[is_prefill] = 0
 
@@ -3334,6 +3356,11 @@ class NPUModelRunner(GPUModelRunner):
             tokens_per_req=self.tokens_per_req.gpu[:num_reqs]
             if self.ascend_config.use_offload
             else None,
+            all_kv_in_cpu=(
+                (self.all_kv_in_cpu or for_cudagraph_capture)
+                if self.ascend_config.use_offload
+                else False
+            ),
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -4824,47 +4851,18 @@ class NPUModelRunner(GPUModelRunner):
                                 dtype=current_kv_cache_spec.dtype,
                                 device=self.device,
                             )
-                            tail_window_blocks = 2
-                            tail_blocks = (
-                                self.vllm_config.scheduler_config.max_num_seqs
-                                * tail_window_blocks
-                            )
-                            tail_k_cache = torch.zeros(
-                                [
-                                    tail_blocks,
-                                    current_kv_cache_spec.block_size,
-                                    current_kv_cache_spec.num_kv_heads,
-                                    kv_lora_rank,
-                                ],
-                                dtype=current_kv_cache_spec.dtype,
-                                device=self.device,
-                            )
-                            tail_v_cache = torch.zeros(
-                                [
-                                    tail_blocks,
-                                    current_kv_cache_spec.block_size,
-                                    current_kv_cache_spec.num_kv_heads,
-                                    qk_rope_head_dim,
-                                ],
-                                dtype=current_kv_cache_spec.dtype,
-                                device=self.device,
-                            )
                             # SFA offload KV cache tuple layout:
                             # 0: k_cache       normal reused real-KV K/nope cache
                             # 1: v_cache       normal reused rope/PE cache
                             # 2: dsa_k_cache   indexer alias view over K storage
                             # 3: topk_buffer_k per-layer LRU resident K buffer for CPU decode offload
                             # 4: topk_buffer_v per-layer LRU resident rope/PE buffer for CPU decode offload
-                            # 5: tail_k_cache  per-request NPU tail K buffer, 2 blocks/request
-                            # 6: tail_v_cache  per-request NPU tail rope/PE buffer, 2 blocks/request
                             kv_caches[layer_name] = (
                                 k_cache,
                                 v_cache,
                                 dsa_k_cache,
                                 topk_buffer_k,
                                 topk_buffer_v,
-                                tail_k_cache,
-                                tail_v_cache,
                             )
                         else:
                             kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
@@ -5581,6 +5579,54 @@ class NPUModelRunner(GPUModelRunner):
             mgr.update_stream = self.update_stream
 
         return cuda_graph_size
+
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+    ):
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+
+        num_tokens = desc.num_tokens
+        if (
+            cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and desc.uniform
+            and desc.num_reqs is not None
+            and (enable_sp(self.vllm_config) or enable_sp_by_pass())
+        ):
+            # FULL_DECODE_ONLY capture keys are registered after sequence-parallel
+            # padding. Build dummy metadata from real decode tokens and let the
+            # dispatcher pad it back to desc.num_tokens.
+            num_tokens = desc.num_reqs * self.uniform_decode_query_len
+
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        for _ in range(num_warmups):
+            self._dummy_run(
+                num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=force_attention,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+                profile_seq_lens=profile_seq_lens,
+            )
+        self._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            is_graph_capturing=True,
+            profile_seq_lens=profile_seq_lens,
+        )
 
     def _prepare_multimodal_fields(self):
         """

@@ -125,6 +125,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
             actual_seq_lengths_q=[2, 3, 4],
             positions=torch.arange(9),
             attn_state=AscendAttentionState.ChunkedPrefill,
+            all_kv_in_cpu=True,
             max_seq_len=6,
         )
 
@@ -132,6 +133,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.assertTrue(torch.equal(unpadded_metadata._seq_lens_cpu, internal_seq_lens_cpu[:2]))
         self.assertIsNone(unpadded_metadata.seq_lens_cpu)
+        self.assertTrue(unpadded_metadata.all_kv_in_cpu)
 
     @patch("vllm_ascend.attention.attention_v1.AscendMetadata")
     def test_build(self, mock_ascend_metadata):
