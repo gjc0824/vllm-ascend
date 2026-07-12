@@ -30,6 +30,22 @@ def _num_covered_blocks(num_tokens: int, block_size: int) -> int:
     return (num_tokens + block_size - 1) // block_size
 
 
+def _num_required_cpu_blocks(
+    num_tokens_after_step: int,
+    block_size: int,
+    decode_width: int,
+    is_decode_step: bool,
+) -> int:
+    # The draft model writes KV for the next speculative tokens immediately
+    # after target verification. Mirror vLLM's HBM lookahead allocation so an
+    # all-accepted step can cross a block boundary without hitting CPU block 0.
+    lookahead_tokens = max(decode_width - 1, 0) if is_decode_step else 0
+    return _num_covered_blocks(
+        num_tokens_after_step + lookahead_tokens,
+        block_size,
+    )
+
+
 def _is_sfa_indexer_group(kv_cache_group) -> bool:
     return bool(kv_cache_group.layer_names) and all(
         ".indexer.k_cache" in layer_name
@@ -219,7 +235,16 @@ class SFAKVOffloadlScheduler:
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = _num_covered_blocks(num_tokens_after_step, self._block_size) # pcp/dcp not considered now
+                is_decode_step = (
+                    0 < num_new_tokens <= self.decode_width
+                    and num_computed_token >= request.num_prompt_tokens
+                )
+                num_blocks_after_step = _num_required_cpu_blocks(
+                    num_tokens_after_step,
+                    self._block_size,
+                    self.decode_width,
+                    is_decode_step,
+                )
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
                 target_num_blocks = min(
                     num_blocks_after_step,
@@ -228,10 +253,6 @@ class SFAKVOffloadlScheduler:
                 num_new_cpu_blocks = max(target_num_blocks - num_offloaded_blocks, 0)
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_cpu_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
-                is_decode_step = (
-                    0 < num_new_tokens <= self.decode_width
-                    and num_computed_token >= request.num_prompt_tokens
-                )
                 if is_decode_step:
                     # In the buffer hybrid layout, indexer cache aliases the
                     # real-K storage. A decode-step whole-block HBM refresh can
