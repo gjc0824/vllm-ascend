@@ -110,11 +110,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import (
-    AscendCommonAttentionMetadata,
-    set_connector_req_ids,
-    using_paged_attention,
-)
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, set_connector_req_ids, using_paged_attention
 
 # yapf conflicts with isort for this block
 # yapf: disable

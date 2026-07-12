@@ -1929,6 +1929,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 device,
                 non_blocking=True,
             ),
+            all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
             max_seq_len=0,
         )
         return spec_common_attn_metadata, token_indices
@@ -2041,6 +2042,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
             cpu_update_tokens_per_req=cpu_update_tokens_per_req,
+            all_kv_in_cpu=getattr(common_attn_metadata, "all_kv_in_cpu", False),
             max_seq_len=0,
         )
 

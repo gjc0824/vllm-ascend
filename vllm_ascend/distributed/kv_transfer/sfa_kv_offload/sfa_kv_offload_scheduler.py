@@ -23,9 +23,7 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
 
 
 def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: str) -> int:
-    num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-    draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
-    return max(num_scheduled_tokens - len(draft_tokens), 0)
+    return scheduler_output.num_scheduled_tokens[req_id]
 
 
 def _num_covered_blocks(num_tokens: int, block_size: int) -> int:
@@ -221,7 +219,7 @@ class SFAKVOffloadlScheduler:
                     )
                 num_computed_token = cached_reqs.num_computed_tokens[i]
                 num_tokens_after_step = num_computed_token + num_new_tokens
-                num_blocks_after_step = _num_covered_blocks(num_tokens_after_step, self._block_size)
+                num_blocks_after_step = _num_covered_blocks(num_tokens_after_step, self._block_size) # pcp/dcp not considered now
                 num_offloaded_blocks = len(request_tracker.allocated_block_ids_cpu)
                 target_num_blocks = min(
                     num_blocks_after_step,

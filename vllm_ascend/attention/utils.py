@@ -239,6 +239,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
     cpu_update_tokens_per_req: torch.Tensor | None = None
+    all_kv_in_cpu: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -302,6 +303,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             else None,
             tokens_per_req=_slice_reqs(self.tokens_per_req),
             cpu_update_tokens_per_req=_slice_reqs(self.cpu_update_tokens_per_req),
+            all_kv_in_cpu=self.all_kv_in_cpu,
         )
 
 
