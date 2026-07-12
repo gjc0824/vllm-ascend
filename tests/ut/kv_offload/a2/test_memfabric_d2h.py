@@ -183,6 +183,36 @@ def test_sparse_copy_d2h_preserves_current_stream_order(npu_device: torch.device
     assert torch.equal(destination, expected)
 
 
+def test_sparse_copy_immediate_d2h_h2d_roundtrip(npu_device: torch.device) -> None:
+    source = torch.arange(64, dtype=torch.int32, device=npu_device)
+    destination = torch.full_like(source, -1)
+    host_buffer = offload.empty(
+        [source.numel()],
+        dtype=source.dtype,
+        pin_memory=True,
+    )
+    host_buffer.zero_()
+    num_bytes = source.numel() * source.element_size()
+
+    assert offload.sparse_copy(
+        torch.tensor([source.data_ptr()], dtype=torch.int64, device=npu_device),
+        torch.tensor([host_buffer.data_ptr()], dtype=torch.int64, device=npu_device),
+        torch.tensor([num_bytes], dtype=torch.int32, device=npu_device),
+        torch.tensor([1], dtype=torch.int32, device=npu_device),
+        npu_device,
+    ) == 0
+    assert offload.sparse_copy(
+        torch.tensor([host_buffer.data_ptr()], dtype=torch.int64, device=npu_device),
+        torch.tensor([destination.data_ptr()], dtype=torch.int64, device=npu_device),
+        torch.tensor([num_bytes], dtype=torch.int32, device=npu_device),
+        torch.tensor([1], dtype=torch.int32, device=npu_device),
+        npu_device,
+    ) == 0
+    torch.npu.synchronize()
+
+    assert torch.equal(destination, source)
+
+
 def test_sfa_d2h_descriptor_builder(npu_device: torch.device) -> None:
     from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
         SFAKVOffloadWorker,
@@ -269,6 +299,42 @@ def test_sfa_d2h_descriptor_builder(npu_device: torch.device) -> None:
     torch.npu.synchronize()
     assert worker.d2h_size_npu.cpu().item() == 2
     assert worker.d2h_lengths_npu[:2].cpu().tolist() == [0, 0]
+
+
+def test_sfa_lru_invalidation_after_cpu_kv_overwrite() -> None:
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (
+        SFAKVOffloadWorker,
+    )
+
+    worker = SFAKVOffloadWorker.__new__(SFAKVOffloadWorker)
+    worker.lru_last_req_ids_cpu_list = [torch.tensor([11, 11, 22])]
+    worker.lru_slot_to_token_cpu_list = [
+        torch.tensor(
+            [
+                [1, 5, 9, -1],
+                [5, 7, 8, -1],
+                [5, 6, 7, -1],
+            ],
+            dtype=torch.int32,
+        )
+    ]
+    worker.sfa_kv_offload_debug = False
+    worker.tp_rank = 0
+
+    invalidated = worker._invalidate_overwritten_lru_tokens(
+        layer_id=0,
+        num_update_tokens=2,
+        update_req_ids_cpu=torch.tensor([11, 22]),
+        update_positions_cpu=torch.tensor([5, 6]),
+        update_valid_cpu=torch.tensor([True, False]),
+    )
+
+    assert invalidated == 2
+    assert worker.lru_slot_to_token_cpu_list[0].tolist() == [
+        [1, -1, 9, -1],
+        [-1, 7, 8, -1],
+        [5, 6, 7, -1],
+    ]
 
 
 def test_sparse_copy_d2h_zero_lengths_and_empty_batch(npu_device: torch.device) -> None:

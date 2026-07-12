@@ -165,6 +165,14 @@ class SFAKVOffloadWorker:
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
         self.use_d2h_update = False
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        self.sfa_kv_offload_debug = bool(
+            additional_config.get("sfa_kv_offload_debug", False)
+        )
+        self.sfa_kv_offload_debug_max_logs = int(
+            additional_config.get("sfa_kv_offload_debug_max_logs", 32)
+        )
+        self._sfa_kv_offload_debug_logs = 0
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
@@ -507,6 +515,24 @@ class SFAKVOffloadWorker:
                 dtype=torch.int32,
                 device='npu',
             )
+            self.d2h_update_req_ids_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int64,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_update_positions_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int64,
+                device='cpu',
+                pin_memory=True,
+            )
+            self.d2h_update_valid_cpu = torch.empty(
+                [self.max_num_topk_rows],
+                dtype=torch.int32,
+                device='cpu',
+                pin_memory=True,
+            )
             if not hasattr(offload, "sparse_copy"):
                 raise RuntimeError(
                     "SFA KV offload requires memfabric offload.sparse_copy; "
@@ -783,6 +809,69 @@ class SFAKVOffloadWorker:
     def set_req_ids(self, req_ids: list):
         self.req_ids = req_ids
 
+    def _invalidate_overwritten_lru_tokens(
+        self,
+        layer_id: int,
+        num_update_tokens: int,
+        update_req_ids_cpu: torch.Tensor,
+        update_positions_cpu: torch.Tensor,
+        update_valid_cpu: torch.Tensor,
+    ) -> int:
+        """Invalidate resident copies whose logical CPU KV was overwritten."""
+        if num_update_tokens <= 0:
+            return 0
+
+        last_req_ids = self.lru_last_req_ids_cpu_list[layer_id]
+        slot_to_token = self.lru_slot_to_token_cpu_list[layer_id]
+        invalidated = 0
+        for update_idx in range(num_update_tokens):
+            if not bool(update_valid_cpu[update_idx]):
+                continue
+            req_id = update_req_ids_cpu[update_idx]
+            position = update_positions_cpu[update_idx]
+            matching_rows = torch.nonzero(
+                last_req_ids == req_id,
+                as_tuple=False,
+            ).flatten()
+            for row in matching_rows.tolist():
+                stale_slots = slot_to_token[row] == position
+                invalidated += int(stale_slots.sum().item())
+                slot_to_token[row].masked_fill_(stale_slots, -1)
+
+        if self.sfa_kv_offload_debug:
+            should_log_layer = layer_id in {
+                0,
+                self.num_target_layers,
+                self.num_layers - 1,
+            }
+        else:
+            should_log_layer = False
+        if (
+            should_log_layer
+            and self.tp_rank == 0
+            and self._sfa_kv_offload_debug_logs
+            < self.sfa_kv_offload_debug_max_logs
+        ):
+            valid_updates = update_valid_cpu[:num_update_tokens].to(torch.bool)
+            logger.warning(
+                "SFA_KV_OFFLOAD_INVALIDATE layer=%s layer_id=%s "
+                "updates=%s valid_updates=%s invalidated=%s "
+                "req_ids=%s positions=%s",
+                self.offload_layer_names[layer_id],
+                layer_id,
+                num_update_tokens,
+                int(valid_updates.sum().item()),
+                invalidated,
+                update_req_ids_cpu[:num_update_tokens][
+                    valid_updates
+                ].tolist(),
+                update_positions_cpu[:num_update_tokens][
+                    valid_updates
+                ].tolist(),
+            )
+            self._sfa_kv_offload_debug_logs += 1
+        return invalidated
+
     def prepare_lru_resident_and_load_cpu(self, args):
         (
             num_reqs,
@@ -817,7 +906,16 @@ class SFAKVOffloadWorker:
             num_tokens_buffer,
             layer_id,
             do_offload,
+            lru_invalidation_args,
         ) = args
+        if lru_invalidation_args is not None:
+            # Rejected speculative positions are overwritten in the CPU pool.
+            # Drop any resident copies keyed by the same logical position so
+            # compact treats them as misses and reloads the new KV payload.
+            self._invalidate_overwritten_lru_tokens(
+                layer_id,
+                *lru_invalidation_args,
+            )
         cpu_sparse_attn.lru_resident_compact(
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,
@@ -925,6 +1023,7 @@ class SFAKVOffloadWorker:
         req_ids_cpu = self.lru_req_ids_cpu[:num_tokens]
         req_ids_cpu.copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
         d2h_ready = False
+        lru_invalidation_args = None
         if (
             key_cache is not None
             and value_cache is not None
@@ -989,6 +1088,11 @@ class SFAKVOffloadWorker:
                         if token_to_req_npu is not None
                         else None
                     )
+                    update_req_ids_npu = torch.index_select(
+                        req_ids_npu,
+                        0,
+                        update_indices,
+                    )
                 else:
                     update_slots_npu = slot_mapping[:num_update_tokens]
                     update_positions_npu = positions[:num_update_tokens]
@@ -997,6 +1101,7 @@ class SFAKVOffloadWorker:
                         if token_to_req_npu is not None
                         else None
                     )
+                    update_req_ids_npu = req_ids_npu[:num_update_tokens]
                 self._build_d2h_descriptors(
                     layer_id,
                     num_reqs,
@@ -1005,6 +1110,35 @@ class SFAKVOffloadWorker:
                     update_slots_npu,
                     update_positions_npu,
                     update_token_to_req_npu,
+                )
+                update_req_ids_cpu = self.d2h_update_req_ids_cpu[
+                    :num_update_tokens
+                ]
+                update_positions_cpu = self.d2h_update_positions_cpu[
+                    :num_update_tokens
+                ]
+                update_valid_cpu = self.d2h_update_valid_cpu[
+                    :num_update_tokens
+                ]
+                update_req_ids_cpu.copy_(
+                    update_req_ids_npu,
+                    non_blocking=True,
+                )
+                update_positions_cpu.copy_(
+                    update_positions_npu,
+                    non_blocking=True,
+                )
+                update_valid_cpu.copy_(
+                    (self.d2h_lengths_npu[:num_update_tokens] > 0).to(
+                        torch.int32
+                    ),
+                    non_blocking=True,
+                )
+                lru_invalidation_args = (
+                    num_update_tokens,
+                    update_req_ids_cpu,
+                    update_positions_cpu,
+                    update_valid_cpu,
                 )
 
         args = (
@@ -1040,6 +1174,7 @@ class SFAKVOffloadWorker:
             self.num_tokens_buffer_cpu,
             layer_id,
             capturing,
+            lru_invalidation_args,
         )
 
         if self.use_d2h_update:
