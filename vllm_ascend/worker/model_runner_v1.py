@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from zlib import adler32
 
 import numpy as np
 import torch
@@ -106,6 +107,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -600,11 +602,19 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
 
-        import os # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done
-        self.kv_offload_colocate_debug = bool(int(os.getenv('KV_OFFLOAD_COLOCATE_DEBUG', '0')))
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done
+        self.kv_offload_colocate_debug = envs_ascend.KV_OFFLOAD_COLOCATE_DEBUG
         self.kv_offload_decode_config = self.ascend_config.kv_offload_decode_config
         self.kv_offload_decode_enabled = self.kv_offload_decode_config.enabled
+        self.kv_offload_decode_manager = None
         self.tp_rank = get_tensor_model_parallel_rank()
+
+        # Per-request metadata consumed by the KV offload decode resident LRU.
+        self._offload_req_ids_tensor = None
+        self._offload_token_to_req = None
+        if self.kv_offload_decode_enabled:
+            self._offload_req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+            self._offload_token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
 
     @property
     def use_cp(self) -> bool:
@@ -2034,6 +2044,10 @@ class NPUModelRunner(GPUModelRunner):
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        if self.kv_offload_decode_enabled and self.kv_offload_decode_manager is not None:
+            # Finish any prefill-only D2H commit before scheduler block reuse.
+            self.kv_offload_decode_manager.prepare_scheduler_step()
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -3064,6 +3078,49 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
         )
 
+    def _update_kv_offload_request_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+    ) -> None:
+        """Populate per-request identity tensors for the KV offload decode LRU.
+
+        Request ids are adler32 hashes of the scheduler request id; rows are
+        reset whenever the occupying request changes. Ported from vllm-ascend
+        ``_update_sfa_request_metadata``.
+        """
+        if self._offload_req_ids_tensor is None or self._offload_token_to_req is None:
+            return
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        self._offload_req_ids_tensor.np[:num_reqs_padded].fill(0)
+        effective_num_reqs = min(num_reqs, len(req_ids))
+        req_id_values = np.asarray(
+            [
+                adler32(req_id.encode("utf-8"))
+                if isinstance(req_id, str)
+                else row + 1
+                for row, req_id in enumerate(req_ids[:effective_num_reqs])
+            ],
+            dtype=np.int64,
+        )
+        self._offload_req_ids_tensor.np[:effective_num_reqs] = req_id_values
+        self._offload_req_ids_tensor.copy_to_gpu(num_reqs_padded)
+
+        query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs + 1]
+        query_lens = np.diff(query_start_loc_cpu.numpy()).astype(np.int32, copy=False)
+        token_to_req = np.repeat(np.arange(num_reqs, dtype=np.int32), query_lens)
+        if token_to_req.shape[0] < num_tokens:
+            raise RuntimeError(
+                "KV offload token_to_req metadata is shorter than the scheduled token batch: "
+                f"metadata={token_to_req.shape[0]}, tokens={num_tokens}"
+            )
+        self._offload_token_to_req.np[:num_tokens] = token_to_req[:num_tokens]
+        if num_tokens_padded > num_tokens:
+            self._offload_token_to_req.np[num_tokens:num_tokens_padded].fill(0)
+        self._offload_token_to_req.copy_to_gpu(num_tokens_padded)
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -3087,6 +3144,7 @@ class NPUModelRunner(GPUModelRunner):
             return {}, None
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
+        self._update_kv_offload_request_metadata(num_tokens, num_reqs, num_tokens_padded, num_reqs_padded)
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
@@ -3224,6 +3282,16 @@ class NPUModelRunner(GPUModelRunner):
             group_len = self.group_len.gpu[:num_reqs_padded],
             group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
             group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
+            req_ids_tensor=(
+                self._offload_req_ids_tensor.gpu[:num_reqs_padded]
+                if self._offload_req_ids_tensor is not None
+                else None
+            ),
+            token_to_req=(
+                self._offload_token_to_req.gpu[:num_tokens_padded]
+                if self._offload_token_to_req is not None
+                else None
+            ),
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

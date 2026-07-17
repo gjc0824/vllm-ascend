@@ -1,9 +1,9 @@
 import os
 
-from memfabric_hybrid import offload
 import numpy as np
 import torch
 import torch_npu
+from memfabric_hybrid import offload
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -30,7 +30,9 @@ OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 # c8 case, TODO
 
 
-_SUBSCRIBED_COMPUTE_STREAMS = set()
+_SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
+
+
 def get_subscribed_compute_streams() -> set:
     return _SUBSCRIBED_COMPUTE_STREAMS
 
@@ -107,6 +109,7 @@ class KVOffloadDecodeManager:
             device='cpu',
             pin_memory=True,
         )
+        self._pending_d2h: list[tuple[object, tuple[torch.Tensor, ...]]] = []
 
         self._build_cpp()
 
@@ -262,6 +265,50 @@ class KVOffloadDecodeManager:
         assert dtype == torch.bfloat16, "c8 not supported now"
         self.token_size_bytes_k = kv_head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = kv_head_num * head_dim_v * dtype.itemsize
+        if self.topk_buffer_size % self.block_size != 0:
+            raise ValueError(
+                "KV offload decode topk_buffer_size must be divisible by "
+                f"block_size, got {self.topk_buffer_size} and {self.block_size}"
+            )
+
+        # D2H uses a separate descriptor set from the shared H2D buffers below.
+        # Both prefill and decode can produce up to max_num_tokens rows.
+        d2h_descriptor_rows = self.max_num_tokens * 2
+        device = self.topk_buffers_k[0].device
+        self.d2h_src_ptrs_npu = torch.empty(
+            d2h_descriptor_rows, dtype=torch.int64, device=device
+        )
+        self.d2h_dst_ptrs_npu = torch.empty(
+            d2h_descriptor_rows, dtype=torch.int64, device=device
+        )
+        self.d2h_lengths_npu = torch.empty(
+            d2h_descriptor_rows, dtype=torch.int32, device=device
+        )
+        self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
+        self.d2h_token_indices_npu = torch.arange(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+
+        pages_per_row = self.topk_buffer_size // self.block_size
+        self.current_slots_npu = torch.empty(
+            (self.max_num_topk_rows, self.topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.resident_block_table_npu = torch.arange(
+            self.max_num_topk_rows * pages_per_row,
+            dtype=torch.int32,
+            device=device,
+        ).view(self.max_num_topk_rows, pages_per_row)
+        self.resident_query_lens_npu = torch.arange(
+            1, self.max_num_topk_rows + 1, dtype=torch.int32, device=device
+        )
+        self.resident_seq_lens_npu = torch.full(
+            (self.max_num_topk_rows,),
+            self.topk_buffer_size,
+            dtype=torch.int32,
+            device=device,
+        )
 
         # sparse_copy related addrs and buffers
         self.addr_k_bases: list[int] = [t.data_ptr() for t in self.topk_buffers_k]
@@ -421,20 +468,113 @@ class KVOffloadDecodeManager:
     def offload_new_kv(
         self,
         slot_mapping: torch.Tensor,
-        k_cache_cpu: torch.Tensor,
-        v_cache_cpu: torch.Tensor,
-        k_cache_npu: torch.Tensor, # for prefill, cache_npu[slot] -> cache_cpu[slot]
-        v_cache_npu: torch.Tensor, # for prefill, cache_npu[slot] -> cache_cpu[slot]
-        k: torch.Tensor, # for decode, k/v -> cache_cpu[slot]
-        v: torch.Tensor, # for decode, k/v -> cache_cpu[slot]
+        k_cache_cpu: torch.Tensor | None,
+        v_cache_cpu: torch.Tensor | None,
+        k_cache_npu: torch.Tensor | None,  # prefill: cache_npu[slot] -> cache_cpu[slot]
+        v_cache_npu: torch.Tensor | None,  # prefill: cache_npu[slot] -> cache_cpu[slot]
+        k: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
+        v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         has_prefill: bool = False,
-    ):
+        capturing: bool = False,
+    ) -> None:
         # TODO remove prefill related part after PD disaggregate is ready.
-        if has_prefill:
-            # simple cache_cpu[slot] = cache_npu[slot].to('cpu')
+        if self.tp_rank != 0:
+            # Main K/V is replicated across TP ranks; only TP0 owns and writes
+            # the shared CPU pool whose GVA was broadcast during registration.
             return
-        # normal case for decode, offload.sparse_copy
-        pass
+        if k_cache_cpu is None or v_cache_cpu is None:
+            raise RuntimeError("KV offload decode TP0 CPU cache is not registered")
+
+        if has_prefill:
+            if k_cache_npu is None or v_cache_npu is None:
+                raise ValueError("prefill offload requires NPU paged K/V caches")
+            device = k_cache_npu.device
+        else:
+            if k is None or v is None:
+                raise ValueError("decode offload requires current-token K/V")
+            device = k.device
+
+        slots = slot_mapping.reshape(-1).to(device=device, dtype=torch.int64)
+        token_count = slots.numel()
+        if token_count > self.max_num_tokens:
+            raise ValueError(
+                "KV offload decode rows exceed D2H descriptor capacity, "
+                f"got {token_count}, capacity={self.max_num_tokens}"
+            )
+
+        num_k_slots = (
+            k_cache_cpu.numel() * k_cache_cpu.element_size() // self.token_size_bytes_k
+        )
+        num_v_slots = (
+            v_cache_cpu.numel() * v_cache_cpu.element_size() // self.token_size_bytes_v
+        )
+        if num_k_slots != num_v_slots or num_k_slots <= 0:
+            raise ValueError(
+                "KV offload decode CPU K/V pools have incompatible token capacities: "
+                f"k={num_k_slots}, v={num_v_slots}"
+            )
+        valid = (slots >= 0) & (slots < num_k_slots)
+        safe_slots = slots.clamp(min=0, max=num_k_slots - 1)
+
+        if has_prefill:
+            assert k_cache_npu is not None and v_cache_npu is not None
+            src_k = int(k_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_k
+            src_v = int(v_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_v
+            keep_sources = (k_cache_npu, v_cache_npu)
+        else:
+            assert k is not None and v is not None
+            k_rows = k.reshape(-1, self.token_size_bytes_k // k.element_size())
+            v_rows = v.reshape(-1, self.token_size_bytes_v // v.element_size())
+            if k_rows.shape[0] != token_count or v_rows.shape[0] != token_count:
+                raise ValueError("decode K/V row counts must match slot_mapping")
+            if not k_rows.is_contiguous():
+                k_rows = k_rows.contiguous()
+            if not v_rows.is_contiguous():
+                v_rows = v_rows.contiguous()
+            token_indices = self.d2h_token_indices_npu[:token_count]
+            src_k = int(k_rows.data_ptr()) + token_indices * self.token_size_bytes_k
+            src_v = int(v_rows.data_ptr()) + token_indices * self.token_size_bytes_v
+            keep_sources = (k_rows, v_rows)
+
+        dst_k = int(k_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_k
+        dst_v = int(v_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_v
+        self.d2h_src_ptrs_npu[:token_count].copy_(src_k)
+        self.d2h_src_ptrs_npu[token_count : 2 * token_count].copy_(src_v)
+        self.d2h_dst_ptrs_npu[:token_count].copy_(dst_k)
+        self.d2h_dst_ptrs_npu[token_count : 2 * token_count].copy_(dst_v)
+        self.d2h_lengths_npu[:token_count].fill_(self.token_size_bytes_k)
+        self.d2h_lengths_npu[token_count : 2 * token_count].fill_(
+            self.token_size_bytes_v
+        )
+        self.d2h_lengths_npu[:token_count].masked_fill_(~valid, 0)
+        self.d2h_lengths_npu[token_count : 2 * token_count].masked_fill_(~valid, 0)
+        self.d2h_size_npu.fill_(2 * token_count)
+
+        result = offload.sparse_copy(
+            self.d2h_src_ptrs_npu,
+            self.d2h_dst_ptrs_npu,
+            self.d2h_lengths_npu,
+            self.d2h_size_npu,
+            device,
+        )
+        if result not in (None, 0):
+            raise RuntimeError(f"memfabric D2H sparse_copy failed with result={result}")
+        if capturing:
+            # Capture records the sparse copy in stream order. A Python event
+            # here would describe capture time rather than each graph replay.
+            return
+        done_event = torch_npu.npu.Event()
+        done_event.record(torch_npu.npu.current_stream())
+        self._pending_d2h.append((done_event, keep_sources))
+
+    def _wait_for_pending_d2h(self) -> None:
+        for event, _ in self._pending_d2h:
+            event.synchronize()
+        self._pending_d2h.clear()
+
+    def prepare_scheduler_step(self) -> None:
+        """Finish prefill-only commits before scheduler block reuse."""
+        self._wait_for_pending_d2h()
 
     def onload_topk_kv(
         self,
@@ -455,6 +595,8 @@ class KVOffloadDecodeManager:
                 "KV offload decode topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
+        if not capturing:
+            self._wait_for_pending_d2h()
         if token_to_req_npu is not None:
             # spec decode case, expand block_table to actual num decode tokens.
             token_to_req_cpu = self.lru_token_to_req_cpu[:num_tokens]
@@ -564,7 +706,12 @@ class KVOffloadDecodeManager:
             addr_buffer,
             size_buffer,
             num_tokens_buffer,
+            layer_id,
         ) = args
+        if self.tp_size > 1:
+            # In graph mode this callback is ordered after TP0's captured D2H;
+            # in eager mode onload_topk_kv waited for TP0's event above.
+            self.tp_group.barrier()
         self.kv_offload_decode_cpp.lru_resident_compact(
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,

@@ -627,8 +627,11 @@ class BaseDeviceAdaptor:
         attn_metadata,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor | None = None,
+        sparse_indices_discrete: bool = False,
     ) -> torch.Tensor:
-        block_table = attn_metadata.block_table
+        if block_table is None:
+            block_table = attn_metadata.block_table
         kv = kv_cache[0]
 
         # The kv-quant sparse attention op only accepts packed quantized KV.
@@ -669,6 +672,7 @@ class BaseDeviceAdaptor:
             layout_kv="PA_BSND",
             sparse_mode=3,
             attention_mode=2,
+            sparse_indices_discrete=sparse_indices_discrete,
         )
         return attn_output
 

@@ -592,8 +592,8 @@ class NPUWorker(WorkerBase):
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
         kv_offload_decode_config = get_ascend_config().kv_offload_decode_config
-        import os # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done
-        kv_offload_colocate_debug = bool(int(os.getenv('KV_OFFLOAD_COLOCATE_DEBUG', '0')))
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done
+        kv_offload_colocate_debug = envs_ascend.KV_OFFLOAD_COLOCATE_DEBUG
         # KV_OFFLOAD_COLOCATE_DEBUG=1: for pd colocate debug, don't enlarge available_memory, still allocate npu kv_cache
         # KV_OFFLOAD_COLOCATE_DEBUG=0: future pd disaggregate usage, enlarge available_memory, no more npu kv_cache
         if kv_offload_decode_config.enabled and kv_offload_colocate_debug:

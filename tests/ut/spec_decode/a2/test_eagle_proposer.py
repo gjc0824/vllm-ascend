@@ -152,6 +152,8 @@ def test_prepare_inputs_padded_preserves_internal_seq_lens_cpu():
     proposer.runner.decode_token_per_req = 4
 
     internal_seq_lens_cpu = torch.tensor([7, 9], dtype=torch.int32)
+    req_ids_tensor = torch.tensor([11, 22], dtype=torch.int64)
+    token_to_req = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32)
     common_attn_metadata = AscendCommonAttentionMetadata(
         query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int32),
         query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
@@ -170,6 +172,8 @@ def test_prepare_inputs_padded_preserves_internal_seq_lens_cpu():
         attn_state=AscendAttentionState.SpecDecoding,
         decode_token_per_req=4,
         max_seq_len=9,
+        req_ids_tensor=req_ids_tensor,
+        token_to_req=token_to_req,
     )
     spec_decode_metadata = MagicMock()
     spec_decode_metadata.cu_num_draft_tokens = torch.tensor([2, 3], dtype=torch.int32)
@@ -184,6 +188,8 @@ def test_prepare_inputs_padded_preserves_internal_seq_lens_cpu():
 
     assert spec_common_attn_metadata._seq_lens_cpu is internal_seq_lens_cpu
     assert spec_common_attn_metadata.seq_lens_cpu is None
+    assert spec_common_attn_metadata.req_ids_tensor is req_ids_tensor
+    assert spec_common_attn_metadata.token_to_req is token_to_req
 
 
 class TestSlidingWindowAdapter:
