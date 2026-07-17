@@ -596,8 +596,9 @@ class NPUWorker(WorkerBase):
         kv_offload_colocate_debug = bool(int(os.getenv('KV_OFFLOAD_COLOCATE_DEBUG', '0')))
         # KV_OFFLOAD_COLOCATE_DEBUG=1: for pd colocate debug, don't enlarge available_memory, still allocate npu kv_cache
         # KV_OFFLOAD_COLOCATE_DEBUG=0: future pd disaggregate usage, enlarge available_memory, no more npu kv_cache
-        if kv_offload_colocate_debug:
-            if self.available_kv_cache_memory_bytes  > kv_offload_decode_config.dram_size_per_dp_GB * 1024 * 1024 * 1024:
+        if kv_offload_decode_config.enabled and kv_offload_colocate_debug:
+            # TODO also remove this branch with KV_OFFLOAD_COLOCATE_DEBUG
+            if self.available_kv_cache_memory_bytes > kv_offload_decode_config.dram_size_per_dp_GB * 1024 * 1024 * 1024:
                 raise ValueError(
                     f"Needed dram size ({GiB(self.available_kv_cache_memory_bytes)} GB) is larger than "
                     f"user specified dram size ({kv_offload_decode_config.dram_size_per_dp_GB} GB). "
