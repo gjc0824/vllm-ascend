@@ -110,6 +110,8 @@ class KVOffloadDecodeManager:
             pin_memory=True,
         )
         self._pending_d2h: list[tuple[object, tuple[torch.Tensor, ...]]] = []
+        self._graph_subscribed_streams: set[object] = set()
+        self._npu_runtime = torch_npu.npu
 
         self._build_cpp()
 
@@ -572,9 +574,29 @@ class KVOffloadDecodeManager:
             event.synchronize()
         self._pending_d2h.clear()
 
+    def _drain_graph_host_callbacks(self) -> None:
+        """Wait before resetting CPU state used by captured host callbacks."""
+        for stream in getattr(self, "_graph_subscribed_streams", ()):
+            event = self._npu_runtime.Event()
+            event.record(stream)
+            event.synchronize()
+
+    def reset_resident_cache(self) -> None:
+        """Invalidate resident rows before draft-token slots can be rewritten."""
+        if not hasattr(self, "lru_last_req_ids_cpu_list"):
+            return
+        self.lru_req_ids_cpu.fill_(-1)
+        self.lru_current_slots_cpu.fill_(-1)
+        for last_req_ids in self.lru_last_req_ids_cpu_list:
+            # The C++ LRU resets the corresponding slot map and order when the
+            # next callback observes this request-id mismatch.
+            last_req_ids.fill_(-1)
+
     def prepare_scheduler_step(self) -> None:
-        """Finish prefill-only commits before scheduler block reuse."""
+        """Drain transfers and invalidate resident K/V before block reuse."""
         self._wait_for_pending_d2h()
+        self._drain_graph_host_callbacks()
+        self.reset_resident_cache()
 
     def onload_topk_kv(
         self,
@@ -653,6 +675,7 @@ class KVOffloadDecodeManager:
             if current_compute_stream not in subscribed_compute_streams:
                 torch_npu.npu._subscribe_report(current_compute_stream)
                 subscribed_compute_streams.add(current_compute_stream)
+            self._graph_subscribed_streams.add(current_compute_stream)
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
                 self._onload_topk_kv_cpu,

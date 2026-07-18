@@ -168,11 +168,19 @@ def test_decode_rows_must_match_slot_mapping(monkeypatch):
         )
 
 
-def test_scheduler_step_waits_for_eager_d2h(monkeypatch):
+def test_scheduler_step_waits_for_eager_d2h_and_invalidates_lru(monkeypatch):
     manager = _make_d2h_manager()
     k_cache_cpu, v_cache_cpu = _cpu_caches()
     _capture_sparse_copy(monkeypatch)
     events = []
+    manager._graph_subscribed_streams = set()
+    manager._npu_runtime = manager_module.torch_npu.npu
+    manager.lru_req_ids_cpu = torch.tensor([11, 22], dtype=torch.int64)
+    manager.lru_current_slots_cpu = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    manager.lru_last_req_ids_cpu_list = [
+        torch.tensor([11, 22], dtype=torch.int64),
+        torch.tensor([11, 22], dtype=torch.int64),
+    ]
 
     class FakeEvent:
         def record(self, stream):
@@ -199,6 +207,32 @@ def test_scheduler_step_waits_for_eager_d2h(monkeypatch):
 
     assert events == [("record", "stream"), ("synchronize", None)]
     assert manager._pending_d2h == []
+    assert manager.lru_req_ids_cpu.tolist() == [-1, -1]
+    assert manager.lru_current_slots_cpu.tolist() == [[-1, -1], [-1, -1]]
+    assert all(state.tolist() == [-1, -1] for state in manager.lru_last_req_ids_cpu_list)
+
+
+def test_scheduler_step_drains_graph_stream_before_lru_reset():
+    manager = _make_d2h_manager()
+    events = []
+
+    class FakeEvent:
+        def record(self, stream):
+            events.append(("record", stream))
+
+        def synchronize(self):
+            events.append(("synchronize", None))
+
+    manager._npu_runtime = SimpleNamespace(Event=FakeEvent)
+    manager._graph_subscribed_streams = {"graph-stream"}
+    manager.lru_req_ids_cpu = torch.tensor([33], dtype=torch.int64)
+    manager.lru_current_slots_cpu = torch.tensor([[0, 1]], dtype=torch.int32)
+    manager.lru_last_req_ids_cpu_list = [torch.tensor([33], dtype=torch.int64)]
+
+    manager.prepare_scheduler_step()
+
+    assert events == [("record", "graph-stream"), ("synchronize", None)]
+    assert manager.lru_last_req_ids_cpu_list[0].tolist() == [-1]
 
 
 def test_onload_cpu_callback_keeps_colleague_argument_contract():

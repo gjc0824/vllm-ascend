@@ -2045,7 +2045,8 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         if self.kv_offload_decode_enabled and self.kv_offload_decode_manager is not None:
-            # Finish any prefill-only D2H commit before scheduler block reuse.
+            # Draft positions can be overwritten after MTP rejection, so drain
+            # pending copies and invalidate resident rows before state updates.
             self.kv_offload_decode_manager.prepare_scheduler_step()
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
