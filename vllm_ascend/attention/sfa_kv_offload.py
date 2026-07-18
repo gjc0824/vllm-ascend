@@ -341,6 +341,19 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             0,
             row_to_req,
         )
+        decode_cum_query_lens = actual_seq_lengths_query[:num_decodes]
+        decode_query_lens = decode_cum_query_lens.clone()
+        if num_decodes > 1:
+            decode_query_lens[1:] -= decode_cum_query_lens[:-1]
+        # Only the query span can be rewritten by the next MTP step.
+        stable_prefix_lens = (
+            actual_seq_lengths_key[:num_decodes] - decode_query_lens
+        ).clamp_min_(0)
+        decode_stable_prefix_lens = torch.index_select(
+            stable_prefix_lens,
+            0,
+            row_to_req,
+        )
         decode_topk = topk_indices[:num_decode_tokens]
         seq_len_thresholds = decode_seq_lens.view(
             decode_seq_lens.shape[0],
@@ -378,6 +391,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             decode_topk,
             resident_slot_indices,
             decode_req_ids,
+            decode_stable_prefix_lens,
             token_to_req,
             capturing=self._in_graph_runtime(),
         )
@@ -391,7 +405,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             resident_query_lens,
             resident_seq_lens,
             block_table=resident_block_table,
-            sparse_indices_discrete=True,
+            sparse_indices_discrete=False,
         )
         if num_prefills == 0:
             return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])

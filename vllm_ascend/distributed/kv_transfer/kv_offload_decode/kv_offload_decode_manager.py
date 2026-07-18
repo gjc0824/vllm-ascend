@@ -412,6 +412,12 @@ class KVOffloadDecodeManager:
             pin_memory=True,
         ) for _ in range(self.num_layers)]
         self.lru_req_ids_cpu = torch.empty([self.max_num_topk_rows], dtype=torch.int64, device='cpu', pin_memory=True)
+        self.lru_stable_prefix_lens_cpu = torch.empty(
+            [self.max_num_topk_rows],
+            dtype=torch.int32,
+            device='cpu',
+            pin_memory=True,
+        )
         self.lru_last_req_ids_cpu_list = [torch.full(
             [self.max_num_topk_rows],
             -1,
@@ -452,6 +458,7 @@ class KVOffloadDecodeManager:
         )
 
         self.lru_req_ids_ptr = self.lru_req_ids_cpu.data_ptr()
+        self.lru_stable_prefix_lens_ptr = self.lru_stable_prefix_lens_cpu.data_ptr()
         self.lru_last_req_ids_ptrs = [lru_last_req_ids_cpu.data_ptr() for lru_last_req_ids_cpu in self.lru_last_req_ids_cpu_list]
         self.lru_topk_indices_ptr = self.lru_topk_indices_cpu.data_ptr()
         self.lru_token_to_req_ptr = self.lru_token_to_req_cpu.data_ptr()
@@ -575,28 +582,16 @@ class KVOffloadDecodeManager:
         self._pending_d2h.clear()
 
     def _drain_graph_host_callbacks(self) -> None:
-        """Wait before resetting CPU state used by captured host callbacks."""
+        """Wait until captured host callbacks finish using CPU LRU state."""
         for stream in getattr(self, "_graph_subscribed_streams", ()):
             event = self._npu_runtime.Event()
             event.record(stream)
             event.synchronize()
 
-    def reset_resident_cache(self) -> None:
-        """Invalidate resident rows before draft-token slots can be rewritten."""
-        if not hasattr(self, "lru_last_req_ids_cpu_list"):
-            return
-        self.lru_req_ids_cpu.fill_(-1)
-        self.lru_current_slots_cpu.fill_(-1)
-        for last_req_ids in self.lru_last_req_ids_cpu_list:
-            # The C++ LRU resets the corresponding slot map and order when the
-            # next callback observes this request-id mismatch.
-            last_req_ids.fill_(-1)
-
     def prepare_scheduler_step(self) -> None:
-        """Drain transfers and invalidate resident K/V before block reuse."""
+        """Drain transfers and callbacks before scheduler block reuse."""
         self._wait_for_pending_d2h()
         self._drain_graph_host_callbacks()
-        self.reset_resident_cache()
 
     def onload_topk_kv(
         self,
@@ -607,6 +602,7 @@ class KVOffloadDecodeManager:
         topk_indices_npu: torch.Tensor,
         current_slots_npu: torch.Tensor,
         req_ids_npu: torch.Tensor,
+        stable_prefix_lens_npu: torch.Tensor,
         token_to_req_npu: torch.Tensor | None = None,
         capturing: bool = False,
     ):
@@ -634,6 +630,11 @@ class KVOffloadDecodeManager:
         topk_indices_cpu.copy_(topk_indices_npu[:num_tokens], non_blocking=capturing)
         req_ids_cpu = self.lru_req_ids_cpu[:num_tokens]
         req_ids_cpu.copy_(req_ids_npu[:num_tokens], non_blocking=capturing)
+        stable_prefix_lens_cpu = self.lru_stable_prefix_lens_cpu[:num_tokens]
+        stable_prefix_lens_cpu.copy_(
+            stable_prefix_lens_npu[:num_tokens],
+            non_blocking=capturing,
+        )
 
         args = (
             num_tokens,
@@ -643,6 +644,7 @@ class KVOffloadDecodeManager:
             self.lru_req_ids_ptr,
             self.lru_last_req_ids_ptrs[layer_id],
             self.lru_topk_indices_ptr,
+            self.lru_stable_prefix_lens_ptr,
             self.lru_slot_to_token_ptrs[layer_id],
             self.lru_slots_ptrs[layer_id],
             self.lru_current_slots_ptr,
@@ -706,6 +708,7 @@ class KVOffloadDecodeManager:
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,
             lru_topk_indices_ptr,
+            lru_stable_prefix_lens_ptr,
             lru_slot_to_token_ptr,
             lru_slots_ptr,
             lru_current_slots_ptr,
@@ -739,6 +742,7 @@ class KVOffloadDecodeManager:
             lru_req_ids_ptr,
             lru_last_req_ids_ptr,
             lru_topk_indices_ptr,
+            lru_stable_prefix_lens_ptr,
             lru_slot_to_token_ptr,
             lru_slots_ptr,
             lru_current_slots_ptr,

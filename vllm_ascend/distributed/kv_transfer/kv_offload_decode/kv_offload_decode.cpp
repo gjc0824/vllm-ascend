@@ -92,6 +92,7 @@ FORCE_INLINE void process_one_lru_resident_row(
     const int64_t* RESTRICT req_ids,
     int64_t* RESTRICT last_req_ids,
     const int32_t* RESTRICT topk_indices,
+    const int32_t* RESTRICT stable_prefix_lens,
     int32_t* RESTRICT slot_to_token,
     int32_t* RESTRICT lru_slots,
     int32_t* RESTRICT current_slots,
@@ -124,6 +125,11 @@ FORCE_INLINE void process_one_lru_resident_row(
         reset_lru_resident_row(slot_to_token_row, lru_slots_row, capacity);
         last_req_ids[row] = req_id;
     }
+    const int32_t stable_prefix_len = std::clamp(
+        stable_prefix_lens[row],
+        0,
+        max_token
+    );
 
     const int32_t base = next_lru_resident_epoch(token_mark, token_pos, epoch, max_token);
     for (int32_t pos = 0; pos < topk; ++pos) {
@@ -141,7 +147,13 @@ FORCE_INLINE void process_one_lru_resident_row(
         if (UNLIKELY(slot < 0 || slot >= capacity)) {
             continue;
         }
-        const int32_t token = slot_to_token_row[slot];
+        int32_t token = slot_to_token_row[slot];
+        // The speculative suffix may have been overwritten in the CPU KV pool.
+        if (LIKELY(is_valid_lru_resident_token(token, max_token)) &&
+            UNLIKELY(token >= stable_prefix_len)) {
+            slot_to_token_row[slot] = -1;
+            token = -1;
+        }
         if (LIKELY(is_valid_lru_resident_token(token, max_token)) && token_mark[token] == base) {
             const int32_t pos = token_pos[token];
             current_slots_row[pos] = slot;
@@ -194,6 +206,7 @@ HOT_FUNCTION void lru_resident_compact(
     uintptr_t req_ids_ptr,
     uintptr_t last_req_ids_ptr,
     uintptr_t topk_indices_ptr,
+    uintptr_t stable_prefix_lens_ptr,
     uintptr_t slot_to_token_ptr,
     uintptr_t lru_slots_ptr,
     uintptr_t current_slots_ptr,
@@ -219,6 +232,7 @@ HOT_FUNCTION void lru_resident_compact(
     auto* RESTRICT req_ids = reinterpret_cast<int64_t*>(req_ids_ptr);
     auto* RESTRICT last_req_ids = reinterpret_cast<int64_t*>(last_req_ids_ptr);
     auto* RESTRICT topk_indices = reinterpret_cast<int32_t*>(topk_indices_ptr);
+    auto* RESTRICT stable_prefix_lens = reinterpret_cast<int32_t*>(stable_prefix_lens_ptr);
     auto* RESTRICT slot_to_token = reinterpret_cast<int32_t*>(slot_to_token_ptr);
     auto* RESTRICT lru_slots = reinterpret_cast<int32_t*>(lru_slots_ptr);
     auto* RESTRICT current_slots = reinterpret_cast<int32_t*>(current_slots_ptr);
@@ -251,6 +265,7 @@ HOT_FUNCTION void lru_resident_compact(
                 req_ids,
                 last_req_ids,
                 topk_indices,
+                stable_prefix_lens,
                 slot_to_token,
                 lru_slots,
                 current_slots,
@@ -284,6 +299,7 @@ HOT_FUNCTION void lru_resident_compact(
                 req_ids,
                 last_req_ids,
                 topk_indices,
+                stable_prefix_lens,
                 slot_to_token,
                 lru_slots,
                 current_slots,

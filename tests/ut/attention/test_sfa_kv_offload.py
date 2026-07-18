@@ -332,6 +332,7 @@ def test_decode_onload_receives_full_graph_runtime_state(monkeypatch):
     )
 
     assert onload_calls[0][1]["capturing"] is True
+    assert onload_calls[0][0][7].tolist() == [0]
 
 
 def test_mtp_onload_expands_rows_and_masks_tail_topk(monkeypatch):
@@ -390,7 +391,8 @@ def test_mtp_onload_expands_rows_and_masks_tail_topk(monkeypatch):
         metadata.seq_lens,
     )
 
-    assert torch.equal(onload_calls[0][0][7], metadata.token_to_req)
+    assert onload_calls[0][0][7].tolist() == [2, 3, 3]
+    assert torch.equal(onload_calls[0][0][8], metadata.token_to_req)
     assert onload_calls[0][0][4].tolist() == [
         [0, 2, -1],
         [1, 4, -1],

@@ -168,7 +168,7 @@ def test_decode_rows_must_match_slot_mapping(monkeypatch):
         )
 
 
-def test_scheduler_step_waits_for_eager_d2h_and_invalidates_lru(monkeypatch):
+def test_scheduler_step_waits_for_eager_d2h_and_preserves_lru(monkeypatch):
     manager = _make_d2h_manager()
     k_cache_cpu, v_cache_cpu = _cpu_caches()
     _capture_sparse_copy(monkeypatch)
@@ -207,12 +207,12 @@ def test_scheduler_step_waits_for_eager_d2h_and_invalidates_lru(monkeypatch):
 
     assert events == [("record", "stream"), ("synchronize", None)]
     assert manager._pending_d2h == []
-    assert manager.lru_req_ids_cpu.tolist() == [-1, -1]
-    assert manager.lru_current_slots_cpu.tolist() == [[-1, -1], [-1, -1]]
-    assert all(state.tolist() == [-1, -1] for state in manager.lru_last_req_ids_cpu_list)
+    assert manager.lru_req_ids_cpu.tolist() == [11, 22]
+    assert manager.lru_current_slots_cpu.tolist() == [[0, 1], [1, 0]]
+    assert all(state.tolist() == [11, 22] for state in manager.lru_last_req_ids_cpu_list)
 
 
-def test_scheduler_step_drains_graph_stream_before_lru_reset():
+def test_scheduler_step_drains_graph_stream_and_preserves_lru():
     manager = _make_d2h_manager()
     events = []
 
@@ -232,7 +232,7 @@ def test_scheduler_step_drains_graph_stream_before_lru_reset():
     manager.prepare_scheduler_step()
 
     assert events == [("record", "graph-stream"), ("synchronize", None)]
-    assert manager.lru_last_req_ids_cpu_list[0].tolist() == [-1]
+    assert manager.lru_last_req_ids_cpu_list[0].tolist() == [33]
 
 
 def test_onload_cpu_callback_keeps_colleague_argument_contract():
@@ -262,7 +262,7 @@ def test_onload_cpu_callback_keeps_colleague_argument_contract():
         miss_count,
         miss_tokens,
         miss_slots,
-        *range(1, 10),
+        *range(1, 11),
         block_table,
         4,
         8,
@@ -282,6 +282,7 @@ def test_onload_cpu_callback_keeps_colleague_argument_contract():
     manager._onload_topk_kv_cpu(args)
 
     assert [name for name, _ in calls] == ["lru", "addr"]
+    assert calls[0][1][3] == 4
     assert manager.tp_group.barrier_calls == 1
 
 
