@@ -1,6 +1,7 @@
 from dataclasses import fields
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.config import CUDAGraphMode
 
@@ -21,14 +22,24 @@ from vllm_ascend.attention.utils import build_valid_topk_mask
 from vllm_ascend.device.device_op import DeviceOperator
 
 
+def _mock_offload_decode_config(monkeypatch, enabled: bool):
+    monkeypatch.setattr(
+        sfa_v1,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            kv_offload_decode_config=SimpleNamespace(enabled=enabled)
+        ),
+    )
+
+
 def test_backend_selection_returns_offload_classes(monkeypatch):
-    monkeypatch.setattr(sfa_v1, "kv_offload_decode_enabled", lambda: True)
+    _mock_offload_decode_config(monkeypatch, True)
     assert AscendSFABackend.get_impl_cls() is AscendSFAKVOffloadImpl
     assert AscendSFABackend.get_builder_cls() is AscendSFAKVOffloadMetadataBuilder
 
 
 def test_backend_selection_default_unchanged(monkeypatch):
-    monkeypatch.setattr(sfa_v1, "kv_offload_decode_enabled", lambda: False)
+    _mock_offload_decode_config(monkeypatch, False)
     monkeypatch.setattr(sfa_v1, "enable_cp", lambda: False)
     monkeypatch.setattr(sfa_v1, "enable_sfa_dcp_replicated_indexer", lambda: False)
     assert AscendSFABackend.get_impl_cls() is AscendSFAImpl
@@ -268,6 +279,155 @@ def test_decode_exec_kv_marks_full_graph_runtime(monkeypatch):
     )
 
     assert calls[0]["capturing"] is True
+
+
+def test_prefill_exec_kv_rejected_without_colocate_debug(monkeypatch):
+    # TODO remove with KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+    monkeypatch.delenv("KV_OFFLOAD_COLOCATE_DEBUG", raising=False)
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
+    impl._current_layer_name = None
+    metadata = SimpleNamespace(
+        attn_state=AscendAttentionState.PrefillNoCache,
+        num_decodes=0,
+        num_prefills=1,
+    )
+
+    with pytest.raises(RuntimeError, match="KV_OFFLOAD_COLOCATE_DEBUG"):
+        impl.exec_kv(
+            torch.empty(1, 6),
+            torch.empty(0),
+            torch.empty(0),
+            (None, None, None),
+            torch.tensor([3]),
+            metadata,
+        )
+
+
+def test_prefill_exec_kv_stages_npu_cache_with_colocate_debug(monkeypatch):
+    # TODO remove with KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+    monkeypatch.setenv("KV_OFFLOAD_COLOCATE_DEBUG", "1")
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
+    impl._current_layer_name = None
+    k_cache_npu = torch.empty(0)
+    v_cache_npu = torch.empty(0)
+    calls = []
+    manager = SimpleNamespace(
+        _get_offload_layer_id=lambda _name: 0,
+        tp_rank=0,
+        k_caches_cpu=[torch.empty(0)],
+        v_caches_cpu=[torch.empty(0)],
+        offload_new_kv=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        sfa_kv_offload,
+        "get_kv_offload_decode_manager",
+        lambda: manager,
+    )
+    staged = (torch.ones(1, 1, 1, 2), torch.ones(1, 1, 1, 4))
+    monkeypatch.setattr(AscendSFAImpl, "exec_kv", lambda *_args, **_kwargs: staged)
+    metadata = SimpleNamespace(
+        attn_state=AscendAttentionState.PrefillNoCache,
+        num_decodes=0,
+        num_prefills=1,
+    )
+    slots = torch.tensor([3])
+
+    result = impl.exec_kv(
+        torch.empty(1, 6),
+        torch.empty(0),
+        torch.empty(0),
+        (k_cache_npu, v_cache_npu),
+        slots,
+        metadata,
+    )
+
+    assert result is staged
+    assert len(calls) == 1
+    assert calls[0]["slot_mapping"] is slots
+    assert calls[0]["k_cache_npu"] is k_cache_npu
+    assert calls[0]["v_cache_npu"] is v_cache_npu
+    assert calls[0]["has_prefill"] is True
+
+
+def test_pure_prefill_attention_rejected_without_colocate_debug(monkeypatch):
+    # TODO remove with KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+    monkeypatch.delenv("KV_OFFLOAD_COLOCATE_DEBUG", raising=False)
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
+    impl._current_layer_name = None
+    manager = SimpleNamespace(_get_offload_layer_id=lambda _name: 0)
+    monkeypatch.setattr(
+        sfa_kv_offload,
+        "get_kv_offload_decode_manager",
+        lambda: manager,
+    )
+    metadata = SimpleNamespace(
+        num_decodes=0,
+        num_prefills=1,
+        num_decode_tokens=0,
+    )
+
+    with pytest.raises(RuntimeError, match="KV_OFFLOAD_COLOCATE_DEBUG"):
+        impl._execute_sparse_flash_attention_process(
+            torch.empty(1, 1, 4),
+            torch.empty(1, 1, 1, 2),
+            (None, None, None),
+            torch.zeros(1, 1, 3, dtype=torch.int32),
+            metadata,
+            torch.ones(1, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        )
+
+
+def test_mixed_batch_attention_rejected_without_colocate_debug(monkeypatch):
+    # TODO remove with KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+    monkeypatch.delenv("KV_OFFLOAD_COLOCATE_DEBUG", raising=False)
+    impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
+    impl.layer_name = "model.layers.0.self_attn.attn"
+    impl._current_layer_name = None
+    manager = SimpleNamespace(
+        _get_offload_layer_id=lambda _name: 0,
+        topk_buffer_size=4,
+        block_size=2,
+        topk_buffers_k=[torch.empty(4, 4, 1, 4)],
+        topk_buffers_v=[torch.empty(4, 4, 1, 2)],
+        current_slots_npu=torch.zeros(4, 3, dtype=torch.int32),
+        resident_block_table_npu=torch.arange(8, dtype=torch.int32).view(4, 2),
+        resident_query_lens_npu=torch.arange(1, 5, dtype=torch.int32),
+        resident_seq_lens_npu=torch.full((4,), 4, dtype=torch.int32),
+        onload_topk_kv=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        sfa_kv_offload,
+        "get_kv_offload_decode_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        DeviceOperator,
+        "execute_sparse_flash_attention_process",
+        staticmethod(lambda *_args, **_kwargs: torch.empty(1, 1, 4)),
+    )
+    metadata = SimpleNamespace(
+        num_decodes=1,
+        num_prefills=1,
+        num_decode_tokens=1,
+        block_table=torch.zeros(2, 1, dtype=torch.int32),
+        req_ids_tensor=torch.ones(1, dtype=torch.int64),
+        token_to_req=torch.zeros(1, dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match="KV_OFFLOAD_COLOCATE_DEBUG"):
+        impl._execute_sparse_flash_attention_process(
+            torch.empty(4, 1, 4),
+            torch.empty(4, 1, 1, 2),
+            (None, None, None),
+            torch.zeros(1, 1, 3, dtype=torch.int32),
+            metadata,
+            torch.tensor([1, 3], dtype=torch.int32),
+            torch.tensor([1, 3], dtype=torch.int32),
+        )
 
 
 def test_decode_onload_receives_full_graph_runtime_state(monkeypatch):

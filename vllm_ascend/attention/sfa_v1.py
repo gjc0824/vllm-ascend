@@ -31,7 +31,6 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     get_sfa_qsfa_packed_head_dim,
-    kv_offload_decode_enabled,
     maybe_save_kv_layer_to_connector,
     trans_rope_weight,
     transdata,
@@ -126,7 +125,7 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        if kv_offload_decode_enabled():
+        if get_ascend_config().kv_offload_decode_config.enabled:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadMetadataBuilder
 
             return AscendSFAKVOffloadMetadataBuilder
@@ -152,7 +151,7 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
-        if kv_offload_decode_enabled():
+        if get_ascend_config().kv_offload_decode_config.enabled:
             from vllm_ascend.attention.sfa_kv_offload import AscendSFAKVOffloadImpl
 
             return AscendSFAKVOffloadImpl
@@ -1454,7 +1453,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query,
         actual_seq_lengths_key,
         block_table=None,
-        sparse_indices_discrete=False,
     ):
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
@@ -1466,7 +1464,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             block_table=block_table,
-            sparse_indices_discrete=sparse_indices_discrete,
         )
 
     def _record_dcp_query_gather_context(
@@ -1506,6 +1503,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         # KV offload decode registers the main MLA cache as a 6-tuple
         # (k_npu, v_npu, k_cpu, v_cpu, topk_buffer_k, topk_buffer_v); the
         # attention kernels only consume the leading NPU pair.
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+        # the leading NPU pair only exists for colocate debug (prefill
+        # staging); this truncation follows the colocate tuple layout.
         if len(main_cache) == 6:
             main_cache = (main_cache[0], main_cache[1])
 

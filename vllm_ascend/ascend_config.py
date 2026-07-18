@@ -905,16 +905,6 @@ class KVOffloadDecodeConfig:
                 "kv_offload_decode_config.topk_buffer_size must be >= topk, "
                 f"got topk_buffer_size={self.topk_buffer_size}, topk={self.topk}"
             )
-        if not vllm_config.model_config.enforce_eager:
-            from vllm.config import CUDAGraphMode
-
-            cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
-            if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
-                raise ValueError(
-                    "KV Offload Decode graph execution only supports "
-                    "cudagraph_mode=FULL_DECODE_ONLY; "
-                    f"got {cudagraph_mode}."
-                )
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

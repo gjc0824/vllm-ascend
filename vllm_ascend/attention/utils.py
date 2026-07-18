@@ -492,11 +492,6 @@ def transdata(nd_mat, block_size: tuple = (16, 16)):
     return nz_mat
 
 
-def kv_offload_decode_enabled() -> bool:
-    """Whether the KV offload decode path is enabled via additional_config."""
-    return bool(get_ascend_config().kv_offload_decode_config.enabled)
-
-
 def enabling_mlapo(vllm_config: VllmConfig) -> bool:
     config_val = get_ascend_config().enable_mlapo
     if get_ascend_device_type() == AscendDeviceType.A5:

@@ -17,11 +17,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVOffloadDecodeConfig
 
 
 # non-c8 case, # [k_cache, v_cache, k_cache_cpu, v_cache_cpu, topk_buffer_k, topk_buffer_v]
-# TODO change this after PD disaggregate is done and kv_cache(_npu) is deleted.
+# TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+# the npu k_cache/v_cache entries only exist for colocate debug (prefill
+# staging) and are deleted together with the prefill path.
 OFFLOAD_KV_CACHE_TUPLE_LEN = 6
 OFFLOAD_K_CACHE_CPU_INDEX = 2
 OFFLOAD_V_CACHE_CPU_INDEX = 3
@@ -274,7 +277,8 @@ class KVOffloadDecodeManager:
             )
 
         # D2H uses a separate descriptor set from the shared H2D buffers below.
-        # Both prefill and decode can produce up to max_num_tokens rows.
+        # Both prefill (colocate debug only, gated by KV_OFFLOAD_COLOCATE_DEBUG)
+        # and decode can produce up to max_num_tokens rows.
         d2h_descriptor_rows = self.max_num_tokens * 2
         device = self.topk_buffers_k[0].device
         self.d2h_src_ptrs_npu = torch.empty(
@@ -479,20 +483,28 @@ class KVOffloadDecodeManager:
         slot_mapping: torch.Tensor,
         k_cache_cpu: torch.Tensor | None,
         v_cache_cpu: torch.Tensor | None,
-        k_cache_npu: torch.Tensor | None,  # prefill: cache_npu[slot] -> cache_cpu[slot]
-        v_cache_npu: torch.Tensor | None,  # prefill: cache_npu[slot] -> cache_cpu[slot]
+        k_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
+        v_cache_npu: torch.Tensor | None,  # prefill (colocate debug only): cache_npu[slot] -> cache_cpu[slot]
         k: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         has_prefill: bool = False,
         capturing: bool = False,
     ) -> None:
-        # TODO remove prefill related part after PD disaggregate is ready.
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+        # the has_prefill path (NPU paged cache -> CPU pool D2H) only exists
+        # for single-node PD-colocate debug.
         if self.tp_rank != 0:
             # Main K/V is replicated across TP ranks; only TP0 owns and writes
             # the shared CPU pool whose GVA was broadcast during registration.
             return
         if k_cache_cpu is None or v_cache_cpu is None:
             raise RuntimeError("KV offload decode TP0 CPU cache is not registered")
+        if has_prefill and not envs_ascend.KV_OFFLOAD_COLOCATE_DEBUG:
+            raise RuntimeError(
+                "KV offload decode prefill offload requires "
+                "KV_OFFLOAD_COLOCATE_DEBUG=1; a PD-disaggregated decode node "
+                "never stages prefill KV in an NPU paged cache"
+            )
 
         if has_prefill:
             if k_cache_npu is None or v_cache_npu is None:

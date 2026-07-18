@@ -7,13 +7,14 @@ KV-offload-related attention logic lives in this module and is selected by
 
 Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 
-- prefill (debug intermediate state): ``exec_kv`` writes the NPU paged main
+- prefill (debug intermediate state, only reachable with
+  ``KV_OFFLOAD_COLOCATE_DEBUG=1``): ``exec_kv`` writes the NPU paged main
   cache as usual, then the layer's cache rows are committed D2H
   (``cache_cpu[slot] = cache_npu[slot]``) through the manager;
 - decode: no NPU main K/V cache at all (indexer K cache only). The current
   token's K/V is produced compute-only and committed D2H directly; top-k
   misses are loaded H2D into the resident (topk) buffer and a single
-  resident SFA attention runs with ``sparse_indices_discrete=True``.
+  resident SFA attention runs.
 """
 
 from typing import Any, TypeVar
@@ -26,6 +27,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
@@ -44,6 +46,18 @@ from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_man
 )
 
 M = TypeVar("M", bound=AscendSFAMetadata)
+
+
+def _check_prefill_colocate_debug() -> None:
+    # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+    # prefill/mixed handling only exists for single-node PD-colocate debug;
+    # a PD-disaggregated decode node never receives prefill batches.
+    if not envs_ascend.KV_OFFLOAD_COLOCATE_DEBUG:
+        raise RuntimeError(
+            "KV offload decode received a prefill/mixed batch without "
+            "KV_OFFLOAD_COLOCATE_DEBUG=1; a PD-disaggregated decode node "
+            "only accepts decode requests"
+        )
 
 
 class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
@@ -286,8 +300,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
             return k_pe, k_nope
 
-        # Prefill / mixed batch: stage in the NPU paged main cache as usual,
-        # then commit the written rows D2H into the shared CPU pool.
+        # Prefill / mixed batch (colocate debug only): stage in the NPU paged
+        # main cache as usual, then commit the written rows D2H into the
+        # shared CPU pool.
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+        _check_prefill_colocate_debug()
         result = super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
         manager = get_kv_offload_decode_manager()
         layer_name = self._offload_layer_name()
@@ -322,6 +339,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         layer_name = self._offload_layer_name()
 
         if num_decode_tokens == 0:
+            # Pure prefill batch (colocate debug only).
+            # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+            _check_prefill_colocate_debug()
             return super()._execute_sparse_flash_attention_process(
                 ql_nope,
                 q_pe,
@@ -405,13 +425,15 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             resident_query_lens,
             resident_seq_lens,
             block_table=resident_block_table,
-            sparse_indices_discrete=False,
         )
         if num_prefills == 0:
             return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])
 
-        # Mixed batch: prefill rows still attend the NPU paged cache. The
-        # cumulative query lengths are rebased to the first prefill request.
+        # Mixed batch (colocate debug only): prefill rows still attend the NPU
+        # paged cache. The cumulative query lengths are rebased to the first
+        # prefill request.
+        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+        _check_prefill_colocate_debug()
         prefill_query_offset = actual_seq_lengths_query[num_decodes - 1]
         prefill_query_lens = actual_seq_lengths_query[num_decodes:] - prefill_query_offset
         prefill_block_table = attn_metadata.block_table[num_decodes : num_decodes + num_prefills]

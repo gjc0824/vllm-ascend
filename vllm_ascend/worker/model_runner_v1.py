@@ -4329,8 +4329,9 @@ class NPUModelRunner(GPUModelRunner):
                     if self.kv_offload_decode_enabled:
                         # TODO support c8
                         assert current_sparse_c8 == False, "c8 not supported now"
-                        # TODO after PD disaggregate is done we can remove this if branch,
-                        # only replace raw_k_tensor by raw_k_tensor_cpu to use the original code.
+                        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+                        # drop the npu k/v tensors and replace raw_k_tensor by raw_k_tensor_cpu
+                        # to use the original code.
                         if self.tp_rank == 0:
                             k_tensor_cpu = self.kv_offload_decode_manager._empty_aligned_cpu_tensor(
                                 [k_tensor_size],
@@ -4557,8 +4558,9 @@ class NPUModelRunner(GPUModelRunner):
                         raw_cache = kv_cache_raw_tensors[layer_name]
                         assert isinstance(raw_cache, tuple)
                         if self.kv_offload_decode_enabled:
-                            # TODO after PD disaggregate is done we can remove this if branch,
-                            # only keep raw_k_tensor = raw_k_tensor_cpu to use the original code.
+                            # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+                            # drop the npu k/v tensors and only keep raw_k_tensor = raw_k_tensor_cpu
+                            # to use the original code.
                             raw_k_tensor, raw_v_tensor, raw_k_tensor_cpu, raw_v_tensor_cpu, sum_page_size_bytes = raw_cache
                         else:
                             if current_sparse_c8:
@@ -4714,7 +4716,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.kv_offload_decode_enabled:
                         # TODO support c8
                         assert current_sparse_c8 == False, "c8 not supported"
-                        # TODO after PD disaggregate is done we can remove this if branch,
+                        # TODO remove KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done:
+                        # the npu k_cache/v_cache views below only exist for colocate debug;
                         # only keep raw_k_tensor = raw_k_tensor_cpu to use the original code.
                         k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape) if raw_k_tensor is not None else None
                         v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape) if raw_v_tensor is not None else None

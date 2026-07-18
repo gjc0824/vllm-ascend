@@ -92,6 +92,8 @@ def test_decode_offload_builds_d2h_descriptors_and_masks_padding(monkeypatch):
 
 
 def test_prefill_offload_reads_paged_cache_rows_by_slot(monkeypatch):
+    # The prefill D2H path only exists for single-node PD-colocate debug.
+    monkeypatch.setenv("KV_OFFLOAD_COLOCATE_DEBUG", "1")
     manager = _make_d2h_manager()
     k_cache_cpu, v_cache_cpu = _cpu_caches()
     k_cache_npu = torch.zeros_like(k_cache_cpu)
@@ -130,6 +132,29 @@ def test_prefill_offload_reads_paged_cache_rows_by_slot(monkeypatch):
         manager.token_size_bytes_v,
         manager.token_size_bytes_v,
     ]
+
+
+def test_prefill_offload_rejected_without_colocate_debug(monkeypatch):
+    # TODO remove with KV_OFFLOAD_COLOCATE_DEBUG after PD disaggregate is done.
+    monkeypatch.delenv("KV_OFFLOAD_COLOCATE_DEBUG", raising=False)
+    manager = _make_d2h_manager()
+    k_cache_cpu, v_cache_cpu = _cpu_caches()
+    calls = _capture_sparse_copy(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="KV_OFFLOAD_COLOCATE_DEBUG"):
+        manager.offload_new_kv(
+            torch.tensor([2, 5]),
+            k_cache_cpu,
+            v_cache_cpu,
+            torch.zeros_like(k_cache_cpu),
+            torch.zeros_like(v_cache_cpu),
+            None,
+            None,
+            has_prefill=True,
+            capturing=True,
+        )
+
+    assert calls == []
 
 
 def test_non_owner_tp_rank_does_not_submit_d2h(monkeypatch):
