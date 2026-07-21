@@ -2044,10 +2044,6 @@ class NPUModelRunner(GPUModelRunner):
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
-        if self.kv_offload_decode_enabled and self.kv_offload_decode_manager is not None:
-            # Draft positions can be overwritten after MTP rejection, so drain
-            # pending copies and invalidate resident rows before state updates.
-            self.kv_offload_decode_manager.prepare_scheduler_step()
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):

@@ -112,7 +112,6 @@ class KVOffloadDecodeManager:
             device='cpu',
             pin_memory=True,
         )
-        self._pending_d2h: list[tuple[object, tuple[torch.Tensor, ...]]] = []
         self._graph_subscribed_streams: set[object] = set()
         self._npu_runtime = torch_npu.npu
 
@@ -541,7 +540,6 @@ class KVOffloadDecodeManager:
             assert k_cache_npu is not None and v_cache_npu is not None
             src_k = int(k_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_k
             src_v = int(v_cache_npu.data_ptr()) + safe_slots * self.token_size_bytes_v
-            keep_sources = (k_cache_npu, v_cache_npu)
         else:
             assert k is not None and v is not None
             k_rows = k.reshape(-1, self.token_size_bytes_k // k.element_size())
@@ -555,7 +553,6 @@ class KVOffloadDecodeManager:
             token_indices = self.d2h_token_indices_npu[:token_count]
             src_k = int(k_rows.data_ptr()) + token_indices * self.token_size_bytes_k
             src_v = int(v_rows.data_ptr()) + token_indices * self.token_size_bytes_v
-            keep_sources = (k_rows, v_rows)
 
         dst_k = int(k_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_k
         dst_v = int(v_cache_cpu.data_ptr()) + safe_slots * self.token_size_bytes_v
@@ -584,26 +581,11 @@ class KVOffloadDecodeManager:
             # Capture records the sparse copy in stream order. A Python event
             # here would describe capture time rather than each graph replay.
             return
+        # Eager D2H must finish before temporary decode K/V can be released and
+        # before TP peers may read the shared CPU pool after their barrier.
         done_event = torch_npu.npu.Event()
         done_event.record(torch_npu.npu.current_stream())
-        self._pending_d2h.append((done_event, keep_sources))
-
-    def _wait_for_pending_d2h(self) -> None:
-        for event, _ in self._pending_d2h:
-            event.synchronize()
-        self._pending_d2h.clear()
-
-    def _drain_graph_host_callbacks(self) -> None:
-        """Wait until captured host callbacks finish using CPU LRU state."""
-        for stream in getattr(self, "_graph_subscribed_streams", ()):
-            event = self._npu_runtime.Event()
-            event.record(stream)
-            event.synchronize()
-
-    def prepare_scheduler_step(self) -> None:
-        """Drain transfers and callbacks before scheduler block reuse."""
-        self._wait_for_pending_d2h()
-        self._drain_graph_host_callbacks()
+        done_event.synchronize()
 
     def onload_topk_kv(
         self,
@@ -625,8 +607,6 @@ class KVOffloadDecodeManager:
                 "KV offload decode topk rows exceed configured workspace, "
                 f"num_tokens={num_tokens}, max_num_topk_rows={self.max_num_topk_rows}"
             )
-        if not capturing:
-            self._wait_for_pending_d2h()
         if token_to_req_npu is not None:
             # spec decode case, expand block_table to actual num decode tokens.
             token_to_req_cpu = self.lru_token_to_req_cpu[:num_tokens]
