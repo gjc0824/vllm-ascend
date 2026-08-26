@@ -199,6 +199,42 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
+    ("executing_layered_subbatch", "enable_expert_parallel", "ep_world_size", "expected"),
+    [
+        (False, True, 4, None),
+        (True, False, 4, None),
+        (True, True, 1, None),
+        (True, True, 4, MoECommType.ALLTOALL),
+    ],
+)
+def test_layered_prefill_comm_override_distinguishes_tp_from_ep(
+    monkeypatch,
+    executing_layered_subbatch,
+    enable_expert_parallel,
+    ep_world_size,
+    expected,
+):
+    """TP-only MoE keeps AllGather; only an actual EP group uses AlltoAll."""
+    monkeypatch.setattr(
+        afc,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=ep_world_size),
+    )
+    vllm_config = _make_vllm_config(
+        enable_expert_parallel=enable_expert_parallel,
+        tensor_parallel_size=4,
+    )
+
+    assert (
+        afc.get_layered_prefill_moe_comm_override(
+            vllm_config,
+            executing_layered_subbatch=executing_layered_subbatch,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
         (128, MoECommType.MC2),

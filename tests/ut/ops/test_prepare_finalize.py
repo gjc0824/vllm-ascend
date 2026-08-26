@@ -146,6 +146,37 @@ class TestPrepareAndFinalize(unittest.TestCase):
         # Should concat back
         self.assertEqual(final_result.shape[0], 2)
 
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=2)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("torch.distributed.all_gather")
+    def test_all2all_tp_split_pads_non_divisible_batch(
+        self, mock_all_gather, mock_tp_rank, mock_tp_size
+    ):
+        layer = PrepareAndFinalizeWithAll2All(self.moe_config)
+        hidden_states = torch.randn(3, 8)
+        router_logits = torch.randn(3, 2)
+
+        prepare_output = layer.prepare(hidden_states, router_logits, replace_allreduce=False)
+        h_out = prepare_output.hidden_states
+        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+
+        # Three rows must be rounded up to four before splitting across TP=2.
+        self.assertEqual(h_out.shape[0], 2)
+        self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
+
+        def mock_all_gather_func(tensor_list, tensor, group=None):
+            tensor_list[0] = tensor
+            tensor_list[1] = tensor.clone()
+
+        mock_all_gather.side_effect = mock_all_gather_func
+        final_result = layer.finalize(
+            h_out,
+            reduce_results=False,
+            padded_hidden_states_shape=padded_hidden_states_shape,
+        )
+
+        self.assertEqual(final_result.shape[0], 3)
+
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_dp_group")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_allgather_prepare_finalize(self, mock_get_forward_context, mock_get_dp_group):

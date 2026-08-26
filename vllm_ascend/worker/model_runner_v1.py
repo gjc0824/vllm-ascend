@@ -71,7 +71,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.layered_prefill import (
+    LayeredFrontier,
+    LayeredPrefillStateStore,
+)
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -194,6 +198,7 @@ from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
+    get_layered_prefill_moe_comm_override,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
     set_ascend_forward_context,
@@ -275,7 +280,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -286,6 +291,27 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    layered_prefill_intermediate: bool = False
+
+
+class LayeredSubBatchState(NamedTuple):
+    """Worker-local state for one half of a layered P/D step."""
+
+    input_batch: NPUInputBatch
+    execute_state: ExecuteModelState
+    kv_connector_output: Any
+    discard_request_indices: np.ndarray
+    num_discarded_requests: int
+    discard_request_mask: np.ndarray
+
+
+class LayeredExecuteModelState(NamedTuple):
+    """The two forwards which make up one externally visible scheduler step."""
+
+    scheduler_output: "SchedulerOutput"
+    sub_batches: tuple[LayeredSubBatchState, ...]
+    main_input_batch: NPUInputBatch
+    main_sampling_masks: tuple[np.ndarray, int, np.ndarray]
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -300,6 +326,11 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        # Worker-local activation frontiers.  Scheduler metadata only carries
+        # request IDs and group cursors; tensors never cross the process
+        # boundary.
+        self.layered_prefill_state = LayeredPrefillStateStore()
 
         self.pin_memory = PIN_MEMORY
 
@@ -546,7 +577,11 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=self.pin_memory,
         )
         # for cleancode , actually the three attrs is defined in gpu_model_runner
-        self.execute_model_state: ExecuteModelState | None = None
+        self.execute_model_state: (
+            ExecuteModelState | LayeredExecuteModelState | None
+        ) = None
+        self.layered_prefill_input_batch: NPUInputBatch | None = None
+        self._executing_layered_subbatch = False
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -1773,6 +1808,454 @@ class NPUModelRunner(GPUModelRunner):
         )
         return cut_tokens
 
+    def _get_layered_prefill_input_batch(self, num_reqs: int) -> NPUInputBatch:
+        """Build the small persistent batch used by the P sub-forward.
+
+        The batch owns request rows and block-table metadata, while the runner's
+        input/attention buffers remain shared.  It is created after KV-cache
+        initialization so its block-table layout exactly matches the main batch.
+        """
+        batch = self.layered_prefill_input_batch
+        if batch is not None and batch.max_num_reqs >= num_reqs:
+            return batch
+
+        block_tables = self.input_batch.block_table.block_tables
+        if not block_tables:
+            raise RuntimeError("Layered prefill requires an initialized KV cache")
+        block_sizes = [table.physical_block_size for table in block_tables]
+        kernel_block_sizes = [
+            list(table.kernel_sizes) if table.kernel_sizes is not None else [0]
+            for table in block_tables
+        ]
+        max_num_blocks = [table.max_num_blocks_per_req for table in block_tables]
+        speculative_config = self.vllm_config.speculative_config
+        batch = NPUInputBatch(
+            max_num_reqs=max(1, num_reqs),
+            max_model_len=max(self.max_model_len, self.max_encoder_len),
+            max_num_batched_tokens=self.max_num_tokens,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            vocab_size=self.model_config.get_vocab_size(),
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            max_num_blocks_per_req=max_num_blocks,
+            logitsprocs=build_logitsprocs(
+                self.vllm_config,
+                self.device,
+                self.pin_memory,
+                self.is_pooling_model,
+                self.vllm_config.model_config.logits_processors,
+            ),
+            logitsprocs_need_output_token_ids=bool(
+                self.vllm_config.model_config.logits_processors
+            ),
+            is_spec_decode=bool(speculative_config),
+            is_pooling_model=self.is_pooling_model,
+            num_speculative_tokens=(
+                speculative_config.num_speculative_tokens
+                if speculative_config is not None
+                else 0
+            ),
+            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+            kv_cache_groups=self.kv_cache_config.kv_cache_groups,
+            reasoning_config=getattr(self.vllm_config, "reasoning_config", None),
+        )
+        self.layered_prefill_input_batch = batch
+        return batch
+
+    @staticmethod
+    def _subset_cached_request_data(
+        data: CachedRequestData, req_ids: list[str]
+    ) -> CachedRequestData:
+        indices = [data.req_ids.index(req_id) for req_id in req_ids if req_id in data.req_ids]
+        selected_ids = [data.req_ids[index] for index in indices]
+        aligned = lambda values: (
+            [values[index] for index in indices] if len(values) == len(data.req_ids) else []
+        )
+        return CachedRequestData(
+            req_ids=selected_ids,
+            resumed_req_ids=data.resumed_req_ids.intersection(selected_ids),
+            new_token_ids=aligned(data.new_token_ids),
+            all_token_ids={
+                req_id: data.all_token_ids[req_id]
+                for req_id in selected_ids
+                if req_id in data.all_token_ids
+            },
+            new_block_ids=aligned(data.new_block_ids),
+            num_computed_tokens=aligned(data.num_computed_tokens),
+            num_output_tokens=aligned(data.num_output_tokens),
+        )
+
+    @classmethod
+    def _subset_scheduler_output(
+        cls,
+        scheduler_output: "SchedulerOutput",
+        req_ids: list[str],
+        *,
+        layered_plan: Any = None,
+        include_one_time_updates: bool = True,
+    ) -> "SchedulerOutput":
+        req_id_set = set(req_ids)
+        num_scheduled_tokens = {
+            req_id: scheduler_output.num_scheduled_tokens[req_id]
+            for req_id in req_ids
+            if req_id in scheduler_output.num_scheduled_tokens
+        }
+        scheduled_new_reqs = [
+            data for data in scheduler_output.scheduled_new_reqs
+            if data.req_id in req_id_set
+        ]
+        scheduled_cached_reqs = cls._subset_cached_request_data(
+            scheduler_output.scheduled_cached_reqs, req_ids
+        )
+        scheduled_spec_decode_tokens = {
+            req_id: tokens
+            for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+            if req_id in req_id_set
+        }
+        scheduled_encoder_inputs = {
+            req_id: inputs
+            for req_id, inputs in scheduler_output.scheduled_encoder_inputs.items()
+            if req_id in req_id_set
+        }
+        num_invalid_spec_tokens = None
+        if scheduler_output.num_invalid_spec_tokens is not None:
+            num_invalid_spec_tokens = {
+                req_id: value
+                for req_id, value in scheduler_output.num_invalid_spec_tokens.items()
+                if req_id in req_id_set
+            }
+        partial_tail_offloads = None
+        if scheduler_output.partial_tail_offloads is not None:
+            partial_tail_offloads = {
+                req_id: value
+                for req_id, value in scheduler_output.partial_tail_offloads.items()
+                if req_id in req_id_set
+            }
+        return replace(
+            scheduler_output,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_cached_reqs=scheduled_cached_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            scheduled_encoder_input_stats=(
+                scheduler_output.scheduled_encoder_input_stats
+                if include_one_time_updates else None
+            ),
+            finished_req_ids=(
+                scheduler_output.finished_req_ids
+                if include_one_time_updates else set()
+            ),
+            preempted_req_ids=(
+                scheduler_output.preempted_req_ids
+                if include_one_time_updates else set()
+            ),
+            free_encoder_mm_hashes=(
+                scheduler_output.free_encoder_mm_hashes
+                if include_one_time_updates else []
+            ),
+            new_block_ids_to_zero=(
+                scheduler_output.new_block_ids_to_zero
+                if include_one_time_updates else None
+            ),
+            kv_cache_block_copies=(
+                scheduler_output.kv_cache_block_copies
+                if include_one_time_updates else None
+            ),
+            kv_connector_metadata=(
+                scheduler_output.kv_connector_metadata
+                if include_one_time_updates else None
+            ),
+            ec_connector_metadata=(
+                scheduler_output.ec_connector_metadata
+                if include_one_time_updates else None
+            ),
+            ec_manager_metadata=(
+                scheduler_output.ec_manager_metadata
+                if include_one_time_updates else None
+            ),
+            partial_tail_offloads=partial_tail_offloads,
+            num_invalid_spec_tokens=num_invalid_spec_tokens,
+            layered_prefill_plan=layered_plan,
+        )
+
+    def _capture_layered_sampling_masks(
+        self,
+    ) -> tuple[np.ndarray, int, np.ndarray]:
+        num_reqs = self.input_batch.num_reqs
+        return (
+            self.discard_request_indices.np[: self.num_discarded_requests].copy(),
+            self.num_discarded_requests,
+            self.discard_request_mask.np[:num_reqs].copy(),
+        )
+
+    def _restore_layered_sampling_masks(
+        self,
+        snapshot: tuple[np.ndarray, int, np.ndarray],
+    ) -> None:
+        indices, num_discarded, mask = snapshot
+        self.num_discarded_requests = num_discarded
+        if num_discarded:
+            self.discard_request_indices.np[:num_discarded] = indices
+        self.discard_request_indices.copy_to_gpu(num_discarded)
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs:
+            self.discard_request_mask.np[:num_reqs] = mask
+        self.discard_request_mask.copy_to_gpu(num_reqs)
+
+    def _execute_layered_step(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> ModelRunnerOutput | IntermediateTensors | None:
+        """Execute the fixed Phase 1 D -> P subbatch sequence."""
+        plan = scheduler_output.layered_prefill_plan
+        assert plan is not None
+        if intermediate_tensors is not None:
+            raise RuntimeError("Layered prefill Phase 1 does not support PP tensors")
+        layered_model = self.get_model()
+        if not getattr(layered_model, "supports_layered_prefill", False):
+            raise RuntimeError(
+                f"Model {type(layered_model).__name__} does not support layered prefill"
+            )
+        all_req_ids = list(scheduler_output.num_scheduled_tokens)
+        p_req_ids = list(plan.prefill_req_ids)
+        if len(p_req_ids) != 1:
+            raise RuntimeError(
+                "Layered prefill Phase 1 supports exactly one P request"
+            )
+        p_req_set = set(p_req_ids)
+        if not p_req_set.issubset(all_req_ids):
+            raise RuntimeError("Layered plan contains an unscheduled P request")
+        d_req_ids = [req_id for req_id in all_req_ids if req_id not in p_req_set]
+        main_input_batch = self.input_batch
+        main_sampling_masks = self._capture_layered_sampling_masks()
+        p_input_batch = self._get_layered_prefill_input_batch(len(p_req_ids))
+        sub_batches: list[LayeredSubBatchState] = []
+
+        self._executing_layered_subbatch = True
+        one_time_updates_pending = True
+        try:
+            for req_ids, active_batch, active_plan in (
+                (d_req_ids, main_input_batch, None),
+                (p_req_ids, p_input_batch, plan),
+            ):
+                if not req_ids:
+                    continue
+                self.input_batch = active_batch
+                if not one_time_updates_pending:
+                    # The primary subbatch already applied global request
+                    # lifecycle updates.  Remove stale rows from this batch
+                    # locally without popping a same-ID resubmission from the
+                    # shared request-state map a second time.
+                    for req_id in scheduler_output.finished_req_ids:
+                        active_batch.remove_request(req_id)
+                self.execute_model_state = None
+                sub_output = self._subset_scheduler_output(
+                    scheduler_output,
+                    req_ids,
+                    layered_plan=active_plan,
+                    include_one_time_updates=one_time_updates_pending,
+                )
+                one_time_updates_pending = False
+                result = self.execute_model(sub_output, None)
+                if result is not None:
+                    raise RuntimeError(
+                        "Layered prefill Phase 1 expects PP=1 execute_model to "
+                        "return None"
+                    )
+                execute_state = self.execute_model_state
+                if not isinstance(execute_state, ExecuteModelState):
+                    raise RuntimeError("Missing execute state for layered subbatch")
+                discard_indices, num_discarded, discard_mask = (
+                    self._capture_layered_sampling_masks()
+                )
+                if active_batch is main_input_batch:
+                    # ``_update_states`` may add, remove, or condense rows in
+                    # the main batch.  The snapshot taken before the Decode
+                    # subbatch therefore can have a different length from
+                    # the batch that must be restored after the P subbatch.
+                    # Keep the post-Decode snapshot, whose mask is aligned
+                    # with the current main input batch.
+                    main_sampling_masks = (
+                        discard_indices.copy(),
+                        num_discarded,
+                        discard_mask.copy(),
+                    )
+                sub_batches.append(
+                    LayeredSubBatchState(
+                        input_batch=active_batch,
+                        execute_state=execute_state,
+                        kv_connector_output=self.kv_connector_output,
+                        discard_request_indices=discard_indices,
+                        num_discarded_requests=num_discarded,
+                        discard_request_mask=discard_mask,
+                    )
+                )
+                self.execute_model_state = None
+                self.kv_connector_output = None
+        finally:
+            self._executing_layered_subbatch = False
+            self.input_batch = main_input_batch
+
+        self.execute_model_state = LayeredExecuteModelState(
+            scheduler_output=scheduler_output,
+            sub_batches=tuple(sub_batches),
+            main_input_batch=main_input_batch,
+            main_sampling_masks=main_sampling_masks,
+        )
+        return None
+
+    @staticmethod
+    def _merge_layered_outputs(
+        scheduler_output: "SchedulerOutput",
+        outputs: list[ModelRunnerOutput],
+    ) -> ModelRunnerOutput:
+        by_req_id: dict[str, tuple[ModelRunnerOutput, int]] = {}
+        for output in outputs:
+            for index, req_id in enumerate(output.req_ids):
+                by_req_id[req_id] = (output, index)
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        sampled_token_ids = [
+            by_req_id[req_id][0].sampled_token_ids[by_req_id[req_id][1]]
+            if req_id in by_req_id
+            else []
+            for req_id in req_ids
+        ]
+
+        # Phase 1 disables P logprobs/speculative decoding, but a D request can
+        # still request logprobs.  Fill non-logprob rows with neutral placeholders
+        # so the scheduler's req-indexed slicing remains valid.
+        logprob_values = [output.logprobs for output in outputs if output.logprobs is not None]
+        merged_logprobs = None
+        if logprob_values:
+            width = max(value.logprob_token_ids.shape[1] for value in logprob_values)
+            token_rows: list[np.ndarray] = []
+            value_rows: list[np.ndarray] = []
+            rank_rows: list[np.ndarray] = []
+            cu_num_generated_tokens: list[int] = []
+            flattened_count = 0
+            for req_id, tokens in zip(req_ids, sampled_token_ids):
+                count = len(tokens)
+                cu_num_generated_tokens.append(flattened_count)
+                if count == 0:
+                    continue
+                value = by_req_id.get(req_id)
+                selected = None
+                if value is not None and value[0].logprobs is not None:
+                    selected = value[0].logprobs.slice_request(value[1], count)
+                if selected is None:
+                    token_rows.append(np.full((count, width), -1, dtype=np.int32))
+                    value_rows.append(np.full((count, width), -np.inf, dtype=np.float32))
+                    rank_rows.append(np.full((count,), -1, dtype=np.int32))
+                else:
+                    pad = width - selected.logprob_token_ids.shape[1]
+                    token_rows.append(
+                        np.pad(selected.logprob_token_ids, ((0, 0), (0, pad)), constant_values=-1)
+                    )
+                    value_rows.append(
+                        np.pad(selected.logprobs, ((0, 0), (0, pad)), constant_values=-np.inf)
+                    )
+                    rank_rows.append(selected.sampled_token_ranks)
+                flattened_count += count
+            if token_rows:
+                merged_logprobs = LogprobsLists(
+                    np.concatenate(token_rows),
+                    np.concatenate(value_rows),
+                    np.concatenate(rank_rows),
+                    cu_num_generated_tokens,
+                )
+
+        prompt_logprobs: dict[str, LogprobsTensors | None] = {}
+        num_nans: dict[str, int] = {}
+        for output in outputs:
+            prompt_logprobs.update(output.prompt_logprobs_dict)
+            if output.num_nans_in_logits:
+                num_nans.update(output.num_nans_in_logits)
+        merged = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+            sampled_token_ids=sampled_token_ids,
+            logprobs=merged_logprobs,
+            prompt_logprobs_dict=prompt_logprobs,
+            pooler_output=[],
+            kv_connector_output=next(
+                (output.kv_connector_output for output in outputs if output.kv_connector_output),
+                None,
+            ),
+            ec_connector_output=next(
+                (output.ec_connector_output for output in outputs if output.ec_connector_output),
+                None,
+            ),
+            num_nans_in_logits=num_nans or None,
+            cudagraph_stats=next(
+                (output.cudagraph_stats for output in outputs if output.cudagraph_stats),
+                None,
+            ),
+            routed_experts=None,
+        )
+        # vllm-ascend's PP/MTP compatibility patch adds this field lazily on
+        # older upstream versions.  Preserve it when present without making the
+        # upstream dataclass depend on the plugin extension.
+        if any(hasattr(output, "spec_token_ids") for output in outputs):
+            setattr(
+                merged,
+                "spec_token_ids",
+                [
+                    getattr(by_req_id[req_id][0], "spec_token_ids", [])[by_req_id[req_id][1]]
+                    if req_id in by_req_id
+                    and getattr(by_req_id[req_id][0], "spec_token_ids", None) is not None
+                    else []
+                    for req_id in req_ids
+                ],
+            )
+        return merged
+
+    def _sample_layered_step(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput:
+        layered_state = self.execute_model_state
+        assert isinstance(layered_state, LayeredExecuteModelState)
+        self.execute_model_state = None
+        outputs: list[ModelRunnerOutput] = []
+        try:
+            for sub_batch in layered_state.sub_batches:
+                self.input_batch = sub_batch.input_batch
+                self._restore_layered_sampling_masks(
+                    (
+                        sub_batch.discard_request_indices,
+                        sub_batch.num_discarded_requests,
+                        sub_batch.discard_request_mask,
+                    )
+                )
+                self.execute_model_state = sub_batch.execute_state
+                self.kv_connector_output = sub_batch.kv_connector_output
+                # Grammar rows belong to the D subbatch. Phase 1 excludes
+                # structured-output P requests, so do not pass D grammar state
+                # through the P sampler.
+                active_grammar_output = grammar_output
+                if grammar_output is not None and not any(
+                    req_id in grammar_output.structured_output_request_ids
+                    for req_id in self.input_batch.req_ids
+                ):
+                    active_grammar_output = None
+                output = self.sample_tokens(active_grammar_output)
+                if isinstance(output, AsyncModelRunnerOutput):
+                    output = output.get_output()
+                if output is None:
+                    output = EMPTY_MODEL_RUNNER_OUTPUT
+                if not isinstance(output, ModelRunnerOutput):
+                    raise RuntimeError("Layered prefill sampling returned PP tensors")
+                outputs.append(output)
+        finally:
+            self.execute_model_state = None
+            self.kv_connector_output = None
+            self.input_batch = layered_state.main_input_batch
+            self._restore_layered_sampling_masks(layered_state.main_sampling_masks)
+        return self._merge_layered_outputs(layered_state.scheduler_output, outputs)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1796,6 +2279,24 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        layered_plan = scheduler_output.layered_prefill_plan
+        self.layered_prefill_state.clear_many(scheduler_output.finished_req_ids)
+        if scheduler_output.preempted_req_ids:
+            self.layered_prefill_state.clear_many(scheduler_output.preempted_req_ids)
+        if layered_plan is not None and not self._executing_layered_subbatch:
+            return self._execute_layered_step(scheduler_output, intermediate_tensors)
+        if layered_plan is not None:
+            pp = get_pp_group()
+            if pp.world_size != 1:
+                raise RuntimeError(
+                    "Layered prefill Phase 1 requires pipeline_parallel_size=1"
+                )
+            layered_model = self.get_model()
+            if set(scheduler_output.num_scheduled_tokens) != set(layered_plan.prefill_req_ids):
+                raise RuntimeError(
+                    "Layered P subbatch contains request IDs outside the plan"
+                )
        
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -2111,6 +2612,13 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                # TP-only MoE keeps its normal AllGather path.  The helper
+                # selects AlltoAll only when this layered subbatch is backed
+                # by a real EP group.
+                moe_comm_type_override=get_layered_prefill_moe_comm_override(
+                    self.vllm_config,
+                    executing_layered_subbatch=self._executing_layered_subbatch,
+                ),
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2121,12 +2629,88 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if layered_plan is None:
+                hidden_states = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            else:
+                if num_tokens_padded != scheduler_output.total_num_scheduled_tokens:
+                    raise RuntimeError(
+                        "Layered prefill Phase 1 does not support padded eager batches"
+                    )
+                req_id = layered_plan.prefill_req_ids[0]
+                frontier = self.layered_prefill_state.get(req_id)
+                if layered_plan.group_id > 0:
+                    if frontier is None:
+                        raise RuntimeError(
+                            f"Missing layered activation frontier for request {req_id}"
+                        )
+                    if frontier.group_id != layered_plan.group_id:
+                        raise RuntimeError(
+                            f"Layered frontier group mismatch for {req_id}: expected "
+                            f"{layered_plan.group_id}, got {frontier.group_id}"
+                        )
+                    frontier_tuple = (frontier.hidden_states, frontier.residual)
+                    initial_input_ids = None
+                    initial_inputs_embeds = None
+                else:
+                    if frontier is not None:
+                        raise RuntimeError(
+                            f"Unexpected layered frontier for group 0 request {req_id}"
+                        )
+                    frontier_tuple = None
+                    initial_input_ids = input_ids
+                    initial_inputs_embeds = inputs_embeds
+                layered_output = layered_model.forward_layered_prefill(
+                    input_ids=initial_input_ids,
+                    positions=positions[:num_tokens_padded],
+                    layer_start=layered_plan.group_start,
+                    layer_end=layered_plan.group_end,
+                    frontier=frontier_tuple,
+                    inputs_embeds=initial_inputs_embeds,
+                    intermediate_tensors=None,
+                )
+                if layered_output.hidden_states.shape[0] != num_tokens_padded:
+                    raise RuntimeError(
+                        "Layered model returned a hidden-state row count that "
+                        "does not match the P query batch"
+                    )
+                if layered_output.is_final_layer != layered_plan.is_final_group:
+                    raise RuntimeError(
+                        "Layered model final-layer status does not match the plan"
+                    )
+                hidden_states = layered_output.hidden_states
+                if layered_plan.is_final_group:
+                    self.layered_prefill_state.clear(req_id)
+                else:
+                    # Keep the frontier independent from model/attention
+                    # workspaces that the next Decode sub-forward may reuse.
+                    # This is the Phase 1 correctness path; later optimized
+                    # runners can replace the clone with a managed frontier
+                    # pool once aliasing is proven safe.
+                    frontier_hidden = layered_output.hidden_states.clone()
+                    frontier_residual = (
+                        layered_output.residual.clone()
+                        if layered_output.residual is not None
+                        else None
+                    )
+                    self.layered_prefill_state.put(
+                        LayeredFrontier(
+                            req_id=req_id,
+                            group_id=layered_plan.group_id + 1,
+                            query_len=layered_plan.query_tokens[req_id],
+                            hidden_states=frontier_hidden,
+                            residual=frontier_residual,
+                        )
+                    )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and layered_plan is None:
                 hidden_states, aux_hidden_states = hidden_states
             if not self.broadcast_pp_output:
                 # Common case.
@@ -2148,19 +2732,29 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if layered_plan is not None and not layered_plan.is_final_group:
+                    sample_hidden_states = hidden_states[:0]
+                    logits = None
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
                 if not get_pp_group().is_last_rank:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = hidden_states[:0] if (
+                        layered_plan is not None and not layered_plan.is_final_group
+                    ) else hidden_states[logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    sample_hidden_states = hidden_states[logits_indices]
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    if layered_plan is not None and not layered_plan.is_final_group:
+                        sample_hidden_states = hidden_states[:0]
+                        logits = None
+                    else:
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -2185,6 +2779,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                layered_plan is not None and not layered_plan.is_final_group,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2198,6 +2793,9 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if isinstance(self.execute_model_state, LayeredExecuteModelState):
+            return self._sample_layered_step(grammar_output)
+
         profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
@@ -2231,9 +2829,31 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            layered_prefill_intermediate,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if layered_prefill_intermediate:
+            # Intermediate P groups deliberately have no logits or sampling.
+            # Still finalize model-state bookkeeping so the next group can
+            # reuse the same request row and KV slots.
+            if self.dynamic_eplb:
+                self.eplb_updator.forward_end(self.eplb_heat_collection_status)
+            self._finalize_dump_data()
+            req_ids = self.input_batch.req_ids.copy()
+            return ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                sampled_token_ids=[[] for _ in req_ids],
+                kv_connector_output=kv_connector_output,
+                pooler_output=[],
+                ec_connector_output=ec_connector_output
+                if self.supports_mm_inputs
+                else None,
+                cudagraph_stats=cudagraph_stats,
+                routed_experts=None,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -3629,6 +4249,9 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        # KV-cache initialization can replace the main input batch and its
+        # block-table layout.  Never retain a P view across that boundary.
+        self.layered_prefill_input_batch = None
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()

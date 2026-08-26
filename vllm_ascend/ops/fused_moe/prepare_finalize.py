@@ -147,7 +147,11 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
-            pad_size = self.tp_size - self.num_tokens  # Pad to TP size (cyclic)
+            # All TP slices must have the same row count for the final
+            # all-gather.  Round up to the next TP multiple for both small
+            # and large batches; `tp_size - num_tokens` only handled the
+            # former and produced uneven slices when num_tokens > tp_size.
+            pad_size = (-self.num_tokens) % self.tp_size
             if self.lora_context is not None:
                 prepare_lora_indices(
                     self.lora_context,
@@ -182,7 +186,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         input_ids,
     ):
         if not self.replace_allreduce:
-            pad_size = self.tp_size - self.num_tokens
+            pad_size = (-self.num_tokens) % self.tp_size
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 

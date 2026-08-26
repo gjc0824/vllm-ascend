@@ -819,6 +819,177 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         additional_config = vllm_config.additional_config
     scheduler_extension_config = ascend_config.scheduler_config
 
+    layered_prefill_config = scheduler_extension_config.layered_prefill_config
+    if layered_prefill_config.enabled:
+        parallel_config = vllm_config.parallel_config
+        cache_config = vllm_config.cache_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if parallel_config.pipeline_parallel_size != 1:
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires "
+                "pipeline_parallel_size=1"
+            )
+        # Layered Prefill executes the Decode and Prefill views as separate
+        # forwards.  Every TP rank therefore enters the same layer loop and
+        # its existing TP collectives remain ordered.  TP>1 is supported;
+        # when EP is enabled, the Ascend AlltoAll path restores the physical
+        # TP token split after vLLM collapses routed-expert TP to one.
+        # sequence parallelism is still rejected below because it changes the
+        # frontier/token-row layout.  DP remains restricted to one rank until
+        # the scheduler plan is synchronized across DP/EP ranks.
+        if getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires the V1 model runner"
+            )
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support async_scheduling"
+            )
+        if getattr(parallel_config, "enable_dbo", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support DBO"
+            )
+        if (
+            getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
+            or getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support context parallelism"
+            )
+        if getattr(parallel_config, "data_parallel_size", 1) != 1:
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires data_parallel_size=1"
+            )
+        if enable_sp(vllm_config):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support sequence-parallel MoE"
+            )
+        if getattr(parallel_config, "enable_eplb", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support upstream EPLB"
+            )
+        if not getattr(vllm_config.model_config, "enforce_eager", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires enforce_eager=True"
+            )
+        if getattr(cache_config, "enable_prefix_caching", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires prefix caching disabled"
+            )
+        if getattr(cache_config, "kv_offloading_size", None) is not None:
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support KV offloading"
+            )
+        if getattr(
+            getattr(ascend_config, "sparse_kv_offload_config", None),
+            "enabled",
+            False,
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support sparse KV offload"
+            )
+        if getattr(cache_config, "mamba_cache_mode", "none") != "none":
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support Mamba/hybrid KV state"
+            )
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+        if cudagraph_mode is not None and getattr(cudagraph_mode, "name", None) not in (
+            None,
+            "NONE",
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires cudagraph_mode=NONE"
+            )
+        compilation_mode = getattr(compilation_config, "mode", None)
+        if compilation_mode is not None and getattr(compilation_mode, "name", None) not in (
+            None,
+            "NONE",
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires compilation mode NONE"
+            )
+        if getattr(
+            getattr(ascend_config, "xlite_graph_config", None), "enabled", False
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support Xlite/ACL graphs"
+            )
+        if kv_transfer_config is not None:
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires connector-free PD-mixed mode"
+            )
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support speculative decoding"
+            )
+        if getattr(vllm_config, "lora_config", None) is not None:
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support LoRA"
+            )
+        if (
+            getattr(vllm_config.model_config, "is_encoder_decoder", False)
+            or getattr(vllm_config.model_config, "is_multimodal", False)
+            or getattr(vllm_config.model_config, "is_multimodal_model", False)
+            or getattr(vllm_config.model_config, "is_hybrid", False)
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 supports non-hybrid decoder-only text models only"
+            )
+        if getattr(vllm_config.model_config, "enable_return_routed_experts", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support routed-expert return"
+            )
+        if getattr(getattr(ascend_config, "eplb_config", None), "dynamic_eplb", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support dynamic EPLB"
+            )
+        if getattr(ascend_config, "enable_prefill_mc2", False):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires eager AlltoAll; disable enable_prefill_mc2"
+            )
+        if getattr(ascend_config, "enable_shared_expert_dp", False) or getattr(
+            ascend_config, "multistream_overlap_shared_expert", False
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 does not support shared-expert overlap"
+            )
+        if getattr(ascend_config, "enable_fused_mc2", 0) or getattr(
+            ascend_config, "enable_mc2_hierarchy_comm", False
+        ):
+            raise ValueError(
+                "layered_prefill_config Phase 1 requires eager AlltoAll; disable MC2/fused MC2"
+            )
+        architectures = getattr(vllm_config.model_config, "architectures", None) or []
+        if not any("Qwen3Moe" in architecture for architecture in architectures):
+            raise ValueError(
+                "layered_prefill_config Phase 1 currently supports Qwen3Moe only"
+            )
+        if scheduler_extension_config.profiling_chunk_config.enabled:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with profiling_chunk_config"
+            )
+        if scheduler_extension_config.enable_balance_scheduling:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with balance scheduling"
+            )
+        if scheduler_extension_config.batch_job_sched_config.enabled:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with batch-job scheduling"
+            )
+        if scheduler_extension_config.short_request_first_config.enabled:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with short-request-first scheduling"
+            )
+        if scheduler_extension_config.dyntra_lb_config.enabled:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with DyntraLB"
+            )
+        if scheduler_extension_config.recompute_scheduler_enable:
+            raise ValueError(
+                "layered_prefill_config cannot be combined with recompute scheduling"
+            )
+
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
         kv_transfer_config = vllm_config.kv_transfer_config

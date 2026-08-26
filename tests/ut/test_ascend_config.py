@@ -985,9 +985,32 @@ class TestSchedulerConfig(TestBase):
 
         self.assertFalse(config.enable_balance_scheduling)
         self.assertFalse(config.recompute_scheduler_enable)
+        self.assertFalse(config.layered_prefill_config.enabled)
         self.assertFalse(config.short_request_first_config.enabled)
         self.assertFalse(config.profiling_chunk_config.enabled)
         self.assertFalse(config.dyntra_lb_config.enabled)
+
+    def test_layered_prefill_config_is_parsed_from_scheduler_section(self):
+        config = SchedulerConfig(
+            {
+                "scheduler_config": {
+                    "layered_prefill_config": {
+                        "enabled": True,
+                        "mode": "one_group",
+                        "group_token_target": 1024,
+                        "allowed_num_groups": [1, 2, 4],
+                        "max_groups_per_step": 1,
+                    }
+                }
+            },
+            balance_env_value=False,
+        )
+
+        layered = config.layered_prefill_config
+        self.assertTrue(layered.enabled)
+        self.assertEqual(layered.group_token_target, 1024)
+        self.assertEqual(layered.allowed_num_groups, (1, 2, 4))
+        self.assertEqual(layered.max_groups_per_step, 1)
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_none_config_uses_defaults_and_legacy_fallback(self, mock_warning_once):

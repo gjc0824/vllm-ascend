@@ -13,7 +13,54 @@ from vllm_ascend.patch.platform.patch_pp_mtp import (
     _update_pp_mtp_spec_token_ids,
     _use_pp_ipc_runtime_patch,
 )
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import ExecuteModelState, NPUModelRunner
+
+
+def test_layered_prefill_restores_main_mask_after_decode_batch_update():
+    """The final restore must use the post-update Decode batch shape."""
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    main_batch = SimpleNamespace(num_reqs=2, req_ids=["d0", "d1"])
+    prefill_batch = SimpleNamespace(num_reqs=1, req_ids=["p"])
+    runner.input_batch = main_batch
+    runner.layered_prefill_input_batch = prefill_batch
+    runner._executing_layered_subbatch = False
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.requests = {}
+    runner.get_model = lambda: SimpleNamespace(supports_layered_prefill=True)
+
+    # Return masks aligned with the currently active batch.  The fake Decode
+    # execution grows the main batch from two rows to three rows, reproducing
+    # the request mix from the failing curl call.
+    def capture_masks():
+        size = runner.input_batch.num_reqs
+        mask = np.zeros(size, dtype=bool)
+        return np.empty(0, dtype=np.int64), 0, mask
+
+    runner._capture_layered_sampling_masks = capture_masks
+
+    def fake_execute_model(_scheduler_output, _intermediate_tensors):
+        if runner.input_batch is main_batch:
+            main_batch.num_reqs = 3
+            main_batch.req_ids.append("d2")
+        runner.execute_model_state = ExecuteModelState(*([None] * 13))
+        return None
+
+    runner.execute_model = fake_execute_model
+    runner._get_layered_prefill_input_batch = lambda _num_reqs: prefill_batch
+    runner._subset_scheduler_output = lambda scheduler_output, req_ids, **kwargs: scheduler_output
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"d0": 1, "d1": 1, "d2": 1, "p": 1},
+        finished_req_ids=set(),
+        layered_prefill_plan=SimpleNamespace(prefill_req_ids=("p",)),
+    )
+
+    runner._execute_layered_step(scheduler_output, None)
+
+    layered_state = runner.execute_model_state
+    assert layered_state.main_sampling_masks[2].shape == (3,)
 
 
 def test_model_config_validates_local_mtp_drafter_as_single_pp_rank(monkeypatch):

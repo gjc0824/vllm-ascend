@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.layered_prefill import LayeredPrefillConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1203,6 +1204,28 @@ class SchedulerConfig:
             self._get_config_value(scheduler_config, additional_config, "batch_job_sched_config", {})
         )
         self.dyntra_lb_config = DyntraLBConfig(scheduler_config.get("dyntra_lb_config"))
+        layered_prefill_raw = scheduler_config.get("layered_prefill_config", {})
+        if layered_prefill_raw is None:
+            layered_prefill_raw = {}
+        if not isinstance(layered_prefill_raw, dict):
+            raise ValueError(
+                "additional_config.scheduler_config.layered_prefill_config "
+                f"must be a dict, got {type(layered_prefill_raw).__name__}"
+            )
+        allowed_num_groups = layered_prefill_raw.get(
+            "allowed_num_groups", (1, 2, 4, 8, 16)
+        )
+        if allowed_num_groups is None:
+            allowed_num_groups = (1, 2, 4, 8, 16)
+        self.layered_prefill_config = LayeredPrefillConfig(
+            enabled=bool(layered_prefill_raw.get("enabled", False)),
+            mode=str(layered_prefill_raw.get("mode", "one_group")),
+            group_token_target=int(layered_prefill_raw.get("group_token_target", 512)),
+            allowed_num_groups=tuple(int(v) for v in allowed_num_groups),
+            max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),
+            require_pd_mixed=bool(layered_prefill_raw.get("require_pd_mixed", True)),
+            require_eager=bool(layered_prefill_raw.get("require_eager", True)),
+        )
 
     @staticmethod
     def _get_config_value(
