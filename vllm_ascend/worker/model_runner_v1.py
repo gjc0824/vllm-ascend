@@ -56,6 +56,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.offloader.base import get_offloader, set_offloader
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
@@ -1864,6 +1865,33 @@ class NPUModelRunner(GPUModelRunner):
         return batch
 
     @staticmethod
+    def _layered_prefill_moe_layer_offset(
+        all_moe_layers: list[str], layer_start: int
+    ) -> int:
+        """Return the MoE custom-op cursor for a Transformer layer boundary."""
+        return sum(
+            extract_layer_index(layer_name) < layer_start
+            for layer_name in all_moe_layers
+        )
+
+    def _set_layered_prefill_moe_layer_offset(self, layer_start: int) -> None:
+        forward_context = get_forward_context()
+        all_moe_layers = forward_context.all_moe_layers
+        if all_moe_layers is not None:
+            forward_context.moe_layer_index = (
+                self._layered_prefill_moe_layer_offset(
+                    all_moe_layers, layer_start
+                )
+            )
+
+    @staticmethod
+    def _layered_prefill_force_eager(
+        model_enforce_eager: bool, layered_plan: Any
+    ) -> bool:
+        """Keep partial-layer Prefill out of the full Decode graph."""
+        return model_enforce_eager or layered_plan is not None
+
+    @staticmethod
     def _subset_cached_request_data(
         data: CachedRequestData, req_ids: list[str]
     ) -> CachedRequestData:
@@ -2438,9 +2466,26 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=self._layered_prefill_force_eager(
+                        self.model_config.enforce_eager, layered_plan
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+
+                if self._executing_layered_subbatch:
+                    if layered_plan is not None:
+                        if cudagraph_mode != CUDAGraphMode.NONE:
+                            raise RuntimeError(
+                                "Layered Prefill subbatch must execute eagerly"
+                            )
+                        logger.info_once(
+                            "Layered Prefill subbatch selected eager execution"
+                        )
+                    else:
+                        logger.info_once(
+                            "Layered Decode subbatch selected cudagraph_mode=%s",
+                            cudagraph_mode.name,
+                        )
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2643,6 +2688,9 @@ class NPUModelRunner(GPUModelRunner):
                     raise RuntimeError(
                         "Layered prefill Phase 1 does not support padded eager batches"
                     )
+                self._set_layered_prefill_moe_layer_offset(
+                    layered_plan.group_start
+                )
                 req_id = layered_plan.prefill_req_ids[0]
                 frontier = self.layered_prefill_state.get(req_id)
                 if layered_plan.group_id > 0:

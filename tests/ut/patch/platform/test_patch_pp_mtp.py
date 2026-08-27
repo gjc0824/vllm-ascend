@@ -63,6 +63,46 @@ def test_layered_prefill_restores_main_mask_after_decode_batch_update():
     assert layered_state.main_sampling_masks[2].shape == (3,)
 
 
+@pytest.mark.parametrize(
+    ("all_moe_layers", "layer_start", "expected"),
+    [
+        (["model.layers.1.mlp", "model.layers.3.mlp"], 0, 0),
+        (["model.layers.1.mlp", "model.layers.3.mlp"], 2, 1),
+        (["model.layers.1.mlp", "model.layers.3.mlp"], 4, 2),
+    ],
+)
+def test_layered_prefill_moe_cursor_starts_at_group_layer(
+    all_moe_layers, layer_start, expected
+):
+    assert (
+        NPUModelRunner._layered_prefill_moe_layer_offset(
+            all_moe_layers, layer_start
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_enforce_eager", "has_layered_plan", "expected"),
+    [
+        (True, False, True),
+        (True, True, True),
+        (False, False, False),
+        (False, True, True),
+    ],
+)
+def test_layered_prefill_forces_only_prefill_group_eager(
+    model_enforce_eager, has_layered_plan, expected
+):
+    layered_plan = object() if has_layered_plan else None
+    assert (
+        NPUModelRunner._layered_prefill_force_eager(
+            model_enforce_eager, layered_plan
+        )
+        is expected
+    )
+
+
 def test_model_config_validates_local_mtp_drafter_as_single_pp_rank(monkeypatch):
     fake_registry = SimpleNamespace(
         is_pp_supported_model=lambda _architectures, _model_config: False,

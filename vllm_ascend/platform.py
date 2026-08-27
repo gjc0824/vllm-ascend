@@ -868,9 +868,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             raise ValueError(
                 "layered_prefill_config Phase 1 does not support upstream EPLB"
             )
-        if not getattr(vllm_config.model_config, "enforce_eager", False):
+        enforce_eager = getattr(vllm_config.model_config, "enforce_eager", False)
+        require_eager = getattr(layered_prefill_config, "require_eager", True)
+        if require_eager and not enforce_eager:
             raise ValueError(
-                "layered_prefill_config Phase 1 requires enforce_eager=True"
+                "layered_prefill_config requires enforce_eager=True when "
+                "require_eager=True"
             )
         if getattr(cache_config, "enable_prefix_caching", False):
             raise ValueError(
@@ -894,26 +897,37 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             )
         compilation_config = getattr(vllm_config, "compilation_config", None)
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
-        if cudagraph_mode is not None and getattr(cudagraph_mode, "name", None) not in (
-            None,
-            "NONE",
-        ):
+        cudagraph_mode_name = getattr(cudagraph_mode, "name", None)
+        allowed_cudagraph_modes = (
+            (None, "NONE")
+            if enforce_eager
+            else (None, "NONE", "FULL_DECODE_ONLY")
+        )
+        if cudagraph_mode_name not in allowed_cudagraph_modes:
             raise ValueError(
-                "layered_prefill_config Phase 1 requires cudagraph_mode=NONE"
+                "layered_prefill_config supports cudagraph_mode=NONE or "
+                "FULL_DECODE_ONLY; Prefill layer groups remain eager"
             )
         compilation_mode = getattr(compilation_config, "mode", None)
-        if compilation_mode is not None and getattr(compilation_mode, "name", None) not in (
-            None,
-            "NONE",
-        ):
+        compilation_mode_name = getattr(compilation_mode, "name", None)
+        if cudagraph_mode_name == "FULL_DECODE_ONLY":
+            # vLLM represents the standard Ascend full Decode graph setup as
+            # VLLM_COMPILE + FULL_DECODE_ONLY. The partial-layer P call bypasses
+            # the wrapped full-model forward and is forced eager in the runner.
+            # Compilation also initializes the attention graph workspaces.
+            allowed_compilation_modes = ["VLLM_COMPILE"]
+        else:
+            allowed_compilation_modes = [None, "NONE"]
+        if compilation_mode_name not in allowed_compilation_modes:
             raise ValueError(
-                "layered_prefill_config Phase 1 requires compilation mode NONE"
+                "layered_prefill_config requires VLLM_COMPILE with "
+                "FULL_DECODE_ONLY, or compilation mode NONE without a graph"
             )
         if getattr(
             getattr(ascend_config, "xlite_graph_config", None), "enabled", False
         ):
             raise ValueError(
-                "layered_prefill_config Phase 1 does not support Xlite/ACL graphs"
+                "layered_prefill_config Phase 1 does not support Xlite graph mode"
             )
         if kv_transfer_config is not None:
             raise ValueError(

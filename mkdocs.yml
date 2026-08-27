@@ -308,6 +308,8 @@ nav:
         - developer_guide/Design_Documents/context_parallel.md
         - developer_guide/Design_Documents/balance_schedule_refactor.md
         - developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
+        - developer_guide/Design_Documents/layered_prefill_pp_pd_design.md
+        - developer_guide/Design_Documents/layered_prefill_development_plan.md
         - developer_guide/Design_Documents/quantization.md
         - developer_guide/Design_Documents/npugraph_ex.md
     - Evaluation:

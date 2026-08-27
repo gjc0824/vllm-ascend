@@ -195,7 +195,12 @@ class TestNPUPlatform(TestBase):
         cache_config.mamba_cache_mode = "none"
 
         ascend_config = self.mock_vllm_ascend_config()
-        ascend_config.scheduler_config.layered_prefill_config = SimpleNamespace(enabled=True)
+        layered_prefill_config = SimpleNamespace(
+            enabled=True, require_eager=True
+        )
+        ascend_config.scheduler_config.layered_prefill_config = (
+            layered_prefill_config
+        )
         ascend_config.sparse_kv_offload_config.enabled = False
         ascend_config.eplb_config.dynamic_eplb = False
         ascend_config.enable_prefill_mc2 = False
@@ -205,6 +210,34 @@ class TestNPUPlatform(TestBase):
 
         vllm_config.parallel_config.data_parallel_size = 2
         with pytest.raises(ValueError, match="requires data_parallel_size=1"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.model_config.enforce_eager = False
+        with pytest.raises(ValueError, match="when require_eager=True"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+        layered_prefill_config.require_eager = False
+        vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+        vllm_config.compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        with pytest.raises(ValueError, match="FULL_DECODE_ONLY"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        with pytest.raises(ValueError, match="requires VLLM_COMPILE"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        with pytest.raises(ValueError, match="requires VLLM_COMPILE"):
             _check_ascend_config(vllm_config, ascend_config)
 
     def test_get_recompute_scheduler_cls(self):
