@@ -30,11 +30,11 @@
 | 配置 | 结果 | 判断 |
 | --- | --- | --- |
 | TP=2，2103-token，多 group，D-only graph | P 与 eager reference 一致，D 与 graph baseline 一致，确认 graph replay | 可进入性能基线 |
-| TP=4，633-token，2-group，D-only graph | 生成文本正常，确认 D graph replay | 可进入短输入性能基线，但仍需 logits/KV 自动验收 |
-| TP=4，2103-token，2-group，全 eager | P 输出与普通 eager baseline 不一致，D 输出一致 | Phase 1 精度阻塞项 |
-| TP=4，2103-token，5-group，D-only graph | P 输出不一致，并有一个 D 输出与普通 graph baseline 不一致 | 需要同时检查 P frontier 和 D/P view/batch invariance |
+| TP=4，633-token，2-group，D-only graph | P 输出一致，D 输出一致；单 Decode 流确认 ACLGraph replay，Layered P eager/D graph 均命中 | 短输入路径通过；多 Decode 流仍需跟踪 batch invariance |
+| TP=4，2103-token，2-group，全 eager | Layered P-only 输出与普通 P-only eager 一致（`\\boxed{A}`）；混合 D/P 普通 eager 输出为 `\\boxed{0}`，与 P-only 参照不同 | Layered frontier 差异已隔离；普通 mixed-batch 数值漂移仍是遗留问题 |
+| TP=4，2103-token，5-group，D-only graph | 已完成 P-only/eager 对照；graph 长文本仍需独立复测 | M0.1 尚未关闭 |
 
-“文本正常”不是最终正确性标准。正式验收应同时检查最终 token、top-1、logits 容差、layer/KV 执行次数和跨请求状态隔离。
+“文本正常”不是最终正确性标准。当前 TP4 验证器已检查最终文本、P-only 语义参照、group 数量、D graph replay、Layered P eager/D graph 选择以及可选 Decode 逐字一致性；尚未实现逐 group hidden/residual、最终 logits/top-k、layer/KV 执行次数和跨请求状态隔离的自动验收。
 
 ### 2.3 尚未实现或未验收
 
