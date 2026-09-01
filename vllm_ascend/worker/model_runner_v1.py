@@ -51,6 +51,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -2039,11 +2040,9 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        """Execute the fixed Phase 1 D -> P subbatch sequence."""
+        """Execute D and P subbatches, carrying both through the PP chain."""
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
-        if intermediate_tensors is not None:
-            raise RuntimeError("Layered prefill Phase 1 does not support PP tensors")
         layered_model = self.get_model()
         if not getattr(layered_model, "supports_layered_prefill", False):
             raise RuntimeError(
@@ -2063,17 +2062,22 @@ class NPUModelRunner(GPUModelRunner):
         main_sampling_masks = self._capture_layered_sampling_masks()
         p_input_batch = self._get_layered_prefill_input_batch(len(p_req_ids))
         sub_batches: list[LayeredSubBatchState] = []
+        pp_intermediates: list[IntermediateTensors] = []
 
-        # Both subbatches represent one logical scheduler step.  Feed the
-        # combined token count to the shared MoE selector so a short D query
-        # cannot choose MC2 while the long P query chooses AllGather.
-        self._layered_moe_comm_token_count = scheduler_output.total_num_scheduled_tokens
+        # The outer worker protocol performs one receive and one send per
+        # scheduler step.  PP layered steps therefore carry D and P rows in a
+        # single IntermediateTensors object, with explicit row counts so graph
+        # padding on the D view cannot make the next stage guess incorrectly.
+        d_intermediate, p_intermediate = self._split_layered_pp_intermediate(
+            intermediate_tensors
+        )
+
         self._executing_layered_subbatch = True
         one_time_updates_pending = True
         try:
-            for req_ids, active_batch, active_plan in (
-                (d_req_ids, main_input_batch, None),
-                (p_req_ids, p_input_batch, plan),
+            for req_ids, active_batch, active_plan, active_intermediate in (
+                (d_req_ids, main_input_batch, None, d_intermediate),
+                (p_req_ids, p_input_batch, plan, p_intermediate),
             ):
                 if not req_ids:
                     continue
@@ -2086,6 +2090,19 @@ class NPUModelRunner(GPUModelRunner):
                     for req_id in scheduler_output.finished_req_ids:
                         active_batch.remove_request(req_id)
                 self.execute_model_state = None
+                # Keep the Decode graph's MoE backend identical to a normal
+                # Decode step.  The long P subbatch may legitimately choose a
+                # different backend (typically AllGather), so only override
+                # its selector with the logical scheduler-step token count.
+                self._layered_moe_comm_token_count = (
+                    None
+                    if active_plan is None
+                    else getattr(
+                        scheduler_output,
+                        "total_num_scheduled_tokens",
+                        sum(scheduler_output.num_scheduled_tokens.values()),
+                    )
+                )
                 sub_output = self._subset_scheduler_output(
                     scheduler_output,
                     req_ids,
@@ -2093,12 +2110,35 @@ class NPUModelRunner(GPUModelRunner):
                     include_one_time_updates=one_time_updates_pending,
                 )
                 one_time_updates_pending = False
-                result = self.execute_model(sub_output, None)
+                result = self.execute_model(sub_output, active_intermediate)
+                if active_batch is p_input_batch:
+                    # P attention writes the prompt KV cache on auxiliary
+                    # streams on Ascend.  The next scheduler step may replay
+                    # the Decode graph immediately; wait here so graph
+                    # reads cannot race the preceding P cache update.
+                    torch.npu.synchronize()
+                if isinstance(result, IntermediateTensors):
+                    # A non-last rank has no sampling state.  Keep the result
+                    # until both views have completed and then forward them as
+                    # one PP payload.
+                    if active_batch is main_input_batch and p_req_ids:
+                        torch.npu.synchronize()
+                        stable_result = IntermediateTensors(
+                            {
+                                key: value.clone()
+                                if isinstance(value, torch.Tensor)
+                                else value
+                                for key, value in result.tensors.items()
+                            }
+                        )
+                        stable_result.kv_connector_output = getattr(
+                            result, "kv_connector_output", None
+                        )
+                        result = stable_result
+                    pp_intermediates.append(result)
+                    continue
                 if result is not None:
-                    raise RuntimeError(
-                        "Layered prefill Phase 1 expects PP=1 execute_model to "
-                        "return None"
-                    )
+                    raise RuntimeError("Layered prefill returned an unexpected output")
                 if active_batch is main_input_batch and p_req_ids:
                     # D and P can legitimately select different MoE backends
                     # (for example MC2 for a one-token D batch and AllGather
@@ -2141,6 +2181,17 @@ class NPUModelRunner(GPUModelRunner):
             self._layered_moe_comm_token_count = None
             self.input_batch = main_input_batch
 
+        if pp_intermediates:
+            d_output = pp_intermediates[0] if d_req_ids else None
+            p_output = pp_intermediates[-1]
+            packed = self._combine_layered_pp_intermediate(d_output, p_output)
+            packed.kv_connector_output = getattr(d_output, "kv_connector_output", None)
+            if packed.kv_connector_output is None:
+                packed.kv_connector_output = getattr(
+                    p_output, "kv_connector_output", None
+                )
+            return packed
+
         self.execute_model_state = LayeredExecuteModelState(
             scheduler_output=scheduler_output,
             sub_batches=tuple(sub_batches),
@@ -2148,6 +2199,124 @@ class NPUModelRunner(GPUModelRunner):
             main_sampling_masks=main_sampling_masks,
         )
         return None
+
+    def _layered_pp_group_owner(self, plan: Any) -> int:
+        pp = get_pp_group()
+        configs = (
+            getattr(self.model_config, "hf_text_config", None),
+            getattr(self.model_config, "hf_config", None),
+            self.model_config,
+        )
+        num_layers = int(plan.group_end)
+        for config in configs:
+            raw_num_layers = getattr(config, "num_hidden_layers", None)
+            if isinstance(raw_num_layers, int):
+                num_layers = int(raw_num_layers)
+                break
+        for rank in range(pp.world_size):
+            start, end = get_pp_indices(num_layers, rank, pp.world_size)
+            if start <= plan.group_start and plan.group_end <= end:
+                return rank
+        raise RuntimeError(
+            f"Layered group [{plan.group_start}, {plan.group_end}) is not "
+            "aligned with the PP layer partition"
+        )
+
+    @staticmethod
+    def _layered_pp_row_count(value: Any, key: str) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            row_count = value
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.device.type == "cpu"
+            and value.numel() == 1
+        ):
+            row_count = int(value.item())
+        else:
+            raise RuntimeError(
+                f"Layered PP metadata {key} must be an integer or scalar tensor"
+            )
+        if row_count < 0:
+            raise RuntimeError(f"Layered PP metadata {key} cannot be negative")
+        return row_count
+
+    @staticmethod
+    def _split_layered_pp_intermediate(
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> tuple[IntermediateTensors | None, IntermediateTensors | None]:
+        if intermediate_tensors is None:
+            return None, None
+        tensors = intermediate_tensors.tensors
+        if "layered_pp_d_rows" not in tensors or "layered_pp_p_rows" not in tensors:
+            raise RuntimeError(
+                "Layered PP intermediate tensors are missing D/P row metadata"
+            )
+        d_rows = NPUModelRunner._layered_pp_row_count(
+            tensors["layered_pp_d_rows"], "layered_pp_d_rows"
+        )
+        p_rows = NPUModelRunner._layered_pp_row_count(
+            tensors["layered_pp_p_rows"], "layered_pp_p_rows"
+        )
+        tensor_items = [
+            (key, value)
+            for key, value in tensors.items()
+            if key not in ("layered_pp_d_rows", "layered_pp_p_rows")
+            and isinstance(value, torch.Tensor)
+        ]
+        if not tensor_items:
+            raise RuntimeError("Layered PP intermediate tensors contain no tensors")
+        for key, value in tensor_items:
+            if value.ndim == 0 or d_rows + p_rows > value.shape[0]:
+                raise RuntimeError(
+                    f"Layered PP metadata exceeds {key} row dimension: "
+                    f"{d_rows}+{p_rows}>{value.shape[0] if value.ndim else 0}"
+                )
+        d_tensors = {
+            key: value[:d_rows] for key, value in tensor_items
+        }
+        p_tensors = {
+            key: value[d_rows : d_rows + p_rows] for key, value in tensor_items
+        }
+        return IntermediateTensors(d_tensors), IntermediateTensors(p_tensors)
+
+    @staticmethod
+    def _combine_layered_pp_intermediate(
+        d_intermediate: IntermediateTensors | None,
+        p_intermediate: IntermediateTensors,
+    ) -> IntermediateTensors:
+        d_tensors = d_intermediate.tensors if d_intermediate is not None else {}
+        keys = dict.fromkeys((*d_tensors, *p_intermediate.tensors))
+        tensors: dict[str, Any] = {}
+        for key in keys:
+            d_value = d_tensors.get(key)
+            p_value = p_intermediate.tensors.get(key)
+            if isinstance(d_value, torch.Tensor) and isinstance(p_value, torch.Tensor):
+                tensors[key] = torch.cat((d_value, p_value), dim=0)
+            elif isinstance(d_value, torch.Tensor):
+                tensors[key] = d_value
+            elif isinstance(p_value, torch.Tensor):
+                tensors[key] = p_value
+        d_rows = next(
+            (
+                value.shape[0]
+                for value in d_tensors.values()
+                if isinstance(value, torch.Tensor)
+            ),
+            0,
+        )
+        p_rows = next(
+            (
+                value.shape[0]
+                for value in p_intermediate.tensors.values()
+                if isinstance(value, torch.Tensor)
+            ),
+            None,
+        )
+        if p_rows is None:
+            raise RuntimeError("Layered P intermediate tensors contain no tensors")
+        tensors["layered_pp_d_rows"] = torch.tensor(d_rows, dtype=torch.int64)
+        tensors["layered_pp_p_rows"] = torch.tensor(p_rows, dtype=torch.int64)
+        return IntermediateTensors(tensors)
 
     @staticmethod
     def _merge_layered_outputs(
@@ -2328,16 +2497,16 @@ class NPUModelRunner(GPUModelRunner):
         if layered_plan is not None and not self._executing_layered_subbatch:
             return self._execute_layered_step(scheduler_output, intermediate_tensors)
         if layered_plan is not None:
-            pp = get_pp_group()
-            if pp.world_size != 1:
-                raise RuntimeError(
-                    "Layered prefill Phase 1 requires pipeline_parallel_size=1"
-                )
             layered_model = self.get_model()
             if set(scheduler_output.num_scheduled_tokens) != set(layered_plan.prefill_req_ids):
-                raise RuntimeError(
-                    "Layered P subbatch contains request IDs outside the plan"
-                )
+                # The layered subbatch intentionally contains only P rows.
+                # The outer D view is validated by _execute_layered_step.
+                if not set(scheduler_output.num_scheduled_tokens).issubset(
+                    set(layered_plan.prefill_req_ids)
+                ):
+                    raise RuntimeError(
+                        "Layered P subbatch contains request IDs outside the plan"
+                    )
        
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -2697,12 +2866,15 @@ class NPUModelRunner(GPUModelRunner):
                     raise RuntimeError(
                         "Layered prefill Phase 1 does not support padded eager batches"
                     )
-                self._set_layered_prefill_moe_layer_offset(
-                    layered_plan.group_start
-                )
+                self._set_layered_prefill_moe_layer_offset(layered_plan.group_start)
                 req_id = layered_plan.prefill_req_ids[0]
                 frontier = self.layered_prefill_state.get(req_id)
-                if layered_plan.group_id > 0:
+                pp = get_pp_group()
+                owner = self._layered_pp_group_owner(layered_plan)
+                owner_has_frontier = (
+                    layered_plan.group_id > 0 and pp.rank_in_group == owner
+                )
+                if owner_has_frontier:
                     if frontier is None:
                         raise RuntimeError(
                             f"Missing layered activation frontier for request {req_id}"
@@ -2716,13 +2888,34 @@ class NPUModelRunner(GPUModelRunner):
                     initial_input_ids = None
                     initial_inputs_embeds = None
                 else:
-                    if frontier is not None:
+                    if frontier is not None and pp.rank_in_group == owner:
                         raise RuntimeError(
                             f"Unexpected layered frontier for group 0 request {req_id}"
                         )
                     frontier_tuple = None
-                    initial_input_ids = input_ids
-                    initial_inputs_embeds = inputs_embeds
+                    if layered_plan.group_id == 0 and pp.rank_in_group == 0:
+                        # The first stage owns the embedding operation.  It is
+                        # transported through earlier no-op stages until the
+                        # stage owning group 0 consumes it.
+                        initial_input_ids = input_ids
+                        initial_inputs_embeds = inputs_embeds
+                    elif pp.rank_in_group < owner and layered_plan.group_id > 0:
+                        # Before the owner stage P rows are transport-only.
+                        # Rank 0 has no incoming P activation, so construct a
+                        # correctly shaped placeholder instead of embedding.
+                        hidden_size = self.model_config.get_hidden_size()
+                        initial_input_ids = None
+                        initial_inputs_embeds = torch.zeros(
+                            (num_tokens_padded, hidden_size),
+                            dtype=self.model_config.dtype,
+                            device=self.device,
+                        )
+                    else:
+                        initial_input_ids = None
+                        initial_inputs_embeds = None
+                receives_pp_activation = pp.rank_in_group > owner
+                if receives_pp_activation and intermediate_tensors is None:
+                    raise RuntimeError("Layered PP stage did not receive P activation")
                 layered_output = layered_model.forward_layered_prefill(
                     input_ids=initial_input_ids,
                     positions=positions[:num_tokens_padded],
@@ -2730,7 +2923,9 @@ class NPUModelRunner(GPUModelRunner):
                     layer_end=layered_plan.group_end,
                     frontier=frontier_tuple,
                     inputs_embeds=initial_inputs_embeds,
-                    intermediate_tensors=None,
+                    intermediate_tensors=(
+                        intermediate_tensors if receives_pp_activation else None
+                    ),
                 )
                 if layered_output.hidden_states.shape[0] != num_tokens_padded:
                     raise RuntimeError(
@@ -2769,6 +2964,28 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and layered_plan is None:
                 hidden_states, aux_hidden_states = hidden_states
+            if layered_plan is not None and not get_pp_group().is_last_rank:
+                # Let the outer worker perform the single PP send for the
+                # packed D/P payload.  This also avoids the broadcast-output
+                # fast path sending only one of the two subbatches.
+                transport_residual = layered_output.residual
+                if transport_residual is None:
+                    # Stages before the group owner carry placeholders only.
+                    # Keep the PP tensor schema row-aligned with the Decode
+                    # view; the owner replaces this value with its frontier.
+                    transport_residual = torch.zeros_like(hidden_states)
+                layered_intermediate = IntermediateTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": transport_residual,
+                    }
+                )
+                layered_intermediate.kv_connector_output = kv_connector_output
+                self.kv_connector_output = kv_connector_output
+                self._finalize_dump_data()
+                if self.dynamic_eplb:
+                    self.eplb_updator.forward_end(self.eplb_heat_collection_status)
+                return layered_intermediate
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -3112,35 +3329,16 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self.input_batch.sampling_metadata
-        trace_sampling = (
-            self._executing_layered_subbatch
-            and os.environ.get("VLLM_LAYERED_PREFILL_TRACE") == "1"
-        )
-        if trace_sampling and logits is not None:
-            logger.info(
-                "Layered sample enter req_ids=%s logits_shape=%s "
-                "argmax=%s",
-                self.input_batch.req_ids,
-                tuple(logits.shape),
-                logits.argmax(dim=-1).detach().cpu().tolist(),
-            )
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
-            result = self.sampler(
+            return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
-            if trace_sampling:
-                logger.info(
-                    "Layered sample output req_ids=%s sampled=%s",
-                    self.input_batch.req_ids,
-                    result.sampled_token_ids.detach().cpu().tolist(),
-                )
-            return result
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]

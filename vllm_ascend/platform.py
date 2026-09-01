@@ -824,16 +824,36 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         kv_transfer_config = vllm_config.kv_transfer_config
-        if parallel_config.pipeline_parallel_size != 1:
+        if parallel_config.pipeline_parallel_size < 1:
+            raise ValueError("pipeline_parallel_size must be positive")
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_text_config", None) or getattr(
+            model_config, "hf_config", None
+        )
+        raw_num_hidden_layers = getattr(
+            hf_config or model_config, "num_hidden_layers", None
+        )
+        num_hidden_layers = (
+            int(raw_num_hidden_layers)
+            if isinstance(raw_num_hidden_layers, int)
+            else None
+        )
+        if (
+            num_hidden_layers is not None
+            and parallel_config.pipeline_parallel_size > num_hidden_layers
+        ):
             raise ValueError(
-                "layered_prefill_config Phase 1 requires "
-                "pipeline_parallel_size=1"
+                "layered_prefill_config pipeline_parallel_size cannot exceed "
+                "the model layer count"
             )
         # Layered Prefill executes the Decode and Prefill views as separate
         # forwards.  Every TP rank therefore enters the same layer loop and
         # its existing TP collectives remain ordered.  TP>1 is supported;
         # when EP is enabled, the Ascend AlltoAll path restores the physical
         # TP token split after vLLM collapses routed-expert TP to one.
+        # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
+        # one message per step.  Async/DBO remain disabled below because they
+        # introduce multiple in-flight frontiers.
         # sequence parallelism is still rejected below because it changes the
         # frontier/token-row layout.  DP remains restricted to one rank until
         # the scheduler plan is synchronized across DP/EP ranks.

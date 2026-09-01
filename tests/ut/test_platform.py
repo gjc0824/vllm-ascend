@@ -172,9 +172,10 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
 
-    def test_layered_prefill_accepts_tp_gt_one_but_keeps_dp_one(self):
+    def test_layered_prefill_accepts_tp_and_pp_gt_one_but_keeps_dp_one(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.parallel_config.tensor_parallel_size = 4
+        vllm_config.parallel_config.pipeline_parallel_size = 2
         vllm_config.parallel_config.data_parallel_size = 1
         vllm_config.parallel_config.enable_dbo = False
         vllm_config.parallel_config.enable_eplb = False
@@ -184,6 +185,9 @@ class TestNPUPlatform(TestBase):
         vllm_config.model_config.is_multimodal = False
         vllm_config.model_config.is_multimodal_model = False
         vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.model_config.hf_text_config = SimpleNamespace(
+            num_hidden_layers=48
+        )
         vllm_config.lora_config = None
         vllm_config.compilation_config.mode = CompilationMode.NONE
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -208,6 +212,11 @@ class TestNPUPlatform(TestBase):
 
         _check_ascend_config(vllm_config, ascend_config)
 
+        vllm_config.parallel_config.pipeline_parallel_size = 49
+        with pytest.raises(ValueError, match="cannot exceed the model layer count"):
+            _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.parallel_config.pipeline_parallel_size = 2
         vllm_config.parallel_config.data_parallel_size = 2
         with pytest.raises(ValueError, match="requires data_parallel_size=1"):
             _check_ascend_config(vllm_config, ascend_config)

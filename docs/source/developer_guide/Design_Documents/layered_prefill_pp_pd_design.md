@@ -2,10 +2,10 @@
 
 ## 1. 文档状态
 
-- 状态：实施中。Phase 1 参考实现已落地，但正确性、资源和生命周期验收尚未闭环。
-- 当前里程碑：**Phase 1 语义闭环 + D-only graph 适配**；支持边界为 V1、PP=1、DP=1、一个 Prefill request、固定 `k=1`。
-- 下一里程碑：**Phase 2 DP=1 的 TP/EP eager + 统一通信选择**；当前代码中的 layered AlltoAll override 和 MC2 启动拒绝仍需按计划调整，尚未开始 EP E2E 验收。
-- 最近更新：2026-08-27。
+- 状态：实施中。Phase 1 参考实现、PP=2/4 图/eager，以及 PP=2+TP=2+EP=2 的 eager/单 Decode graph 受限文本精度已落地。
+- 当前里程碑：**Phase 1 语义闭环 + PP eager MVP + D-only graph 适配**；支持边界为 V1、PP=1/2/4、DP=1、stage-aligned layer groups、一个 Prefill request、固定 `k=1`。
+- 下一里程碑：完成 **logits/KV、生命周期和 PP bubble 验收**；随后扩展 TP/EP 矩阵和 E2E 验收。
+- 最近更新：2026-09-01。
 - 执行计划：[Layered Prefill 开发计划](layered_prefill_development_plan.md)。
 - 目标：在 `pipeline parallelism (PP)` 与 `prefill/decode (P/D)` 混部的单个引擎中，让 Prefill 请求沿 layer group 推进，同时让 Decode 请求每一步执行完整模型，从而降低 PP stage 的时延不均衡和流水气泡。
 - 适用仓库：当前工作区中的 `vllm` 与 `vllm-ascend`。
@@ -43,22 +43,24 @@ Layered Prefill（分层 Prefill）不会丢弃模型计算，也不是 early-ex
 建议采用“上游最小通用接口 + Ascend 实验实现”的路线：
 
 - 先在上游 vLLM 抽象出 Layered Prefill 的执行计划和模型能力接口，避免在 vllm-ascend 中复制整个 `Scheduler.schedule()`。
-- 第一阶段只支持 **PD-mixed**（`kv_role=kv_both` 或无 KV connector）、PP=1 的参考语义、一个 Prefill cohort，使用 eager；保留 DP=1 以保证各 EP rank 的 scheduler plan 一致，但允许 TP>1。下一步先做 DP=1、TP/EP>1 的 EP 正确性基线：普通 forward 和 layered 的 MoE 通信后端必须都调用同一个标准 selector 和容量判断，禁止为 layered 强制 AlltoAll 或增加专用通信分支。若标准 selector 根据当前子批次 token 数选择非 fused MC2，则该路径也属于首发 EP 范围；AlltoAll 仅作为 selector 的正常 fallback。PP>1、DP>1/DP+EP、PD 分离、SP/PCP/DCP、异步调度、DBO、Speculative/MTP、Mamba/hybrid、Multimodal 和 LoRA 后置。
+- 首发只支持 **PD-mixed**（`kv_role=kv_both` 或无 KV connector）、DP=1、一个 Prefill cohort，固定 `k=1`，使用 eager P；PP=2/4 使用 stage-aligned global plan 和单个 D/P intermediate payload，TP/EP 继续复用现有通信 selector。PP=2/4 图/eager和 PP=2+TP=2+EP=2 的 eager/单 Decode graph 受限文本验证已经通过；logits/KV、生命周期和 bubble 指标仍需 NPU 验收。DP>1/DP+EP、PD 分离、SP/PCP/DCP、异步调度、DBO、Speculative/MTP、Mamba/hybrid、Multimodal 和 LoRA 后置。
 - 先用一个明确的 MoE/GQA 模型验证语义和收益；Dense 模型默认回退到普通 chunked prefill，因为论文的 Dense 消融中 Layered Prefill 反而更慢。
 - 论文的 one-group-per-iteration 是正确性基线；最终目标可以在此基础上动态选择连续的 `k` 个 group，使本步 Prefill 计算落在 Decode 可用时延预算内。
 - eager 语义正确后，可以先复用现有 `FULL_DECODE_ONLY` 捕获 D 子批次，P layer group 仍保持 eager，以便尽早获得可比较的 TBT 数据；P group 图、DP+EP、Prefix/KV pool 和 PD 分离仍应后置。
 
 ### 2.4 当前工程判断
 
-截至 2026-08-27，当前实现已经足以在受限配置上开始 TP=2/4 的收益测量，但还不能视为 Phase 1 验收完成：
+截至 2026-09-01，当前实现已经足以在受限配置上开始 TP/PP/EP 的收益测量，但还不能视为 Phase 1 验收完成：
 
 - TP=2 的 2103-token、多 group 路径已经通过双参照文本比较；TP=4 的 633-token、2-group 路径能够生成正常文本，并确认 D 子批次实际 replay ACLGraph。
+- TP=1、PP=4 的 2523-token、8-group graph，以及 TP=2、PP=2、EP=2 的 633-token、2-group graph 已通过单 Decode 严格验收；EP 日志确认实际 `ep_size=2` 和 MC2/AllGather。
+- 验收器对 Prefill 使用关闭 Layered 的同拓扑 eager/graph 双参考精确匹配，对 Decode 使用关闭 Layered 的同 graph 严格匹配。两个并发 Decode 流下关闭 Layered 的 graph baseline 自身存在第二路文本非确定性，因此默认门禁使用单 Decode，双流作为压力项保留。
 - TP=4 的 2103-token 路径仍有输出差异：全 eager 下 P 输出已经与普通 eager baseline 不一致；D-only graph 的 5-group 用例中还观察到一个 D 输出与普通 graph baseline 不一致。该问题不是“补 P group 图”能够解决的，必须先定位首次 logits/hidden/KV 偏差。
 - 当前两次 model-call 是语义参考路径，不等价于论文的逐层 P/D 混合 batch。无论初测收益正负，都要通过分项 profiling 区分算法收益、P eager 开销和双调用开销。
 - 短期不实现 P group ACLGraph。现有 D-only graph 已经排除主要 Decode eager 开销；只有 profiling 证明 P eager 是主要瓶颈时，才为有限 layout/range 增加 P graph key。
 - 若目标是验证 PP bubble 改善，则 PP>1 是必需里程碑；PP=1 的 TP 结果只能证明当前 MoE/TP 路径的语义和局部收益，不能代表 PP + PD 目标已经完成。
 
-近期执行顺序为：Phase 1 正确性/资源闭环与 TP 性能测量并行；下一实现里程碑是 **DP=1 的 EP + 标准通信选择**，随后才做 P/D 单 forward、FusedMC2、PP=2/4、自适应 `k_t` 和 DP>1。FusedMC2 放在单次 forward 之后，是因为它需要最终混合 batch 的 `global_bs`、padding 和 active-row mask；非 fused MC2 则随标准 selector 在 EP 首发中验证。详细任务、依赖和退出条件见[开发计划](layered_prefill_development_plan.md)。
+近期执行顺序为：在已通过的 PP=2 短输入文本验证上，继续完成 **PP=2/4 的长输入、logits/KV、lifecycle 和 bubble 观测**，并与已验证 TP 配置的性能测量并行；随后做 DP=1 的 EP + 标准通信选择，再推进 P/D 单 forward、FusedMC2、自适应 `k_t` 和 DP>1。FusedMC2 放在单次 forward 之后，是因为它需要最终混合 batch 的 `global_bs`、padding 和 active-row mask；非 fused MC2 则随标准 selector 验证。详细任务、依赖和退出条件见[开发计划](layered_prefill_development_plan.md)。
 
 ## 3. 论文理解
 
@@ -439,7 +441,7 @@ step_time <= decode_target + allowed_prefill_slack
 | ACLGraph/CUDA Graph/torch.compile | 动态 layer range、row mask、P/D shape 会导致 graph 组合爆炸；图通常捕获完整 layer loop | 语义首发使用 eager；D-only view 可复用 `FULL_DECODE_ONLY` 做性能对照，P group graph 后置并由 profiling 决定 |
 | `VLLM_PP_LAYER_PARTITION` | 不同 stage layer 数和 group 边界不一致会产生新的 stage bottleneck | 首发要求显式校验，group 尽量 stage-aligned |
 | TP | 同一个 plan 下各 TP rank 可保持相同 layer 顺序 | 首发保留，作为 PP/TP 基线 |
-| EP/DeepEP/EPLB | P 行过滤后 token 数、split 和 expert routing 需在所有 rank 保持一致；EPLB 统计也会改变 | Phase 2 先做 PP=1、DP=1 的 EP=1/2/4；ordinary/layered 共用标准 communicator selector，非 fused MC2 随 selector 验证；FusedMC2、DP+EP、EPLB 后置 |
+| EP/DeepEP/EPLB | P 行过滤后 token 数、split 和 expert routing 需在所有 rank 保持一致；EPLB 统计也会改变 | PP MVP 保持 DP=1 并复用标准 communicator selector；EP=1/2/4 多进程、非 fused MC2 随 selector 验证；FusedMC2、DP+EP、EPLB 后置 |
 | SP/PCP/DCP/CP | row 维切分或 context cache 分片会改变 frontier row mapping；Ascend PCP 本身已有约束 | 首发禁用；后续先处理 DCP，再评估其他 CP |
 | Speculative/MTP/Eagle | token progress、draft slots、PP sampled-token broadcast 假设每步有完整 token 结果 | 首发禁用 |
 | Mamba/hybrid cache | 除 KV 外还有 recurrent/SSM state，layer 跳转不能只保存 hidden/residual | 首发禁用 |
@@ -461,10 +463,10 @@ step_time <= decode_target + allowed_prefill_slack
 | --- | --- | --- |
 | Phase 0：观测和基线 | 进行中 | 缺少正式 TP=2/4 TBT/TTFT、子批次耗时和 HBM 报告 |
 | Phase 1：PP=1 语义参考 | 进行中，尚未通过 | TP=4 长输入精度、KV 恰好一次、生命周期、frontier HBM/fallback 和 E2E 矩阵 |
-| Phase 2：DP=1 的 TP/EP eager + 统一通信 | 未开始 | 移除 layered 专用通信 override；EP=2/4 多进程、AlltoAll/MC2 selector、collective 顺序和数值正确性 |
+| Phase 2：DP=1 的 TP/EP eager + 统一通信 | 部分通过 | EP=2 的 PP=2 eager/单 Decode graph 已通过；仍缺 EP=4、AlltoAll、collective 顺序和更完整数值矩阵 |
 | Phase 3：P/D 单 forward | 未开始 | row compaction、active-row mask、单调用下的 attention/MoE/KV 语义 |
 | Phase 4：FusedMC2 | 未开始 | 依赖单 forward 的固定 `global_bs`、padding、active mask 和 fused kernel 契约 |
-| Phase 5：PP=2/4 eager MVP | 未开始 | global plan、frontier owner/转发、stage-aligned plan、多 rank correctness |
+| Phase 5：PP=2/4 stage-aligned MVP | 已实现，受限文本通过 | PP=2/4 eager/graph 文本已通过；仍缺 logits/KV、取消/抢占/finish、bubble 指标和失败路径 |
 | Phase 6：自适应 `k_t` | 未开始 | group cost model、Decode slack、EMA 和 fallback |
 | Phase 7：DP>1 及 DP+EP | 未开始 | cohort/plan 同步、frontier 归属/迁移、全局 token shape 和收益矩阵 |
 | Phase 8：图/模型/Prefix/KV/PD 扩展 | 部分前置 | 仅 D-only graph 已提前接入；P graph、模型/kernel、connector 生命周期未完成 |
@@ -494,10 +496,10 @@ step_time <= decode_target + allowed_prefill_slack
 
 ### Phase 2：DP=1 的 TP/EP eager + 统一通信
 
-这是下一实现里程碑，先不引入 PP 和 DP>1：
+这是 PP MVP 之后的通信验收里程碑，暂不引入 DP>1：
 
 - 配置固定为 V1、PP=1、DP=1、EP=2/4，TP 按模型支持覆盖 1/2/4，使用 eager、一个 P cohort、`k=1`；Phase 2 显式关闭 `enable_fused_mc2`。
-- ordinary forward 与 layered 的每一次 MoE 调用都使用同一个 `select_moe_comm_method`（或上游等价 selector）、同一容量/硬件判断和同一 dispatcher；删除或禁用按 `layered` 强制 AlltoAll 的临时 override。
+- ordinary forward 与 layered 的每一次 MoE 调用都使用同一个 `select_moe_comm_method`（或上游等价 selector）、同一容量/硬件判断和同一 dispatcher；当前实现不引入按 `layered` 强制 AlltoAll 的通信分支。
 - 当前 D/P 双子批次的 `num_tokens` 可以不同，因此 selector 可能自然选择不同后端；这不是 layered 定制，基线比较必须使用相同子批次 shape 并记录实际选择结果。
 - 非 fused MC2 只要标准 selector 选中且 active rows、padding、容量和 split 正确，就在本阶段验证；FusedMC2 留到 Phase 4。
 - 覆盖 EP=1/2/4、633/2103 tokens、2/4/5 groups，检查 logits、文本、routing shape、AlltoAll/MC2 split、collective 顺序和无 hang。
@@ -517,6 +519,8 @@ step_time <= decode_target + allowed_prefill_slack
 依赖 Phase 3 的单 forward active-row 语义。先为最终混合 batch 固定 `global_bs`、padding、`x_active_mask`、split 和输出压缩，再让标准 selector 在满足设备/容量条件时选择 FusedMC2。FusedMC2 失败或不支持时必须回退普通 MC2/AlltoAll；不得为 layered 添加另一套通信选择规则。
 
 ### Phase 5：PP=2/4 eager MVP
+
+当前代码已提供 stage-aligned 的 PP=2/4 eager MVP。2026-08-31 在 NPU 5/6 完成 TP=1、PP=2、633/1263-token、2/4-group、P+D 验证：全 eager 和 D `FULL_DECODE_ONLY` graph/P eager 两种模式均与关闭 Layered Prefill 的 Prefill/Decode 文本精确一致，并观察到预期的 graph replay 和子批次执行选择。4-group 用例覆盖了同一 PP stage 内连续多个 group 的 frontier 保存和恢复；验证器在全部 Decode 流产生首 token 后提交 P，以消除 active cohort 的入队竞态。本阶段剩余工作是扩展多进程 NPU 验收：
 
 - group 边界先与 PP stage 对齐，所有 rank 使用同一个 global plan。
 - 定义 frontier owner；owner 前的 stage 发送合法 placeholder，owner 注入 frontier，后续 stage 正常转发。
@@ -558,7 +562,7 @@ P group ACLGraph/compile capture 是条件优化，只有 profiling 证明 P eag
 
 启动校验应 fail-closed：
 
-- Phase 1/2/3/4 参考路径要求 `pipeline_parallel_size == 1`；Phase 5 起才允许 `pipeline_parallel_size > 1`，并校验 group layout 与 PP partition 对齐；
+- Phase 1/2/3/4 的原始参考路径要求 `pipeline_parallel_size == 1`；当前 PP MVP 允许 `pipeline_parallel_size` 为 2/4，并校验 group layout 与 PP partition 对齐；
 - `kv_role` 为 `kv_both` 或未配置；
 - 模型实现 `SupportsLayeredPrefill`；
 - 不启用首发互斥特性；
@@ -948,7 +952,7 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 1. Scheduler plan 必须在 TP/EP group 内完全一致；DP=1 避免不同 DP rank 的 P cohort 和 query 数不一致。TP>1 不改变 plan，只要求每个 TP rank 执行相同的 layer/collective 序列。
 2. 每个 step 的调用序列固定为 `D full forward -> P active-group forward`；所有 EP rank 以相同顺序进入每一个 MoE layer 的 dispatch/combine collective。
 3. D/P 两个 forward 分别进入 `set_ascend_forward_context()`，`num_tokens` 只表示当前 view 的真实 token 数，用于标准 MC2 capacity/selector 判断；不能把 P+D 总 token 数或 layered 标志传给通信选择器。
-4. ordinary forward 和 layered forward 必须调用同一个 `select_moe_comm_method`（或上游等价 selector），复用相同的硬件、容量、padding 和 fused 开关判断。当前 `vllm_ascend/ascend_forward_context.py` 中的 `get_layered_prefill_moe_comm_override()`/强制 AlltoAll 只能视为过渡实现，Phase 2 必须移除；不得以 layered 为条件定制通信逻辑。
+4. ordinary forward 和 layered forward 必须调用同一个 `select_moe_comm_method`（或上游等价 selector），复用相同的硬件、容量、padding 和 fused 开关判断。当前实现不引入 `get_layered_prefill_moe_comm_override()`/强制 AlltoAll；不得以 layered 为条件定制通信逻辑。
 5. 因 D/P 子批次 token shape 可能不同，标准 selector 可以分别选出 AllGather、非 fused MC2 或 AlltoAll；这属于输入形状导致的正常选择，不要求 D/P 强行使用同一后端。基线比较要使用相同的 view shape，并记录每次实际选择的 `comm_type`。
 6. 非 fused MC2 只要标准 selector 选中且 active rows、padding、容量、split 和输出恢复正确，就在本阶段验证。FusedMC2 依赖单次 forward 的固定 `global_bs`/`x_active_mask`，放到 Phase 4；不支持时回退普通 MC2/AlltoAll。
 7. 当前 `vllm_ascend/platform.py` 对 layered + MC2/FusedMC2 仍有启动拒绝门禁：Phase 2 只解除非 fused MC2 的 layered 专用拒绝，并让 selector 决定是否使用；FusedMC2 的门禁保留到 Phase 4，不能通过配置绕过其 active-row/global-batch 契约。
@@ -967,7 +971,7 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 | 1 | 上游 `vllm/vllm/v1/core/layered_prefill.py`、`request.py`、`sched/output.py`、`sched/scheduler.py` | plan、group cursor、commit token、一次性 KV reservation、preempt/abort 状态；默认关闭 |
 | 2 | 上游 `vllm/vllm/v1/worker/gpu/input_batch.py`、`worker/gpu/model_runner.py`、`worker/gpu/sample/*` | LayeredBatchView、frontier store、双子批次执行、sample mask、eager 生命周期 |
 | 3 | 上游 `model_executor/models/interfaces.py`、`models/qwen3_moe.py` | `SupportsLayeredPrefill` 和 Qwen3 MoE 参考实现；CPU/GPU 数值测试 |
-| 4 | `vllm-ascend/vllm_ascend/worker/model_runner_v1.py`、`ascend_forward_context.py`、EP dispatcher 相关测试 | PP=1、TP/EP eager 子批次；ordinary/layered 共用 communicator selector，并覆盖非 fused MC2/AlltoAll |
+| 4 | `vllm-ascend/vllm_ascend/worker/model_runner_v1.py`、`ascend_forward_context.py`、EP dispatcher 相关测试 | PP=1/2/4、TP/EP eager 子批次；ordinary/layered 共用 communicator selector，并覆盖非 fused MC2/AlltoAll |
 | 5 | 上游/Ascend runner、Attention/KV 和测试 | P/D 单 forward、row compaction、active-row mask、KV 和 sample 语义 |
 | 6 | `vllm-ascend` MC2/graph/kernel 相关代码 | FusedMC2；只接入标准 selector 已选择的 fused 路径 |
 | 7 | Scheduler/PP/timing/DP 相关代码 | PP=2/4、测量型 `k_t`，再做 DP>1/DP+EP 和收益矩阵 |
@@ -1009,10 +1013,10 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 ### 15.11 Phase 1 之后的优化顺序
 
 1. 先完成 Phase 1 退出门槛：TP=4 长输入精度、KV 恰好一次、请求生命周期、frontier HBM/fallback 和 E2E 测试；已验证 TP 配置的性能测量可与这些工作并行。
-2. **先做 DP=1 的 EP=2/4**：移除 layered 专用 AlltoAll override，ordinary/layered 共用标准 selector；随 selector 验证非 fused MC2、AlltoAll split、routing 和 collective 顺序。
-3. 在同一 `LayeredBatchView` 中合并 P/D rows，逐层使用 `D rows | active P rows`，并为 Attention metadata 增加 row compaction/active mask，去掉双 model-call。
-4. 在单次 forward 的 active-row/global batch 语义稳定后接入 FusedMC2；仍只允许标准 selector 选择该后端，失败回退 MC2/AlltoAll。
-5. 实现 PP=2/4 的 stage-aligned global plan、frontier owner 和跨 stage 转发，先保持 eager P 和 `k=1`。
+2. **先完成 PP=2/4 eager MVP 验收**：验证 stage-aligned global plan、frontier owner、D/P payload、collective 顺序和多进程文本/logits/KV/lifecycle。
+3. **完成 DP=1 的 EP=2/4 验收**：ordinary/layered 共用标准 selector；随 selector 验证非 fused MC2、AlltoAll split、routing 和 collective 顺序。
+4. 在同一 `LayeredBatchView` 中合并 P/D rows，逐层使用 `D rows | active P rows`，并为 Attention metadata 增加 row compaction/active mask，去掉双 model-call。
+5. 在单次 forward 的 active-row/global batch 语义稳定后接入 FusedMC2；仍只允许标准 selector 选择该后端，失败回退 MC2/AlltoAll。
 6. 引入 measured group cost、Decode slack 和 `k>1`；保持 `k=1`/普通 chunked fallback。
 7. 在上述语义稳定后扩展 DP>1，再组合 DP+EP；增加 cohort/plan、global active shape 和 collective-order 校验。
 8. P group ACLGraph/compile capture 是条件优化，不是下一个功能里程碑。只有 profiling 证明 P eager 是主要瓶颈时才实施；图 key 至少包含 layout、group range、P/D row shape、PP/EP communicator mode。D 子批次继续复用现有 `FULL_DECODE_ONLY`。
@@ -1020,17 +1024,20 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 
 ### 15.12 当前工作区实现状态
 
-截至 2026-08-27，当前代码处于 **Phase 1 语义闭环 + D-only graph 适配**，不是 Phase 8 的完整图/生态实现，也尚未达到 Phase 1 退出条件：
+截至 2026-09-01，当前代码处于 **Phase 1 语义闭环 + PP=2/4 和 EP+PP 受限文本验证通过 + D-only graph 适配**，不是 Phase 8 的完整图/生态实现，也尚未达到 Phase 1/Phase 5 退出条件：
 
-- Scheduler/Request/frontier 协议和 Qwen3-MoE partial-layer forward 已落地，范围仍为 V1、PP=1、DP=1、一个 P request、`k=1`。
+- Scheduler/Request/frontier 协议和 Qwen3-MoE partial-layer forward 已落地，范围为 V1、PP=1/2/4、DP=1、stage-aligned groups、一个 P request、`k=1`。
+- PP intermediate transport 将 D/P rows 合并为一次 ordinary PP 一收一发，并携带显式 row metadata；owner stage 注入本地 frontier，其他 stage 只转发或保存 frontier 副本。
 - TP-only 已覆盖 TP=2/4；D/P 都使用原有 TP AllGather MoE，partial layer group 会把 fast-MoE cursor 定位到 `group_start`。
 - `require_eager=true` 保留全 eager 参考路径；`require_eager=false` 时图模式只允许 `NONE` 或 `FULL_DECODE_ONLY`。启用后 D 子批次进入现有 ACLGraph，P 子批次由 runner 强制 eager。
-- `verify_layered_prefill_correctness.py` 使用双参照：P 输出与 eager baseline 比较，D graph replay 与普通 graph baseline 分开观察，避免把 compile/eager 的数值差异误判为 partial-layer 错误。
+- `verify_layered_prefill_correctness.py` 保留 P-only/eager mixed 诊断；Prefill 对关闭 Layered 的同拓扑 eager/graph 双参考做精确匹配，Decode 对关闭 Layered 的同 graph 参考做严格匹配。
 - 已验证 Qwen3-30B-A3B 的 TP=2（2103-token、多 group）双参照文本一致；TP=4（633-token、2-group）能够输出正常文本，且 D graph 实际 replay。
 - TP=4 的 2103-token 长 prompt 在全 eager 下已经出现 P 输出差异；D-only graph 的 5-group 用例除 P 输出差异外，还出现一个 D 输出与普通 graph baseline 不一致。需要增加 logits/hidden/KV 分层探针，区分 TP 数值、batch invariance、frontier 或 view 构造问题，不能只以“文本可读”作为通过标准。
-- 尚缺每层 P/KV 恰好执行一次、request reorder/finish/abort/OOM/preempt、frontier HBM 上限与 fallback 等 E2E 验收；因此“已有正常文本”只代表受限路径可运行。
+- TP=1、PP=2、633/1263-token、2/4-group 已在全 eager 和 D graph/P eager 下通过；TP=1、PP=4、2523-token、8-group 的 eager/graph 受限文本也通过。PP=4 的 graph/eager Prefill token 漂移由双参考字段显式记录。
+- TP=2、PP=2、EP=2、633-token、2-group 的 eager 和单 Decode graph 已通过，确认 `ep_size=2` 及 AllGather/MC2。两个并发 Decode 流下关闭 Layered 的 graph baseline 自身存在第二路文本非确定性，作为压力项保留。
+- 尚缺每层 P/KV 恰好执行一次、request reorder/finish/abort/OOM/preempt、frontier HBM 上限与 fallback 等 E2E 验收；因此当前结果只证明上述受限配置。
 
-因此下一步不是立即为 P group 新增 graph key。当前实现仍有临时的 layered EP AlltoAll override，尚未满足“普通与 layered 共用通信选择”的目标；应先在 DP=1、TP/EP=2/4、eager 下移除该 override，并验证标准 selector 选择的 MC2/AlltoAll 路径。随后依次是 P/D 单 forward、FusedMC2、PP=2/4、自适应 `k_t` 和 DP>1/DP+EP。性能报告必须拆出 D graph、P eager、双 model-call、layer group 和通信后端耗时；只有当报告证明 P eager 本身成为主要瓶颈时，再投入 P group capture。
+因此下一步不是立即为 P group 新增 graph key。应继续完成 PP=2/4 的 logits/KV/lifecycle 和 bubble 验收，确认 ordinary PP 一收一发在 D-only、P-only 和 P+D 下没有 collective mismatch；随后扩展 DP=1、TP/EP=2/4 的标准 selector 多进程矩阵，再推进 P/D 单 forward、FusedMC2、自适应 `k_t` 和 DP>1/DP+EP。性能报告必须拆出 D graph、P eager、双 model-call、layer group 和通信后端耗时；只有当报告证明 P eager 本身成为主要瓶颈时，再投入 P group capture。
 
 ## 16. 参考资料
 

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.config.model import ModelConfig
+from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
@@ -101,6 +102,24 @@ def test_layered_prefill_forces_only_prefill_group_eager(
         )
         is expected
     )
+
+
+def test_layered_pp_intermediate_round_trip_preserves_d_and_p_rows():
+    d = IntermediateTensors(
+        {"hidden_states": torch.ones(2, 4), "residual": torch.zeros(2, 4)}
+    )
+    p = IntermediateTensors(
+        {"hidden_states": torch.full((3, 4), 2), "residual": torch.ones(3, 4)}
+    )
+    packed = NPUModelRunner._combine_layered_pp_intermediate(d, p)
+    d_out, p_out = NPUModelRunner._split_layered_pp_intermediate(packed)
+
+    assert d_out is not None and p_out is not None
+    assert torch.equal(d_out["hidden_states"], d["hidden_states"])
+    assert torch.equal(p_out["hidden_states"], p["hidden_states"])
+    assert isinstance(packed["layered_pp_d_rows"], torch.Tensor)
+    assert int(packed["layered_pp_d_rows"].item()) == 2
+    assert int(packed["layered_pp_p_rows"].item()) == 3
 
 
 def test_model_config_validates_local_mtp_drafter_as_single_pp_rank(monkeypatch):
