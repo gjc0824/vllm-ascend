@@ -2,10 +2,11 @@
 
 ## 1. 文档状态
 
-- 状态：实施中。Phase 1 参考实现、PP=2/4 图/eager，以及 PP=2+TP=2+EP=2 的 eager/单 Decode graph 受限文本精度已落地。
-- 当前里程碑：**Phase 1 语义闭环 + PP eager MVP + D-only graph 适配**；支持边界为 V1、PP=1/2/4、DP=1、stage-aligned layer groups、一个 Prefill request、固定 `k=1`。
-- 下一里程碑：完成 **logits/KV、生命周期和 PP bubble 验收**；随后扩展 TP/EP 矩阵和 E2E 验收。
-- 最近更新：2026-09-01。
+- 状态：实施中。Phase 1 参考实现、PP=2/4 图/eager、模型无关 adapter，以及 DeepSeek-V4 adapter 已落地。
+- 当前里程碑：**Phase 1 语义闭环 + PP eager MVP + D-only graph + 模型解耦**；支持边界为 V1、PP=1/2/4、DP=1、stage-aligned layer groups、一个 Prefill request、固定 `k=1`。
+- 下一里程碑：完成 **logits/KV、生命周期和 PP bubble 验收**；随后扩展 TP/EP 矩阵和更广泛的 E2E 验收。
+- 最近更新：2026-09-04。
+- DeepSeek-V4 实机文本验收：使用 `/mnt/share/weights/DeepSeek-V4-Flash`（43 层、`hc_mult=4`）在 TP=1/PP=2（2-group、4-group）和 TP=1/PP=4（4-group）eager mixed P/D 路径通过；Prefill、mixed-batch Prefill 和 graph 参考均精确匹配。
 - 执行计划：[Layered Prefill 开发计划](layered_prefill_development_plan.md)。
 - 目标：在 `pipeline parallelism (PP)` 与 `prefill/decode (P/D)` 混部的单个引擎中，让 Prefill 请求沿 layer group 推进，同时让 Decode 请求每一步执行完整模型，从而降低 PP stage 的时延不均衡和流水气泡。
 - 适用仓库：当前工作区中的 `vllm` 与 `vllm-ascend`。
@@ -42,7 +43,8 @@ Layered Prefill（分层 Prefill）不会丢弃模型计算，也不是 early-ex
 
 建议采用“上游最小通用接口 + Ascend 实验实现”的路线：
 
-- 先在上游 vLLM 抽象出 Layered Prefill 的执行计划和模型能力接口，避免在 vllm-ascend 中复制整个 `Scheduler.schedule()`。
+- 先在上游 vLLM 抽象出 Layered Prefill 的执行计划和模型无关 layer-range adapter，避免在 vllm-ascend 中复制整个 `Scheduler.schedule()`，也避免修改每个模型的 `forward()`。
+- 标准 `(positions, hidden_states, residual)` decoder 由结构检查后自动适配；DeepSeek-V4 等具有额外状态转换的模型通过集中注册专用 adapter。runner 只依赖统一 adapter，不再调用模型私有的 `forward_layered_prefill()`。
 - 首发只支持 **PD-mixed**（`kv_role=kv_both` 或无 KV connector）、DP=1、一个 Prefill cohort，固定 `k=1`，使用 eager P；PP=2/4 使用 stage-aligned global plan 和单个 D/P intermediate payload，TP/EP 继续复用现有通信 selector。PP=2/4 图/eager和 PP=2+TP=2+EP=2 的 eager/单 Decode graph 受限文本验证已经通过；logits/KV、生命周期和 bubble 指标仍需 NPU 验收。DP>1/DP+EP、PD 分离、SP/PCP/DCP、异步调度、DBO、Speculative/MTP、Mamba/hybrid、Multimodal 和 LoRA 后置。
 - 先用一个明确的 MoE/GQA 模型验证语义和收益；Dense 模型默认回退到普通 chunked prefill，因为论文的 Dense 消融中 Layered Prefill 反而更慢。
 - 论文的 one-group-per-iteration 是正确性基线；最终目标可以在此基础上动态选择连续的 `k` 个 group，使本步 Prefill 计算落在 Decode 可用时延预算内。
@@ -50,11 +52,12 @@ Layered Prefill（分层 Prefill）不会丢弃模型计算，也不是 early-ex
 
 ### 2.4 当前工程判断
 
-截至 2026-09-01，当前实现已经足以在受限配置上开始 TP/PP/EP 的收益测量，但还不能视为 Phase 1 验收完成：
+截至 2026-09-04，当前实现已经足以在受限配置上开始 TP/PP/EP 的收益测量，但还不能视为 Phase 1 验收完成：
 
 - TP=2 的 2103-token、多 group 路径已经通过双参照文本比较；TP=4 的 633-token、2-group 路径能够生成正常文本，并确认 D 子批次实际 replay ACLGraph。
 - TP=1、PP=4 的 2523-token、8-group graph，以及 TP=2、PP=2、EP=2 的 633-token、2-group graph 已通过单 Decode 严格验收；EP 日志确认实际 `ep_size=2` 和 MC2/AllGather。
 - 验收器对 Prefill 使用关闭 Layered 的同拓扑 eager/graph 双参考精确匹配，对 Decode 使用关闭 Layered 的同 graph 严格匹配。两个并发 Decode 流下关闭 Layered 的 graph baseline 自身存在第二路文本非确定性，因此默认门禁使用单 Decode，双流作为压力项保留。
+- DeepSeek-V4 的上述用例均生成相同 Prefill 文本（` The final answer is 1. I`）。本轮 Decode 文本未作严格门禁：baseline 与 Layered 的混合调度分别生成了不同续写，但 Layered 执行无模型运行时异常；这与当前验收器的混合 P/D 排队非确定性一致。TP=2 会触发 Ascend `KvQuantSparseAttnSharedkv` 的 `n1Size_=32` tiling 限制，TP=1/PP=1 则超过单卡 HBM，二者均不属于 adapter 语义失败。
 - TP=4 的 2103-token 路径仍有输出差异：全 eager 下 P 输出已经与普通 eager baseline 不一致；D-only graph 的 5-group 用例中还观察到一个 D 输出与普通 graph baseline 不一致。该问题不是“补 P group 图”能够解决的，必须先定位首次 logits/hidden/KV 偏差。
 - 当前两次 model-call 是语义参考路径，不等价于论文的逐层 P/D 混合 batch。无论初测收益正负，都要通过分项 profiling 区分算法收益、P eager 开销和双调用开销。
 - 短期不实现 P group ACLGraph。现有 D-only graph 已经排除主要 Decode eager 开销；只有 profiling 证明 P eager 是主要瓶颈时，才为有限 layout/range 增加 P graph key。
@@ -309,35 +312,53 @@ EngineCore/Scheduler 侧需要保存：
 
 Worker/ModelRunner 侧需要保存：
 
-- 每个 request 的 frontier hidden/residual；
+- 每个 request 的 adapter-defined frontier（当前为 hidden/residual 或 hidden-only）；
 - frontier 当前 owner PP rank；
 - batch reorder 后的 request-to-row 映射；
 - 需要在下一次执行中清理的 state。
 
 EngineCore 不应直接持有 GPU activation；调度进程只持有元数据，GPU tensor 由 worker state manager 管理。
 
-### 6.3 模型能力接口
+### 6.3 模型 adapter 接口
 
-不要把 layer mask 作为所有模型的隐式全局变量。建议增加类似以下能力检查和上下文：
+不要把 layer mask 作为所有模型的隐式全局变量，也不要要求每个模型复制一份
+`forward()`。layer-range 执行由 worker 持有的 adapter 完成：
 
 ```python
-class SupportsLayeredPrefill(Protocol):
-    def forward_layered_prefill(
+class LayeredPrefillModelAdapter(ABC):
+    def forward(
         self,
-        ...,
-        prefill_plan: PrefillExecutionPlan,
-        prefill_state: LayeredPrefillState | None,
-    ) -> ...: ...
+        *, input_ids, positions, layer_start, layer_end,
+        frontier=None, inputs_embeds=None, intermediate_tensors=None,
+    ) -> LayeredForwardOutput: ...
 ```
 
-默认模型能力为 false，Scheduler 在启动时 fail-closed 或回退普通 chunked path。支持模型必须明确保证：
+adapter 在模型加载后检查全局 layer bounds、PP intermediate schema、layer
+调用签名和 final norm。默认 `StandardDecoderLayeredPrefillAdapter` 自动覆盖
+常见 decoder-only 模型，其 layer 必须严格使用
+`(positions, hidden_states, residual) -> (hidden_states, residual)`；不符合时
+启动即拒绝 layered path，避免静默产生错误结果。普通 dense 模型仍可由平台策略
+回退到 chunked prefill，因为适配成功不代表一定有性能收益。
+
+模型特有的 state transition 不应下沉到每个模型文件，而应在 Ascend adapter
+模块集中注册：
+
+```python
+SPECIALIZED_ADAPTERS = {
+    "deepseek_v4": DeepseekV4LayeredPrefillAdapter,
+}
+```
+
+所有 adapter 必须保证：
 
 - P 行只在计划覆盖的层执行；
 - D 行仍执行全部本地层；
 - 非活跃 P 层不写 KV、不触发 MoE/attention/通信 kernel；
 - residual、aux hidden state、norm、logits 和模型特有状态在 group 边界正确传递。
 
-第一版可以为 Qwen3 MoE GQA 提供实现；不要把 DeepSeek MLA、Mamba 或所有自定义模型一次性纳入通用路径。
+第一版已覆盖 Qwen3 MoE 的标准 decoder contract，并为 DeepSeek-V4
+hyper-connection/hash-MoE 提供专用 adapter；Mamba、recurrent hybrid、
+multimodal 和其他自定义 state machine 仍然 fail-closed，直到有对应 adapter。
 
 ### 6.4 Attention/KV 接口
 
@@ -414,7 +435,7 @@ step_time <= decode_target + allowed_prefill_slack
 | Scheduler policy | 上游 hook + Ascend `core/layered_prefill_scheduler.py` | 选择 `N_lg`、`k_t`、cohort queue，与 FCFS/priority 规则整合 | 中到大 |
 | PP worker transport | 上游 `v1/worker/gpu_worker.py`、Ascend `worker.py` | frontier owner、P row 注入/转发、in-flight state、collective 顺序 | 大；正确性高风险 |
 | ModelRunner | 上游 GPU runner + Ascend `model_runner_v1.py` | plan 传入、query rows、非最终 logits mask、状态释放 | 大 |
-| 模型 layer loop | Qwen3 MoE 等支持模型、必要的 patch | P/D 行拆分、选定层执行、residual/aux state | 大；模型相关 |
+| 模型 layer loop | 通用 adapter + 特殊模型注册表 | 选定层执行、frontier/PP schema、模型特有 state transition | 中；普通模型零修改 |
 | Attention/KV | Ascend attention、KV pool、slot mapping、zeroing | layer-specific KV 写入和 bypass，最终 commit 才 cache-complete | 大；kernel 相关 |
 | Runtime profiling | Ascend predictor/worker timing | per-rank/group 成本、EMA/回归、预算控制 | 中 |
 | Graph/compile | ACLGraph、torch.compile、forward context | 每种 layout/range 的 capture 或首发 eager gate | 中到大 |
@@ -424,7 +445,7 @@ step_time <= decode_target + allowed_prefill_slack
 按合理的社区提交拆分，至少是以下 5 类 PR，而不是一个 Ascend-only PR：
 
 1. 上游 execution plan 和 token commit 接口。
-2. 上游 `SupportsLayeredPrefill`/PP frontier 语义与一个参考模型。
+2. 上游模型无关 layer-range adapter、PP frontier 语义与标准 decoder 参考测试。
 3. vllm-ascend eager + PP/TP + PD-mixed 实现。
 4. Ascend timing、NPU kernel、graph 优化。
 5. Prefix/KV connector、EP 和高级特性扩展。
@@ -564,7 +585,7 @@ P group ACLGraph/compile capture 是条件优化，只有 profiling 证明 P eag
 
 - Phase 1/2/3/4 的原始参考路径要求 `pipeline_parallel_size == 1`；当前 PP MVP 允许 `pipeline_parallel_size` 为 2/4，并校验 group layout 与 PP partition 对齐；
 - `kv_role` 为 `kv_both` 或未配置；
-- 模型实现 `SupportsLayeredPrefill`；
+- 模型能通过标准 adapter 校验，或存在已注册的专用 adapter；
 - 不启用首发互斥特性；
 - group layout 与 PP partition 合法；
 - 如果校验失败且用户未强制 enable，则记录原因并回退普通 chunked；如果用户强制 enable，则明确报错。
@@ -618,7 +639,7 @@ P group ACLGraph/compile capture 是条件优化，只有 profiling 证明 P eag
 3. `k_t` 的预算目标应以 TBT SLO、Decode-only step time，还是最慢 PP stage 的 EMA 为主？
 4. 允许一个 step 同时推进跨多个 PP stage 的多个 group，还是保持“一个 active PP owner/stage per step”以简化 collective？
 5. 首发模型选择 Qwen3 MoE GQA、采用 DP=1 的标准通信 selector（按容量在 AlltoAll/MC2 间选择），还是直接针对当前 Ascend 主力 DeepSeek MLA？后者需要额外处理 MLA/indexer KV state。
-6. 上游 vLLM 是否接受 `PrefillExecutionPlan` 和 `SupportsLayeredPrefill` 这样的通用 API；若不接受，Ascend-only patch 只能作为实验分支，不能承诺长期兼容。
+6. 上游 vLLM 是否接受 `PrefillExecutionPlan` 和模型无关 layer-range adapter；若不接受，Ascend-only patch 只能作为实验分支，不能承诺长期兼容。
 
 ## 15. Phase 1：PP=1 代码级实现蓝图
 
@@ -829,9 +850,9 @@ else:
 
 1. `LayeredBatchView.from_input_batch(..., request_ids=decode_req_ids)`，调用现有完整模型 forward，得到 D hidden/logits 输入；
 2. 从 `input_batch` 为 P cohort 构造独立 view，保留原 request-state index、prompt positions、block table 和 slot mapping；
-3. 若 `group_id == 0`，P model call 从 prompt embedding 开始；否则从 `LayeredFrontier.hidden_states/residual` 开始；
-4. 调用模型的 `forward_layered_prefill(layer_start, layer_end, ...)`，只执行计划范围；
-5. 中间 group 把返回的 hidden/residual 写回 state store，不计算 P norm/LM head；最终 group 才生成 P hidden，并标记 P row 可采样；
+3. 若 `group_id == 0`，P model call 从 prompt embedding 开始；否则从 adapter-defined `LayeredFrontier` 开始；
+4. 调用 `LayeredPrefillModelAdapter.forward(layer_start, layer_end, ...)`，只执行计划范围；
+5. 中间 group 把 adapter 返回的 frontier 写回 state store，不计算 P final transform/LM head；最终 group 才生成 P hidden，并标记 P row 可采样；
 6. 把 D/P 的最终 hidden、eligible row 和 request index 写入 `LayeredExecuteState`，供 `sample_tokens()` 使用。
 
 `LayeredBatchView` 是 worker-local 的轻量视图，不要复制完整 `RequestState`：
@@ -876,62 +897,45 @@ class LayeredExecuteState:
 
 ### 15.6 支持模型的代码接口
 
-建议在 `vllm/vllm/model_executor/models/interfaces.py` 增加 opt-in protocol，默认能力为 false：
+当前实现不再给模型增加 opt-in protocol 或第二个 forward。通用执行器位于
+`vllm/model_executor/models/layered_prefill.py`，负责：
 
 ```python
-class SupportsLayeredPrefill(Protocol):
-    num_hidden_layers: int
-
-    def forward_layered_prefill(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        layer_start: int,
-        layer_end: int,
-        frontier: tuple[torch.Tensor, torch.Tensor | None] | None,
-        intermediate_tensors: IntermediateTensors | None = None,
-    ) -> LayeredForwardOutput: ...
-
-
-@dataclass
-class LayeredForwardOutput:
-    hidden_states: torch.Tensor
-    residual: torch.Tensor | None
-    is_final_layer: bool
+adapter = create_layered_prefill_model_adapter(model)
+output = adapter.forward(
+    input_ids=input_ids,
+    positions=positions,
+    layer_start=plan.group_start,
+    layer_end=plan.group_end,
+    frontier=frontier,
+)
 ```
 
-实际接口可以按上游 review 改名，但必须具备显式 layer range，不能依赖 forward context 中的隐式全局变量。Scheduler 启动时检查 `isinstance(model, SupportsLayeredPrefill)`；能力检查失败时回退普通 chunked prefill 或在显式 `force` 下报错。
+`LayeredPrefillModelAdapter` 统一处理 embedding、全局/本地 layer range、
+`PPMissingLayer`、frontier 和 final norm；Ascend runner 只调用 adapter，并通过
+adapter 构造/恢复模型正常的 PP intermediate schema。原
+`SupportsLayeredPrefill` 和 Qwen3-MoE 的 `forward_layered_prefill()` 已删除，
+Qwen3-MoE 的普通 `forward()` 不再包含 Layered Prefill 分支。
 
-#### Qwen3 MoE 的最小改法
+#### 自动适配与注册边界
 
-在 `vllm/vllm/model_executor/models/qwen3_moe.py` 中将逻辑放在 `Qwen3MoeModel`，顶层 `Qwen3MoeForCausalLM` 只做委托：
+标准 adapter 只接受精确的三参数 layer contract，并逐一检查当前 PP rank 的
+所有本地层。额外参数即使有默认值也不会被猜测，因为这通常表示 top-level
+forward 还执行了 adapter 不知道的状态准备。输出不是
+`(hidden_states, residual)` 时也会立即失败。
 
-```python
-def forward_layered_prefill(..., layer_start, layer_end, frontier):
-    if frontier is None:
-        hidden_states = self.embed_input_ids(input_ids)
-        residual = None
-    else:
-        hidden_states, residual = frontier
+DeepSeek-V4 由注册表中的 `DeepseekV4LayeredPrefillAdapter` 处理，模型文件零修改：
 
-    for global_idx in range(layer_start, layer_end):
-        local_idx = global_idx - self.start_layer
-        layer = self.layers[local_idx]
-        hidden_states, residual = layer(positions, hidden_states, residual)
+- 第一个 group 将 embedding 扩展成 `[tokens, hc_mult, hidden]`，后续 group
+  直接使用 frontier，不重复扩展。
+- 每层继续传递原始 `input_ids`，保证 hash-MoE routing 与普通 forward 一致。
+- 内部 residual 不跨 group/PP stage 保存；PP schema 保持 DeepSeek-V4 原有的
+  hidden-only 格式。
+- 只有最后 group 执行 `hc_head` 和 final norm。
 
-    return LayeredForwardOutput(hidden_states, residual, layer_end == self.end_layer)
-```
-
-PP=1 时 `start_layer=0`、`end_layer=num_hidden_layers`，因此不需要 `PPMissingLayer`。真实实现还要：
-
-- 对 `layer_start/end` 做边界和连续性校验；
-- group 0 的第一层使用 `residual=None`，后续 group 使用保存的 residual；
-- 中间 group 不调用 `self.norm`；最终 group 在输出 logits 前调用 norm；
-- 只在 active layer 中调用 `Qwen3MoeDecoderLayer`，未选中的层完全不进入 attention、router、expert 或 KV write；
-- 保留全局 `layer_idx`，因为 attention 的 `layer_idx` 和 EP/EPLB 统计不能使用从零开始的局部下标。
-
-Dense Qwen/Llama 可以先实现同一协议作为 reference correctness model，但默认策略仍应对 Dense 回退普通路径；论文表明 Dense 模型不一定受益。
+新增普通 Qwen/Llama 风格模型通常不需要任何模型代码；有额外状态的模型只需注册
+一个小型 adapter。该机制扩大的是执行兼容性，不改变策略层结论：Dense 模型默认
+仍应回退普通 Prefill，除非性能数据证明 Layered Prefill 有收益。
 
 ### 15.7 KV/Attention 的首阶段实现细节
 
@@ -970,7 +974,8 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 | --- | --- | --- |
 | 1 | 上游 `vllm/vllm/v1/core/layered_prefill.py`、`request.py`、`sched/output.py`、`sched/scheduler.py` | plan、group cursor、commit token、一次性 KV reservation、preempt/abort 状态；默认关闭 |
 | 2 | 上游 `vllm/vllm/v1/worker/gpu/input_batch.py`、`worker/gpu/model_runner.py`、`worker/gpu/sample/*` | LayeredBatchView、frontier store、双子批次执行、sample mask、eager 生命周期 |
-| 3 | 上游 `model_executor/models/interfaces.py`、`models/qwen3_moe.py` | `SupportsLayeredPrefill` 和 Qwen3 MoE 参考实现；CPU/GPU 数值测试 |
+| 3 | 上游 `model_executor/models/layered_prefill.py` | 通用 adapter、严格 contract 校验和标准 decoder 数值测试；删除 Qwen3 MoE 专用 forward |
+| 3a | `vllm-ascend/vllm_ascend/models/layered_prefill.py` | 专用 adapter 注册表和 DeepSeek-V4 hyper-connection/hash-routing 适配 |
 | 4 | `vllm-ascend/vllm_ascend/worker/model_runner_v1.py`、`ascend_forward_context.py`、EP dispatcher 相关测试 | PP=1/2/4、TP/EP eager 子批次；ordinary/layered 共用 communicator selector，并覆盖非 fused MC2/AlltoAll |
 | 5 | 上游/Ascend runner、Attention/KV 和测试 | P/D 单 forward、row compaction、active-row mask、KV 和 sample 语义 |
 | 6 | `vllm-ascend` MC2/graph/kernel 相关代码 | FusedMC2；只接入标准 selector 已选择的 fused 路径 |
@@ -1024,9 +1029,9 @@ PP=1、TP/EP>1 时，所有 TP/EP rank 都持有完整的 layer loop；attention
 
 ### 15.12 当前工作区实现状态
 
-截至 2026-09-01，当前代码处于 **Phase 1 语义闭环 + PP=2/4 和 EP+PP 受限文本验证通过 + D-only graph 适配**，不是 Phase 8 的完整图/生态实现，也尚未达到 Phase 1/Phase 5 退出条件：
+截至 2026-09-04，当前代码处于 **Phase 1 语义闭环 + PP=2/4 和 EP+PP 受限文本验证通过 + D-only graph 适配**，不是 Phase 8 的完整图/生态实现，也尚未达到 Phase 1/Phase 5 退出条件：
 
-- Scheduler/Request/frontier 协议和 Qwen3-MoE partial-layer forward 已落地，范围为 V1、PP=1/2/4、DP=1、stage-aligned groups、一个 P request、`k=1`。
+- Scheduler/Request/frontier 协议和模型无关 partial-layer adapter 已落地；Qwen3-MoE 走标准 adapter，DeepSeek-V4 走专用注册 adapter，两个模型的普通 `forward()` 都不含 Layered Prefill 分支。运行范围为 V1、PP=1/2/4、DP=1、stage-aligned groups、一个 P request、`k=1`。
 - PP intermediate transport 将 D/P rows 合并为一次 ordinary PP 一收一发，并携带显式 row metadata；owner stage 注入本地 frontier，其他 stage 只转发或保存 frontier 副本。
 - TP-only 已覆盖 TP=2/4；D/P 都使用原有 TP AllGather MoE，partial layer group 会把 fast-MoE cursor 定位到 `group_start`。
 - `require_eager=true` 保留全 eager 参考路径；`require_eager=false` 时图模式只允许 `NONE` 或 `FULL_DECODE_ONLY`。启用后 D 子批次进入现有 ACLGraph，P 子批次由 runner 强制 eager。

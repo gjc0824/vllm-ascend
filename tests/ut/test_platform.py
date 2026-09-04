@@ -186,7 +186,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.model_config.is_multimodal_model = False
         vllm_config.model_config.enable_return_routed_experts = False
         vllm_config.model_config.hf_text_config = SimpleNamespace(
-            num_hidden_layers=48
+            model_type="qwen3_moe", num_hidden_layers=48
         )
         vllm_config.lora_config = None
         vllm_config.compilation_config.mode = CompilationMode.NONE
@@ -211,6 +211,24 @@ class TestNPUPlatform(TestBase):
         ascend_config.multistream_overlap_shared_expert = False
 
         _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.model_config.hf_text_config.model_type = "deepseek_v4"
+        _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.model_config.hf_text_config.model_type = None
+        vllm_config.model_config.hf_config = SimpleNamespace(
+            model_type="deepseek_v4", num_hidden_layers=48
+        )
+        _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.model_config.hf_text_config.model_type = "recurrent_hybrid"
+        vllm_config.model_config.hf_config.model_type = "recurrent_hybrid"
+        with pytest.raises(ValueError, match="without recurrent hybrid state"):
+            _check_ascend_config(vllm_config, ascend_config)
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.hf_text_config.model_type = "qwen3_moe"
+        vllm_config.model_config.hf_config.model_type = "qwen3_moe"
 
         vllm_config.parallel_config.pipeline_parallel_size = 49
         with pytest.raises(ValueError, match="cannot exceed the model layer count"):

@@ -18,7 +18,7 @@
 | 能力 | 当前状态 |
 | --- | --- |
 | Scheduler/Request 协议 | 已有 layer plan、group cursor、final-only token commit 和 KV block 复用语义 |
-| Model | Qwen3-MoE 支持连续 partial-layer forward 和 hidden/residual frontier |
+| Model | 通过统一 adapter 自动支持标准 decoder；DeepSeek-V4 使用专用 adapter，模型 `forward()` 无侵入修改 |
 | Runner | 同一 step 固定执行 `D full forward -> P active-group forward` 两个子批次 |
 | 并行范围 | V1、PP=1/2/4、DP=1；stage-aligned layer groups；TP/EP 按既有 selector；一个 P request；固定 `k=1` |
 | MoE 通信 | TP/EP 复用现有 selector；D/P 按各自 token 数选择通信后端；EP=2 已验证 MC2/AllGather，FusedMC2 仍保留启动门禁 |
@@ -176,7 +176,7 @@ M1 决策条件：
 以下项目不阻塞 M0-M7，应按 profiling 和实际部署需求逐项立项：
 
 - P group ACLGraph/compile capture。图 key 至少包含 layout、group range、P/D row shape 和 PP/EP communicator mode，并保留 eager fallback。
-- DeepSeek MLA、FA3/SFA、量化、DCP、shared expert 和其他模型/kernel 组合。
+- DeepSeek-V4 的基础 hyper-connection/hash-MoE adapter 已落地；更复杂的 DeepSeek MLA、FA3/SFA、量化、DCP、shared expert 和其他模型/kernel 组合仍需逐项验证。
 - Prefix Cache、KV pool/offload、recompute 和 layer completion fencing。
 - PD-disaggregated connector 的 partial-KV completion 协议；hidden frontier 默认仍留在 P engine。
 - async scheduling、DBO、Speculative/MTP、Mamba/hybrid、Multimodal、LoRA 和其他 scheduler policy。

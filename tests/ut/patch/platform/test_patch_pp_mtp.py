@@ -29,7 +29,7 @@ def test_layered_prefill_restores_main_mask_after_decode_batch_update():
     runner.execute_model_state = None
     runner.kv_connector_output = None
     runner.requests = {}
-    runner.get_model = lambda: SimpleNamespace(supports_layered_prefill=True)
+    runner.layered_prefill_model_adapter = object()
 
     # Return masks aligned with the currently active batch.  The fake Decode
     # execution grows the main batch from two rows to three rows, reproducing

@@ -827,11 +827,24 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         if parallel_config.pipeline_parallel_size < 1:
             raise ValueError("pipeline_parallel_size must be positive")
         model_config = vllm_config.model_config
-        hf_config = getattr(model_config, "hf_text_config", None) or getattr(
-            model_config, "hf_config", None
+        config_candidates = (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+            model_config,
         )
-        raw_num_hidden_layers = getattr(
-            hf_config or model_config, "num_hidden_layers", None
+        is_deepseek_v4 = any(
+            getattr(config, "model_type", None) == "deepseek_v4"
+            for config in config_candidates
+            if config is not None
+        )
+        raw_num_hidden_layers = next(
+            (
+                getattr(config, "num_hidden_layers", None)
+                for config in config_candidates
+                if config is not None
+                and getattr(config, "num_hidden_layers", None) is not None
+            ),
+            None,
         )
         num_hidden_layers = (
             int(raw_num_hidden_layers)
@@ -965,10 +978,14 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             getattr(vllm_config.model_config, "is_encoder_decoder", False)
             or getattr(vllm_config.model_config, "is_multimodal", False)
             or getattr(vllm_config.model_config, "is_multimodal_model", False)
-            or getattr(vllm_config.model_config, "is_hybrid", False)
+            or (
+                getattr(vllm_config.model_config, "is_hybrid", False)
+                and not is_deepseek_v4
+            )
         ):
             raise ValueError(
-                "layered_prefill_config Phase 1 supports non-hybrid decoder-only text models only"
+                "layered_prefill_config Phase 1 supports decoder-only text "
+                "models without recurrent hybrid state"
             )
         if getattr(vllm_config.model_config, "enable_return_routed_experts", False):
             raise ValueError(
@@ -993,11 +1010,6 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         ):
             raise ValueError(
                 "layered_prefill_config Phase 1 requires eager AlltoAll; disable MC2/fused MC2"
-            )
-        architectures = getattr(vllm_config.model_config, "architectures", None) or []
-        if not any("Qwen3Moe" in architecture for architecture in architectures):
-            raise ValueError(
-                "layered_prefill_config Phase 1 currently supports Qwen3Moe only"
             )
         if scheduler_extension_config.profiling_chunk_config.enabled:
             raise ValueError(

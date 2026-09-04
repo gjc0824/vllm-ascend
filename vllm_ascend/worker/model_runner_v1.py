@@ -58,6 +58,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.model_executor.models.layered_prefill import LayeredPrefillModelAdapter
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.offloader.base import get_offloader, set_offloader
 from vllm.sequence import IntermediateTensors
@@ -333,6 +334,7 @@ class NPUModelRunner(GPUModelRunner):
         # request IDs and group cursors; tensors never cross the process
         # boundary.
         self.layered_prefill_state = LayeredPrefillStateStore()
+        self.layered_prefill_model_adapter: LayeredPrefillModelAdapter | None = None
 
         self.pin_memory = PIN_MEMORY
 
@@ -2043,10 +2045,10 @@ class NPUModelRunner(GPUModelRunner):
         """Execute D and P subbatches, carrying both through the PP chain."""
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
-        layered_model = self.get_model()
-        if not getattr(layered_model, "supports_layered_prefill", False):
+        layered_adapter = self.layered_prefill_model_adapter
+        if layered_adapter is None:
             raise RuntimeError(
-                f"Model {type(layered_model).__name__} does not support layered prefill"
+                "The loaded model does not have a layered prefill adapter"
             )
         all_req_ids = list(scheduler_output.num_scheduled_tokens)
         p_req_ids = list(plan.prefill_req_ids)
@@ -2490,14 +2492,20 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        layered_plan = scheduler_output.layered_prefill_plan
-        self.layered_prefill_state.clear_many(scheduler_output.finished_req_ids)
-        if scheduler_output.preempted_req_ids:
-            self.layered_prefill_state.clear_many(scheduler_output.preempted_req_ids)
+        # Keep compatibility with scheduler-output objects produced by older
+        # vLLM versions and lightweight test doubles.
+        layered_plan = getattr(scheduler_output, "layered_prefill_plan", None)
+        layered_state = getattr(self, "layered_prefill_state", None)
+        if layered_state is not None:
+            layered_state.clear_many(
+                getattr(scheduler_output, "finished_req_ids", ())
+            )
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", ())
+        if preempted_req_ids and layered_state is not None:
+            layered_state.clear_many(preempted_req_ids)
         if layered_plan is not None and not self._executing_layered_subbatch:
             return self._execute_layered_step(scheduler_output, intermediate_tensors)
         if layered_plan is not None:
-            layered_model = self.get_model()
             if set(scheduler_output.num_scheduled_tokens) != set(layered_plan.prefill_req_ids):
                 # The layered subbatch intentionally contains only P rows.
                 # The outer D view is validated by _execute_layered_step.
@@ -2862,6 +2870,11 @@ class NPUModelRunner(GPUModelRunner):
                     **model_kwargs,
                 )
             else:
+                layered_adapter = self.layered_prefill_model_adapter
+                if layered_adapter is None:
+                    raise RuntimeError(
+                        "The loaded model does not have a layered prefill adapter"
+                    )
                 if num_tokens_padded != scheduler_output.total_num_scheduled_tokens:
                     raise RuntimeError(
                         "Layered prefill Phase 1 does not support padded eager batches"
@@ -2885,7 +2898,6 @@ class NPUModelRunner(GPUModelRunner):
                             f"{layered_plan.group_id}, got {frontier.group_id}"
                         )
                     frontier_tuple = (frontier.hidden_states, frontier.residual)
-                    initial_input_ids = None
                     initial_inputs_embeds = None
                 else:
                     if frontier is not None and pp.rank_in_group == owner:
@@ -2897,27 +2909,26 @@ class NPUModelRunner(GPUModelRunner):
                         # The first stage owns the embedding operation.  It is
                         # transported through earlier no-op stages until the
                         # stage owning group 0 consumes it.
-                        initial_input_ids = input_ids
                         initial_inputs_embeds = inputs_embeds
                     elif pp.rank_in_group < owner and layered_plan.group_id > 0:
                         # Before the owner stage P rows are transport-only.
-                        # Rank 0 has no incoming P activation, so construct a
-                        # correctly shaped placeholder instead of embedding.
-                        hidden_size = self.model_config.get_hidden_size()
-                        initial_input_ids = None
-                        initial_inputs_embeds = torch.zeros(
-                            (num_tokens_padded, hidden_size),
-                            dtype=self.model_config.dtype,
-                            device=self.device,
+                        # Construct the model's normal PP state shape instead
+                        # of assuming a two-dimensional residual stream.
+                        frontier_tuple = layered_adapter.make_transport_frontier(
+                            num_tokens_padded,
+                            self.model_config.dtype,
+                            self.device,
                         )
+                        initial_inputs_embeds = None
                     else:
-                        initial_input_ids = None
                         initial_inputs_embeds = None
                 receives_pp_activation = pp.rank_in_group > owner
                 if receives_pp_activation and intermediate_tensors is None:
                     raise RuntimeError("Layered PP stage did not receive P activation")
-                layered_output = layered_model.forward_layered_prefill(
-                    input_ids=initial_input_ids,
+                layered_output = layered_adapter.forward(
+                    # Some layer contracts, notably DeepSeek-V4 hash routing,
+                    # need token IDs even when activations come from a frontier.
+                    input_ids=input_ids,
                     positions=positions[:num_tokens_padded],
                     layer_start=layered_plan.group_start,
                     layer_end=layered_plan.group_end,
@@ -2968,17 +2979,8 @@ class NPUModelRunner(GPUModelRunner):
                 # Let the outer worker perform the single PP send for the
                 # packed D/P payload.  This also avoids the broadcast-output
                 # fast path sending only one of the two subbatches.
-                transport_residual = layered_output.residual
-                if transport_residual is None:
-                    # Stages before the group owner carry placeholders only.
-                    # Keep the PP tensor schema row-aligned with the Decode
-                    # view; the owner replaces this value with its frontier.
-                    transport_residual = torch.zeros_like(hidden_states)
-                layered_intermediate = IntermediateTensors(
-                    {
-                        "hidden_states": hidden_states,
-                        "residual": transport_residual,
-                    }
+                layered_intermediate = (
+                    layered_adapter.to_intermediate_tensors(layered_output)
                 )
                 layered_intermediate.kv_connector_output = kv_connector_output
                 self.kv_connector_output = kv_connector_output
@@ -4405,6 +4407,20 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            if self.ascend_config.scheduler_config.layered_prefill_config.enabled:
+                from vllm_ascend.models.layered_prefill import (
+                    create_layered_prefill_model_adapter,
+                )
+
+                try:
+                    self.layered_prefill_model_adapter = (
+                        create_layered_prefill_model_adapter(self.model)
+                    )
+                except TypeError as error:
+                    raise RuntimeError(
+                        f"Model {type(self.model).__name__} cannot use layered "
+                        f"prefill: {error}"
+                    ) from error
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
