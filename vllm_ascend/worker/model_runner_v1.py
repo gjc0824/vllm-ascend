@@ -2875,10 +2875,9 @@ class NPUModelRunner(GPUModelRunner):
                     raise RuntimeError(
                         "The loaded model does not have a layered prefill adapter"
                     )
-                if num_tokens_padded != scheduler_output.total_num_scheduled_tokens:
-                    raise RuntimeError(
-                        "Layered prefill Phase 1 does not support padded eager batches"
-                    )
+                # Match the regular sequence-parallel path: the physical batch
+                # may be padded while scheduler_output keeps the logical prompt
+                # length. Padding rows are excluded from attention/KV commit.
                 self._set_layered_prefill_moe_layer_offset(layered_plan.group_start)
                 req_id = layered_plan.prefill_req_ids[0]
                 frontier = self.layered_prefill_state.get(req_id)
