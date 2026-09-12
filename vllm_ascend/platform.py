@@ -377,6 +377,21 @@ class NPUPlatform(Platform):
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
 
+        from vllm.config.compilation import CUDAGraphMode
+
+        if (
+            vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and "libjemalloc" in os.environ.get("LD_PRELOAD", "")
+        ):
+            logger.warning(
+                "libjemalloc is present in LD_PRELOAD while cudagraph_mode=%s "
+                "is enabled. jemalloc was observed to deadlock NPU workers "
+                "during FULL aclgraph capture (workers park on a jemalloc "
+                "mutex and graph capture never finishes). Remove libjemalloc "
+                "from LD_PRELOAD when graph mode is enabled.",
+                vllm_config.compilation_config.cudagraph_mode.name,
+            )
+
         # 7.Recompute cudagraph sizes and setup compile backend (vllm_config).
         _setup_compile_backend(
             vllm_config,

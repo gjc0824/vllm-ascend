@@ -39,6 +39,7 @@
 | TP=1，PP=4，2523-token，8-group，D-only graph | Layered 与关闭 Layered 的同 graph baseline Prefill/Decode 精确一致；与 eager baseline 的 Prefill token 有 graph/eager 漂移 | Layered graph 路径与同模式 baseline 对齐；保留 eager 漂移作为独立图模式基线问题 |
 | TP=2，PP=2，EP=2，633-token，2-group，全 eager | Prefill、两个 Decode 流均与 baseline 精确一致；日志确认 `ep_size=2`、AllGather/MC2 selector | EP+PP eager 路径通过 |
 | TP=2，PP=2，EP=2，633-token，2-group，D-only graph | 单 Decode 流下 Prefill 精确命中关闭 Layered 的 eager 参考，Decode 与关闭 Layered 的 graph 参考精确一致；确认 `ep_size=2`、MC2/AllGather、P eager/D graph | EP+PP 图模式受限路径通过；双 Decode 流保留为 graph baseline 稳定性压力项 |
+| TP=8，EP=8，dsa_cp，4043-token，8-group，D-only graph（Ascend 950，DSV4-Flash） | 顺序短序列（<100 token）与 4k 长序列 Prefill 文本与关闭 Layered 的同 graph 基线精确一致；并发 D+P 场景下 P 文本精确一致，后台 Decode 流漂移与基线自身重复运行的漂移一致（基线固有） | 2026-09-11 图模式叠加路径通过；注意 LD_PRELOAD jemalloc 会在 FULL aclgraph capture 时死锁 worker，图模式必须移除（platform.py 已加启动告警） |
 
 “文本正常”不是最终正确性标准。当前 TP4 验证器已检查最终文本、P-only 语义参照、group 数量、D graph replay、Layered P eager/D graph 选择以及可选 Decode 逐字一致性；尚未实现逐 group hidden/residual、最终 logits/top-k、layer/KV 执行次数和跨请求状态隔离的自动验收。
 
