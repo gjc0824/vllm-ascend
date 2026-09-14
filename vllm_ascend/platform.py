@@ -923,10 +923,6 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 "layered_prefill_config requires enforce_eager=True when "
                 "require_eager=True"
             )
-        if getattr(cache_config, "enable_prefix_caching", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires prefix caching disabled"
-            )
         if getattr(cache_config, "kv_offloading_size", None) is not None:
             raise ValueError(
                 "layered_prefill_config Phase 1 does not support KV offloading"

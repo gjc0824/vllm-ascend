@@ -3007,7 +3007,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                if layered_plan is not None and not layered_plan.is_final_group:
+                if layered_plan is not None and not layered_plan.is_sampling_step:
                     sample_hidden_states = hidden_states[:0]
                     logits = None
                 else:
@@ -3019,12 +3019,12 @@ class NPUModelRunner(GPUModelRunner):
 
                 if not get_pp_group().is_last_rank:
                     sample_hidden_states = hidden_states[:0] if (
-                        layered_plan is not None and not layered_plan.is_final_group
+                        layered_plan is not None and not layered_plan.is_sampling_step
                     ) else hidden_states[logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    if layered_plan is not None and not layered_plan.is_final_group:
+                    if layered_plan is not None and not layered_plan.is_sampling_step:
                         sample_hidden_states = hidden_states[:0]
                         logits = None
                     else:
@@ -3054,7 +3054,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
-                layered_plan is not None and not layered_plan.is_final_group,
+                layered_plan is not None and not layered_plan.is_sampling_step,
             )
             self.kv_connector_output = kv_connector_output
 

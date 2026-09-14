@@ -210,3 +210,24 @@ Layered Prefill 不能只以“能生成文本”或单个 TP benchmark 宣布�
 5. 固定 `k=1` 和自适应 `k_t` 都有安全 fallback。
 6. 目标 TP/DP/EP 组合有独立的正确性和收益数据，未支持组合在启动时明确拒绝。
 7. P graph 是否实现由 profiling 决定；未实现时 D graph + P eager 仍是受支持且可回退的执行模式。
+
+## 7. 进展记录
+
+### 2026-09-12：chunked prefill 与 prefix cache 适配完成（图模式）
+
+- Prompt 超过 max_num_batched_tokens 时按 budget 切 chunk，每个 chunk 内独立调度
+  layer group（select_num_groups 按 chunk 长度选择），长序列仍获得 layer 粒度切分；
+  单次 forward 允许完全是 prefill 且填满 max_num_batched_tokens（query==budget 时
+  该 step 无 decode 行）。
+- 准入时执行 get_computed_blocks 前缀命中查询，从命中位置重新规划 chunk；
+  每个 chunk 的全部 group 提交后调用 cache_blocks 将该 chunk 的 block 发布进
+  prefix cache（此时这些 block 对全部 layer 才完整，这是安全的发布时机）。
+- Plan 新增 is_final_chunk / is_sampling_step：只有最后一个 chunk 的最后一个
+  group 产生 logits 并采样，中间 chunk 的 final group 按 intermediate 处理。
+- worker 重放游标由强制 0 改为 chunk_start；new/resumed 请求的 block 表包含
+  命中的 cache block；platform/scheduler 移除 prefix caching 拒绝门禁。
+- 验证（8×Ascend 950、dsv4_test.sh 图模式 FULL_DECODE_ONLY + dsa_cp +
+  flashcomm1、TP=8+EP）：layered off/on × prefix cache off/on 下 10/15/20-token
+  短序列、4047-token 4k、8047-token 8k（4096+3951 两 chunk × 8 group）及
+  8k 重复请求全部逐字对齐；重复请求轨迹显示 chunk_start=4096 的前缀命中；
+  并发 decode(1500 tok)+4k prefill 混合场景 P 请求逐字对齐、无死锁。
