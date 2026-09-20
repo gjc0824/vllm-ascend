@@ -457,7 +457,7 @@ step_time <= decode_target + allowed_prefill_slack
 | `enable_chunked_prefill` | token chunk 与 layer group 是正交的，但两者同时改变 query/KV progress，组合会放大状态空间 | 首发只支持 layered-only；后续固定大 token chunk + layer groups |
 | `profiling_chunk_config`/CPP | 现有 scheduler subclass 已复制完整 `schedule()`；两者不能互相覆盖 | 不叠加 subclass；改成统一 `PrefillSchedulingPolicy`，或首发互斥 |
 | `enable_balance_scheduling` | balance scheduler 修改 DP admission，layer scheduler 修改 P cohort/时延预算 | 首发互斥；后续在同一 policy 中定义先 balance DP 再分配 groups 的顺序 |
-| `async_scheduling` | PP 中存在多个 in-flight batch；frontier、PP send ring 和 sample/update 顺序难以保持一致 | 首发强制 `--no-async-scheduling` |
+| `async_scheduling` | PP>1 中存在多个 in-flight batch，异步 PP 的 GPU 采样广播 ring 与 layered 一收一发 payload 不兼容；PP=1 时 worker RPC 严格 execute/sample 成对，frontier 与占位符协议保持成立（补占位符与 P 首 token 回填两处修复） | PP=1 已解除互斥；PP>1 维持 fail-closed，详见《Layered Prefill × 异步调度冲突评估与解除方案》 |
 | DBO/dual batch overlap | 一个 step 被拆成多个 microbatch，P group cursor 可能跨 microbatch 交错 | 首发禁用 |
 | ACLGraph/CUDA Graph/torch.compile | 动态 layer range、row mask、P/D shape 会导致 graph 组合爆炸；图通常捕获完整 layer loop | 语义首发使用 eager；D-only view 可复用 `FULL_DECODE_ONLY` 做性能对照，P group graph 后置并由 profiling 决定 |
 | `VLLM_PP_LAYER_PARTITION` | 不同 stage layer 数和 group 边界不一致会产生新的 stage bottleneck | 首发要求显式校验，group 尽量 stage-aligned |

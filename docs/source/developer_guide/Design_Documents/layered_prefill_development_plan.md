@@ -51,6 +51,7 @@
 - DP>1 的 cohort/plan 同步和 frontier 归属。
 - 单次 forward 后的 FusedMC2；非 fused MC2 要先覆盖标准 selector 选择的路径。
 - 自适应 `k_t`、group cost model 和 Decode slack 控制。
+- async scheduling（PP=1）：调度器/worker 语义已按异步占位符协议补齐；单测与 NPU E2E（TP=2，eager 与 `FULL_DECODE_ONLY`，含分 chunk 提示与 P/D 混批）均已通过逐字比对（见《Layered Prefill × 异步调度冲突评估与解除方案》）。
 - P group ACLGraph。
 - Prefix Cache、KV pool/offload、PD-disaggregated connector 和其他首发互斥特性。
 
@@ -180,7 +181,7 @@ M1 决策条件：
 - DeepSeek-V4 的基础 hyper-connection/hash-MoE adapter 已落地；更复杂的 DeepSeek MLA、FA3/SFA、量化、DCP、shared expert 和其他模型/kernel 组合仍需逐项验证。
 - Prefix Cache、KV pool/offload、recompute 和 layer completion fencing。
 - PD-disaggregated connector 的 partial-KV completion 协议；hidden frontier 默认仍留在 P engine。
-- async scheduling、DBO、Speculative/MTP、Mamba/hybrid、Multimodal、LoRA 和其他 scheduler policy。
+- async scheduling：PP=1 已解除互斥并按异步占位符协议补齐 layered 语义（见《Layered Prefill × 异步调度冲突评估与解除方案》）；PP>1 因异步 PP 广播 ring 与一收一发 payload 不兼容仍拒绝。DBO、Speculative/MTP、Mamba/hybrid、Multimodal、LoRA 和其他 scheduler policy 维持互斥。
 
 ## 5. 推荐提交顺序
 

@@ -880,8 +880,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # when EP is enabled, the Ascend AlltoAll path restores the physical
         # TP token split after vLLM collapses routed-expert TP to one.
         # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
-        # one message per step.  Async/DBO remain disabled below because they
-        # introduce multiple in-flight frontiers.
+        # one message per step.  Async scheduling stays supported only while
+        # the engine keeps at most one execute in flight per worker (V1 runner
+        # with PP=1); async PP broadcasts sampled tokens through a GPU ring
+        # that the layered one-send-per-step payload does not join, so the
+        # combination below stays rejected.  DBO remains disabled because it
+        # introduces multiple in-flight frontiers.
         # sequence parallelism is still rejected below because it changes the
         # frontier/token-row layout.  DP remains restricted to one rank until
         # the scheduler plan is synchronized across DP/EP ranks.
@@ -889,9 +893,13 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             raise ValueError(
                 "layered_prefill_config Phase 1 requires the V1 model runner"
             )
-        if vllm_config.scheduler_config.async_scheduling:
+        if (
+            vllm_config.scheduler_config.async_scheduling
+            and parallel_config.pipeline_parallel_size > 1
+        ):
             raise ValueError(
-                "layered_prefill_config Phase 1 does not support async_scheduling"
+                "layered_prefill_config does not support async_scheduling "
+                "with pipeline_parallel_size > 1"
             )
         if getattr(parallel_config, "enable_dbo", False):
             raise ValueError(

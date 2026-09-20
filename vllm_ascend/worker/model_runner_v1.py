@@ -2114,17 +2114,19 @@ class NPUModelRunner(GPUModelRunner):
                 one_time_updates_pending = False
                 result = self.execute_model(sub_output, active_intermediate)
                 if active_batch is p_input_batch:
-                    # P attention writes the prompt KV cache on auxiliary
-                    # streams on Ascend.  The next scheduler step may replay
-                    # the Decode graph immediately; wait here so graph
-                    # reads cannot race the preceding P cache update.
-                    torch.npu.synchronize()
+                    # P attention writes the prompt KV cache, and internal
+                    # stream forks (DSA overlap, graph task updates) rejoin
+                    # the current stream before forward returns.  Wait for
+                    # that stream only, so the next step's Decode graph
+                    # replay cannot race the preceding P cache update while
+                    # unrelated device work keeps running.
+                    torch.npu.current_stream().synchronize()
                 if isinstance(result, IntermediateTensors):
                     # A non-last rank has no sampling state.  Keep the result
                     # until both views have completed and then forward them as
                     # one PP payload.
                     if active_batch is main_input_batch and p_req_ids:
-                        torch.npu.synchronize()
+                        torch.npu.current_stream().synchronize()
                         stable_result = IntermediateTensors(
                             {
                                 key: value.clone()
@@ -2146,8 +2148,10 @@ class NPUModelRunner(GPUModelRunner):
                     # (for example MC2 for a one-token D batch and AllGather
                     # for a long P batch).  Their collectives may use distinct
                     # runtime streams, so establish a visible boundary before
-                    # starting the next subbatch.
-                    torch.npu.synchronize()
+                    # starting the next subbatch.  Waiting for the current
+                    # stream drains everything this subbatch enqueued;
+                    # kernels that fork internally rejoin before returning.
+                    torch.npu.current_stream().synchronize()
                 execute_state = self.execute_model_state
                 if not isinstance(execute_state, ExecuteModelState):
                     raise RuntimeError("Missing execute state for layered subbatch")
@@ -2425,6 +2429,49 @@ class NPUModelRunner(GPUModelRunner):
             )
         return merged
 
+    def _commit_layered_sampled_tokens(self, output: ModelRunnerOutput) -> None:
+        """Resolve the async-sampled first token of the layered P request.
+
+        Under async scheduling the P row's sampled id is recorded as a -1
+        placeholder in ``req_state.output_token_ids`` (see the sampling
+        bookkeeping) until it is needed by a logits processor.  The request
+        re-enters the main input batch on the next step, and ``add_request``
+        seeds ``token_ids_cpu`` from ``req_state.output_token_ids``, so the
+        placeholder must be resolved here: the scheduler cannot echo the
+        token back because the next schedule() runs before update_from_output()
+        of this step.
+        """
+        for req_id in self.input_batch.req_ids:
+            req_index = output.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            sampled_ids = (
+                output.sampled_token_ids[req_index]
+                if output.sampled_token_ids
+                else []
+            )
+            if not sampled_ids:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            output_token_ids = req_state.output_token_ids
+            first_placeholder = len(output_token_ids)
+            while (
+                first_placeholder > 0
+                and output_token_ids[first_placeholder - 1] == -1
+            ):
+                first_placeholder -= 1
+            num_placeholders = len(output_token_ids) - first_placeholder
+            if num_placeholders <= 0:
+                # Nothing left to resolve; some tokens may already be real
+                # after a KV-load failure discarded the placeholder tail.
+                continue
+            num_to_replace = min(len(sampled_ids), num_placeholders)
+            output_token_ids[
+                first_placeholder : first_placeholder + num_to_replace
+            ] = sampled_ids[:num_to_replace]
+
     def _sample_layered_step(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput:
@@ -2460,6 +2507,15 @@ class NPUModelRunner(GPUModelRunner):
                     output = EMPTY_MODEL_RUNNER_OUTPUT
                 if not isinstance(output, ModelRunnerOutput):
                     raise RuntimeError("Layered prefill sampling returned PP tensors")
+                if (
+                    self.use_async_scheduling
+                    and self.input_batch is not layered_state.main_input_batch
+                    and not sub_batch.execute_state.layered_prefill_intermediate
+                ):
+                    # The P subbatch just sampled its first token; commit the
+                    # real id to req_state before the request migrates back
+                    # to the main input batch on the next step.
+                    self._commit_layered_sampled_tokens(output)
                 outputs.append(output)
         finally:
             self.execute_model_state = None
