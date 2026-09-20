@@ -8,13 +8,265 @@ import torch
 from vllm.config.model import ModelConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
 from vllm_ascend.patch.platform.patch_pp_mtp import (
     _update_pp_mtp_spec_token_ids,
     _use_pp_ipc_runtime_patch,
 )
-from vllm_ascend.worker.model_runner_v1 import ExecuteModelState, NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    ExecuteModelState,
+    LayeredExecuteModelState,
+    NPUModelRunner,
+)
+
+
+def test_merge_layered_drafts_preserves_scheduler_order():
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 1}
+    )
+    drafts = [
+        DraftTokenIds(["prefill"], [[21, 22, 23, 24]]),
+        DraftTokenIds(["decode"], [[11, 12, 13, 14]]),
+    ]
+
+    merged = NPUModelRunner._merge_layered_draft_token_ids(
+        scheduler_output, drafts
+    )
+
+    assert merged == DraftTokenIds(
+        ["decode", "prefill"],
+        [[11, 12, 13, 14], [21, 22, 23, 24]],
+    )
+
+
+def test_merge_layered_drafts_skips_none_and_rejects_duplicates():
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 1}
+    )
+    assert NPUModelRunner._merge_layered_draft_token_ids(
+        scheduler_output,
+        [None, DraftTokenIds(["decode"], [[11]])],
+    ) == DraftTokenIds(["decode"], [[11]])
+
+    with pytest.raises(RuntimeError, match="duplicate layered draft"):
+        NPUModelRunner._merge_layered_draft_token_ids(
+            scheduler_output,
+            [
+                DraftTokenIds(["decode"], [[11]]),
+                DraftTokenIds(["decode"], [[12]]),
+            ],
+        )
+
+
+def test_take_drafts_consumes_pending_layered_result_first():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    pending = DraftTokenIds(
+        ["decode", "prefill"],
+        [[11, 12, 13, 14], [21, 22, 23, 24]],
+    )
+    runner._pending_layered_draft_token_ids = pending
+
+    assert runner.take_draft_token_ids() == pending
+    assert runner._pending_layered_draft_token_ids is None
+
+
+@pytest.mark.parametrize(
+    ("is_sampling_step", "p_sample_event"),
+    [(False, "P-intermediate"), (True, "P-sample")],
+)
+def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
+    monkeypatch, is_sampling_step, p_sample_event
+):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    events = []
+    d_sub_batch = SimpleNamespace(kind="D")
+    p_sub_batch = SimpleNamespace(kind="P")
+    merged_output = object()
+
+    def sample_sub_batch(sub_batch, _grammar_output):
+        events.append("D-sample" if sub_batch.kind == "D" else p_sample_event)
+        return object()
+
+    draft_req_ids = iter(("decode", "prefill"))
+
+    def take_drafts():
+        req_id = next(draft_req_ids)
+        events.append(f"{sub_batch_name(req_id)}-take-draft")
+        return DraftTokenIds([req_id], [[1, 2, 3, 4]])
+
+    def sub_batch_name(req_id):
+        return "D" if req_id == "decode" else "P"
+
+    runner._sample_layered_mtp_subbatch = sample_sub_batch
+    runner.take_draft_token_ids = take_drafts
+    runner._execute_pending_layered_prefill = lambda _pending: (
+        events.append("P-forward") or p_sub_batch
+    )
+    runner._merge_layered_outputs = lambda _scheduler, _outputs: (
+        events.append("merge-output") or merged_output
+    )
+    runner._merge_layered_draft_token_ids = lambda _scheduler, _drafts: (
+        events.append("merge-draft")
+        or DraftTokenIds(
+            ["decode", "prefill"],
+            [[1, 2, 3, 4], [1, 2, 3, 4]],
+        )
+    )
+    runner._restore_layered_sampling_masks = lambda _masks: None
+    runner._pending_layered_draft_token_ids = None
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.input_batch = None
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 1},
+        layered_prefill_plan=SimpleNamespace(
+            prefill_req_ids=("prefill",),
+            is_sampling_step=is_sampling_step,
+        ),
+    )
+    state = SimpleNamespace(
+        scheduler_output=scheduler_output,
+        decode_sub_batch=d_sub_batch,
+        pending_prefill=object(),
+        main_input_batch=object(),
+        main_sampling_masks=(np.empty(0, dtype=np.int64), 0, np.empty(0, dtype=bool)),
+    )
+
+    output = NPUModelRunner._sample_layered_mtp_step(runner, state, None)
+
+    expected = ["D-sample", "D-take-draft", "P-forward", p_sample_event]
+    if is_sampling_step:
+        expected.append("P-take-draft")
+    expected.extend(("merge-output", "merge-draft"))
+    assert events == expected
+    assert output is merged_output
+
+
+def test_layered_mtp_with_empty_decode_uses_existing_single_prefill_path(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.model_runner_v1.get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    main_batch = SimpleNamespace(num_reqs=0, req_ids=[])
+    prefill_batch = SimpleNamespace(num_reqs=1, req_ids=["prefill"])
+    runner.input_batch = main_batch
+    runner.layered_prefill_input_batch = prefill_batch
+    runner._executing_layered_subbatch = False
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.requests = {}
+    runner.layered_prefill_model_adapter = object()
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.num_spec_tokens = 1
+    runner._pending_layered_draft_token_ids = None
+    runner._capture_layered_sampling_masks = lambda: (
+        np.empty(0, dtype=np.int64),
+        0,
+        np.empty(runner.input_batch.num_reqs, dtype=bool),
+    )
+    runner._get_layered_prefill_input_batch = lambda _num_reqs: prefill_batch
+    include_one_time_updates = []
+
+    def subset(scheduler_output, _req_ids, **kwargs):
+        include_one_time_updates.append(kwargs["include_one_time_updates"])
+        return scheduler_output
+
+    runner._subset_scheduler_output = subset
+    runner.execute_model = lambda _scheduler_output, _intermediate: (
+        setattr(runner, "execute_model_state", ExecuteModelState(*([None] * 13)))
+        or None
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"prefill": 1},
+        total_num_scheduled_tokens=1,
+        finished_req_ids=set(),
+        layered_prefill_plan=SimpleNamespace(
+            prefill_req_ids=("prefill",),
+            group_id=1,
+            num_groups=2,
+            is_sampling_step=True,
+        ),
+    )
+
+    runner._execute_layered_step(scheduler_output, None)
+
+    assert isinstance(runner.execute_model_state, LayeredExecuteModelState)
+    assert include_one_time_updates == [True]
+
+
+@pytest.mark.parametrize("num_spec_tokens", [1, 4])
+def test_layered_mtp_execute_defers_prefill_forward(
+    monkeypatch, num_spec_tokens
+):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.model_runner_v1.get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    main_batch = SimpleNamespace(num_reqs=1, req_ids=["decode"])
+    prefill_batch = SimpleNamespace(num_reqs=1, req_ids=["prefill"])
+    runner.input_batch = main_batch
+    runner.layered_prefill_input_batch = prefill_batch
+    runner._executing_layered_subbatch = False
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.requests = {}
+    runner.layered_prefill_model_adapter = object()
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.num_spec_tokens = num_spec_tokens
+    runner._pending_layered_draft_token_ids = None
+    runner._capture_layered_sampling_masks = lambda: (
+        np.empty(0, dtype=np.int64),
+        0,
+        np.zeros(runner.input_batch.num_reqs, dtype=bool),
+    )
+    runner._get_layered_prefill_input_batch = lambda _num_reqs: prefill_batch
+
+    def subset(scheduler_output, req_ids, **kwargs):
+        return SimpleNamespace(
+            num_scheduled_tokens={
+                req_id: scheduler_output.num_scheduled_tokens[req_id]
+                for req_id in req_ids
+            },
+            total_num_scheduled_tokens=sum(
+                scheduler_output.num_scheduled_tokens[req_id]
+                for req_id in req_ids
+            ),
+            layered_prefill_plan=kwargs["layered_plan"],
+        )
+
+    runner._subset_scheduler_output = subset
+    forward_calls = []
+
+    def execute_model(sub_output, _intermediate):
+        forward_calls.append(list(sub_output.num_scheduled_tokens))
+        runner.execute_model_state = ExecuteModelState(*([None] * 13))
+        return None
+
+    runner.execute_model = execute_model
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 4},
+        total_num_scheduled_tokens=5,
+        finished_req_ids=set(),
+        layered_prefill_plan=SimpleNamespace(
+            prefill_req_ids=("prefill",),
+            group_id=0,
+            num_groups=2,
+            is_sampling_step=False,
+        ),
+    )
+
+    runner._execute_layered_step(scheduler_output, None)
+
+    assert forward_calls == [["decode"]]
+    assert type(runner.execute_model_state).__name__ == "LayeredMTPExecuteModelState"
 
 
 def test_layered_prefill_restores_main_mask_after_decode_batch_update():
@@ -30,6 +282,7 @@ def test_layered_prefill_restores_main_mask_after_decode_batch_update():
     runner.kv_connector_output = None
     runner.requests = {}
     runner.layered_prefill_model_adapter = object()
+    runner.speculative_config = None
 
     # Return masks aligned with the currently active batch.  The fake Decode
     # execution grows the main batch from two rows to three rows, reproducing

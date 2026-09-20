@@ -317,6 +317,25 @@ class LayeredExecuteModelState(NamedTuple):
     main_sampling_masks: tuple[np.ndarray, int, np.ndarray]
 
 
+class LayeredPendingSubBatchState(NamedTuple):
+    """A layered P subbatch whose forward must wait for D sampling."""
+
+    input_batch: NPUInputBatch
+    scheduler_output: "SchedulerOutput"
+    intermediate_tensors: IntermediateTensors | None
+    moe_comm_token_count: int
+
+
+class LayeredMTPExecuteModelState(NamedTuple):
+    """D state and deferred P work for one MTP layered step."""
+
+    scheduler_output: "SchedulerOutput"
+    decode_sub_batch: LayeredSubBatchState
+    pending_prefill: LayeredPendingSubBatchState
+    main_input_batch: NPUInputBatch
+    main_sampling_masks: tuple[np.ndarray, int, np.ndarray]
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
@@ -582,11 +601,15 @@ class NPUModelRunner(GPUModelRunner):
         )
         # for cleancode , actually the three attrs is defined in gpu_model_runner
         self.execute_model_state: (
-            ExecuteModelState | LayeredExecuteModelState | None
+            ExecuteModelState
+            | LayeredExecuteModelState
+            | LayeredMTPExecuteModelState
+            | None
         ) = None
         self.layered_prefill_input_batch: NPUInputBatch | None = None
         self._executing_layered_subbatch = False
         self._layered_moe_comm_token_count: int | None = None
+        self._pending_layered_draft_token_ids: DraftTokenIds | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -1791,6 +1814,10 @@ class NPUModelRunner(GPUModelRunner):
             self.draft_token_ids_event.record()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self._pending_layered_draft_token_ids is not None:
+            out = self._pending_layered_draft_token_ids
+            self._pending_layered_draft_token_ids = None
+            return out
         out = super().take_draft_token_ids()
         if out is None:
             return None
@@ -2074,6 +2101,86 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_tensors
         )
 
+        use_layered_mtp_interleave = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and get_pp_group().world_size == 1
+        )
+        if use_layered_mtp_interleave and d_req_ids:
+            if self._pending_layered_draft_token_ids is not None:
+                raise RuntimeError(
+                    "Layered MTP drafts were not consumed by the previous step"
+                )
+            self._executing_layered_subbatch = True
+            try:
+                self.input_batch = main_input_batch
+                self.execute_model_state = None
+                self._layered_moe_comm_token_count = None
+                d_output = self._subset_scheduler_output(
+                    scheduler_output,
+                    d_req_ids,
+                    layered_plan=None,
+                    include_one_time_updates=True,
+                )
+                result = self.execute_model(d_output, d_intermediate)
+                if result is not None:
+                    raise RuntimeError(
+                        "Layered MTP D forward returned an unexpected output"
+                    )
+                execute_state = self.execute_model_state
+                if not isinstance(execute_state, ExecuteModelState):
+                    raise RuntimeError(
+                        "Missing execute state for layered MTP D subbatch"
+                    )
+                discard_indices, num_discarded, discard_mask = (
+                    self._capture_layered_sampling_masks()
+                )
+                main_sampling_masks = (
+                    discard_indices.copy(),
+                    num_discarded,
+                    discard_mask.copy(),
+                )
+                decode_sub_batch = LayeredSubBatchState(
+                    input_batch=main_input_batch,
+                    execute_state=execute_state,
+                    kv_connector_output=self.kv_connector_output,
+                    discard_request_indices=discard_indices,
+                    num_discarded_requests=num_discarded,
+                    discard_request_mask=discard_mask,
+                )
+
+                for req_id in scheduler_output.finished_req_ids:
+                    p_input_batch.remove_request(req_id)
+                p_output = self._subset_scheduler_output(
+                    scheduler_output,
+                    p_req_ids,
+                    layered_plan=plan,
+                    include_one_time_updates=False,
+                )
+                pending_prefill = LayeredPendingSubBatchState(
+                    input_batch=p_input_batch,
+                    scheduler_output=p_output,
+                    intermediate_tensors=p_intermediate,
+                    moe_comm_token_count=getattr(
+                        scheduler_output,
+                        "total_num_scheduled_tokens",
+                        sum(scheduler_output.num_scheduled_tokens.values()),
+                    ),
+                )
+                self.execute_model_state = LayeredMTPExecuteModelState(
+                    scheduler_output=scheduler_output,
+                    decode_sub_batch=decode_sub_batch,
+                    pending_prefill=pending_prefill,
+                    main_input_batch=main_input_batch,
+                    main_sampling_masks=main_sampling_masks,
+                )
+                self.kv_connector_output = None
+            finally:
+                self._executing_layered_subbatch = False
+                self._layered_moe_comm_token_count = None
+                self.input_batch = main_input_batch
+            return None
+
         self._executing_layered_subbatch = True
         one_time_updates_pending = True
         try:
@@ -2325,6 +2432,35 @@ class NPUModelRunner(GPUModelRunner):
         return IntermediateTensors(tensors)
 
     @staticmethod
+    def _merge_layered_draft_token_ids(
+        scheduler_output: "SchedulerOutput",
+        drafts: list[DraftTokenIds | None],
+    ) -> DraftTokenIds | None:
+        by_req_id: dict[str, list[int]] = {}
+        for draft in drafts:
+            if draft is None:
+                continue
+            for req_id, token_ids in zip(
+                draft.req_ids, draft.draft_token_ids
+            ):
+                if req_id in by_req_id:
+                    raise RuntimeError(
+                        f"duplicate layered draft for {req_id}"
+                    )
+                by_req_id[req_id] = token_ids
+        req_ids = [
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if req_id in by_req_id
+        ]
+        if not req_ids:
+            return None
+        return DraftTokenIds(
+            req_ids,
+            [by_req_id[req_id] for req_id in req_ids],
+        )
+
+    @staticmethod
     def _merge_layered_outputs(
         scheduler_output: "SchedulerOutput",
         outputs: list[ModelRunnerOutput],
@@ -2471,6 +2607,131 @@ class NPUModelRunner(GPUModelRunner):
             output_token_ids[
                 first_placeholder : first_placeholder + num_to_replace
             ] = sampled_ids[:num_to_replace]
+
+    def _sample_layered_mtp_subbatch(
+        self,
+        sub_batch: LayeredSubBatchState,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput:
+        self.input_batch = sub_batch.input_batch
+        self._restore_layered_sampling_masks(
+            (
+                sub_batch.discard_request_indices,
+                sub_batch.num_discarded_requests,
+                sub_batch.discard_request_mask,
+            )
+        )
+        self.execute_model_state = sub_batch.execute_state
+        self.kv_connector_output = sub_batch.kv_connector_output
+        active_grammar_output = grammar_output
+        if grammar_output is not None and not any(
+            req_id in grammar_output.structured_output_request_ids
+            for req_id in self.input_batch.req_ids
+        ):
+            active_grammar_output = None
+        output = self.sample_tokens(active_grammar_output)
+        if isinstance(output, AsyncModelRunnerOutput):
+            output = output.get_output()
+        if output is None:
+            output = EMPTY_MODEL_RUNNER_OUTPUT
+        if not isinstance(output, ModelRunnerOutput):
+            raise RuntimeError("Layered prefill sampling returned PP tensors")
+        return output
+
+    def _execute_pending_layered_prefill(
+        self,
+        pending: LayeredPendingSubBatchState,
+    ) -> LayeredSubBatchState:
+        self.input_batch = pending.input_batch
+        self.execute_model_state = None
+        self.kv_connector_output = None
+        self._executing_layered_subbatch = True
+        self._layered_moe_comm_token_count = pending.moe_comm_token_count
+        try:
+            result = self.execute_model(
+                pending.scheduler_output,
+                pending.intermediate_tensors,
+            )
+        finally:
+            self._executing_layered_subbatch = False
+            self._layered_moe_comm_token_count = None
+        if result is not None:
+            raise RuntimeError(
+                "Layered MTP P forward returned an unexpected output"
+            )
+        torch.npu.synchronize()
+        execute_state = self.execute_model_state
+        if not isinstance(execute_state, ExecuteModelState):
+            raise RuntimeError(
+                "Missing execute state for layered MTP P subbatch"
+            )
+        discard_indices, num_discarded, discard_mask = (
+            self._capture_layered_sampling_masks()
+        )
+        return LayeredSubBatchState(
+            input_batch=pending.input_batch,
+            execute_state=execute_state,
+            kv_connector_output=self.kv_connector_output,
+            discard_request_indices=discard_indices,
+            num_discarded_requests=num_discarded,
+            discard_request_mask=discard_mask,
+        )
+
+    def _sample_layered_mtp_step(
+        self,
+        state: LayeredMTPExecuteModelState,
+        grammar_output: "GrammarOutput | None",
+    ) -> ModelRunnerOutput:
+        scheduler_output = state.scheduler_output
+        plan = scheduler_output.layered_prefill_plan
+        assert plan is not None
+        drafts: list[DraftTokenIds | None] = []
+        outputs: list[ModelRunnerOutput] = []
+        try:
+            outputs.append(
+                self._sample_layered_mtp_subbatch(
+                    state.decode_sub_batch,
+                    grammar_output,
+                )
+            )
+            drafts.append(self.take_draft_token_ids())
+
+            torch.npu.synchronize()
+            p_sub_batch = self._execute_pending_layered_prefill(
+                state.pending_prefill
+            )
+            outputs.append(
+                self._sample_layered_mtp_subbatch(
+                    p_sub_batch,
+                    grammar_output,
+                )
+            )
+            drafts.append(
+                self.take_draft_token_ids()
+                if plan.is_sampling_step
+                else None
+            )
+            merged_output = self._merge_layered_outputs(
+                scheduler_output,
+                outputs,
+            )
+            self._pending_layered_draft_token_ids = (
+                self._merge_layered_draft_token_ids(
+                    scheduler_output,
+                    drafts,
+                )
+            )
+            return merged_output
+        except Exception:
+            self._pending_layered_draft_token_ids = None
+            raise
+        finally:
+            self.execute_model_state = None
+            self.kv_connector_output = None
+            self.input_batch = state.main_input_batch
+            self._restore_layered_sampling_masks(
+                state.main_sampling_masks
+            )
 
     def _sample_layered_step(
         self, grammar_output: "GrammarOutput | None"
@@ -3124,6 +3385,10 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if isinstance(self.execute_model_state, LayeredMTPExecuteModelState):
+            state = self.execute_model_state
+            self.execute_model_state = None
+            return self._sample_layered_mtp_step(state, grammar_output)
         if isinstance(self.execute_model_state, LayeredExecuteModelState):
             return self._sample_layered_step(grammar_output)
 

@@ -985,9 +985,15 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             raise ValueError(
                 "layered_prefill_config Phase 1 requires connector-free PD-mixed mode"
             )
-        if getattr(vllm_config, "speculative_config", None) is not None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None and not (
+            is_deepseek_v4
+            and getattr(speculative_config, "method", None) == "mtp"
+            and parallel_config.pipeline_parallel_size == 1
+        ):
             raise ValueError(
-                "layered_prefill_config Phase 1 does not support speculative decoding"
+                "layered_prefill_config currently only supports "
+                "DeepSeek-V4 MTP with PP=1"
             )
         if getattr(vllm_config, "lora_config", None) is not None:
             raise ValueError(
