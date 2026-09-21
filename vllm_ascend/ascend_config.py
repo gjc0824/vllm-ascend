@@ -1225,6 +1225,8 @@ class SchedulerConfig:
             max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),
             require_pd_mixed=bool(layered_prefill_raw.get("require_pd_mixed", True)),
             require_eager=bool(layered_prefill_raw.get("require_eager", True)),
+            single_forward=bool(layered_prefill_raw.get("single_forward", True)),
+            single_forward_decode_graph=bool(layered_prefill_raw.get("single_forward_decode_graph", True)),
         )
 
     @staticmethod
