@@ -11,12 +11,14 @@ Model-specific state transitions remain in the existing model adapter.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import torch
-from vllm.config import CUDAGraphMode
+from vllm.config import CompilationMode, CUDAGraphMode, set_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.v1.core.layered_prefill import LayeredFrontier, make_layer_group_ranges
 
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -31,6 +33,33 @@ class LayeredPrefillSingleForward:
         self.runner = runner
         self.decode_builders: dict[tuple[int, int], Any] = {}
         self.decode_graph_cache = None
+        self.compiled_groups: dict[tuple, Any] = {}
+        self.metadata_buffers: dict[tuple, torch.Tensor] = {}
+        self.index_buffers: dict[tuple, torch.Tensor] = {}
+
+    def indices(self, length, *, dtype, device):
+        key = (dtype, device)
+        value = self.index_buffers.get(key)
+        if value is None or value.numel() < length:
+            capacity = max(length, getattr(self.runner, "max_num_reqs", length) + 1)
+            value = torch.arange(capacity, dtype=dtype, device=device)
+            self.index_buffers[key] = value
+        return value[:length]
+
+    def metadata_buffer(self, key, value, rows):
+        shape = (rows, *value.shape[1:])
+        target = self.metadata_buffers.get(key)
+        if (
+            target is None
+            or target.shape[1:] != value.shape[1:]
+            or target.shape[0] < rows
+            or target.dtype != value.dtype
+            or target.device != value.device
+        ):
+            capacity = max(rows, getattr(self.runner, "max_num_reqs", rows))
+            target = value.new_empty((capacity, *shape[1:]))
+            self.metadata_buffers[key] = target
+        return target[:rows]
 
     @staticmethod
     def supported(runner) -> bool:
@@ -104,6 +133,60 @@ class LayeredPrefillSingleForward:
                 )
         return state
 
+    def forward_mixed(self, start, end, state, input_ids, positions):
+        runner = self.runner
+        adapter = runner.layered_prefill_model_adapter
+        compilation = getattr(runner, "compilation_config", None)
+        use_compile = (
+            getattr(compilation, "mode", None) == CompilationMode.VLLM_COMPILE
+            and not runner.model_config.enforce_eager
+            and runner.ascend_config.scheduler_config.layered_prefill_config.single_forward_compile
+        )
+        if not use_compile:
+            for idx in range(start, end):
+                state = adapter._forward_layer(adapter.layers[idx], positions, *state, input_ids)
+            return state
+
+        # Lazy import: compilation infrastructure is not needed by fallback
+        # runners. Compilation does not add a warmup forward on live KV caches.
+        from vllm.compilation.backends import set_model_tag
+
+        from vllm_ascend.worker.layered_prefill_compiled import (
+            LayeredPrefillCompiledGroup,
+        )
+
+        # Python-side communication dispatch must not be frozen from a small
+        # MC2 batch and reused for a large AllGather batch (or conversely).
+        comm = str(get_forward_context().moe_comm_type)
+        key = (start, end, comm, state[1] is None)
+        group = self.compiled_groups.get(key)
+        if group is None:
+            # The AOT decorator hashes the function and config, not module
+            # attributes or backend prefix. Isolate each layer/comm contract
+            # in BOTH caches without mutating the full model's configuration.
+            config = copy(runner.vllm_config)
+            config.additional_config = dict(config.additional_config or {})
+            config.additional_config["layered_prefill_compile_key"] = key
+            config.compilation_config = copy(config.compilation_config)
+            config.compilation_config.cache_dir = ""
+            config.compilation_config.local_cache_dir = None
+            config.compilation_config.traced_files = set(config.compilation_config.traced_files)
+        else:
+            config = group.vllm_config
+        with (
+            set_current_vllm_config(config),
+            set_model_tag(f"layered_prefill_{start}_{end}_{comm}_{state[1] is None}"),
+        ):
+            if group is None:
+                group = LayeredPrefillCompiledGroup(
+                    adapter=adapter,
+                    start=start,
+                    end=end,
+                    vllm_config=config,
+                )
+                self.compiled_groups[key] = group
+            return group(*state, positions, input_ids)
+
     def prepare(self, plan, num_tokens_padded):
         return LayeredPrefillBatch(self, plan, num_tokens_padded)
 
@@ -132,8 +215,13 @@ class LayeredPrefillBatch:
             raise ValueError("Single-forward D view requires one token per request")
         self.d_tokens = len(self.d_rows)
         self.d_padded = runner._pad_for_sequence_parallelism(self.d_tokens)
-        self.d_indices = torch.tensor(self.d_rows, dtype=torch.long, device=runner.device)
-        self.d_req_indices = torch.tensor(self.d_requests, dtype=torch.long, device=runner.device)
+        self.decode_is_prefix = self.p_index == len(req_ids) - 1
+        if self.decode_is_prefix:
+            self.d_indices = executor.indices(self.d_tokens, dtype=torch.long, device=runner.device)
+            self.d_req_indices = self.d_indices
+        else:
+            self.d_indices = torch.tensor(self.d_rows, dtype=torch.long, device=runner.device)
+            self.d_req_indices = torch.tensor(self.d_requests, dtype=torch.long, device=runner.device)
         self.decode_metadata: dict[str, Any] = {}
         self.decode_ratios: dict[Any, Any] = {}
         if not plan.is_sampling_step:
@@ -143,14 +231,30 @@ class LayeredPrefillBatch:
             runner._restore_layered_sampling_masks((indices, len(indices), mask))
 
     def _decode_tokens(self, value, *, dim=0, fill=0):
-        selected = value.index_select(dim, self.d_indices)
+        selected = (
+            value.narrow(dim, 0, self.d_tokens) if self.decode_is_prefix else value.index_select(dim, self.d_indices)
+        )
         if self.d_padded == self.d_tokens:
             return selected
         shape = list(selected.shape)
         shape[dim] = self.d_padded - self.d_tokens
         return torch.cat((selected, selected.new_full(shape, fill)), dim=dim)
 
-    def compact_metadata(self, common):
+    def _compact_rows(self, value, key, *, tokens=False, fill=0):
+        target = self.executor.metadata_buffer(key, value, self.d_padded)
+        if self.decode_is_prefix:
+            target[: self.d_tokens].copy_(value[: self.d_tokens])
+        elif value.device.type == "cpu":
+            rows = self.d_rows if tokens else self.d_requests
+            target[: self.d_tokens].copy_(value[rows])
+        else:
+            indices = self.d_indices if tokens else self.d_req_indices
+            torch.index_select(value, 0, indices, out=target[: self.d_tokens])
+        if self.d_padded > self.d_tokens:
+            target[self.d_tokens :].fill_(fill)
+        return target
+
+    def compact_metadata(self, common, kv_cache_gid=0):
         """Compact the backend-independent contract, never backend metadata."""
         if common.context_parallel_metadata is not None:
             raise ValueError("Single-forward compaction does not support DCP metadata")
@@ -175,20 +279,22 @@ class LayeredPrefillBatch:
         ):
             value = getattr(common, name, None)
             if value is not None:
-                selected = (
-                    value[self.d_requests] if value.device.type == "cpu" else value.index_select(0, self.d_req_indices)
-                )
-                if self.d_padded > self.d_tokens:
-                    padding = selected.new_zeros((self.d_padded - self.d_tokens, *selected.shape[1:]))
-                    selected = torch.cat((selected, padding))
-                updates[name] = selected
+                updates[name] = self._compact_rows(value, (kv_cache_gid, name))
         # Match the runner's uniform-Decode padding contract: every physical
         # token has a query row, while dummy requests have zero KV length and
         # invalid slots. Leaving padding outside query_start_loc can leave
         # backend output rows unwritten and poison quantization tiles.
-        query_cpu = torch.arange(self.d_padded + 1, dtype=common.query_start_loc_cpu.dtype)
+        query_cpu = self.executor.indices(
+            self.d_padded + 1,
+            dtype=common.query_start_loc_cpu.dtype,
+            device=common.query_start_loc_cpu.device,
+        )
         updates.update(
-            query_start_loc=query_cpu.to(common.query_start_loc.device, non_blocking=True),
+            query_start_loc=self.executor.indices(
+                self.d_padded + 1,
+                dtype=common.query_start_loc.dtype,
+                device=common.query_start_loc.device,
+            ),
             query_start_loc_cpu=query_cpu,
             num_reqs=self.d_padded,
             num_actual_tokens=self.d_tokens,
@@ -196,9 +302,18 @@ class LayeredPrefillBatch:
             max_query_len=1,
             max_seq_len=int(updates["_seq_lens_cpu"].max()),
             actual_seq_lengths_q=list(range(1, self.d_padded + 1)),
-            slot_mapping=self._decode_tokens(common.slot_mapping, fill=-1),
-            positions=self._decode_tokens(common.positions),
-            positions_cpu=(common.positions_cpu[self.d_rows] if common.positions_cpu is not None else None),
+            slot_mapping=self._compact_rows(
+                common.slot_mapping,
+                (kv_cache_gid, "slot_mapping"),
+                tokens=True,
+                fill=-1,
+            ),
+            positions=self._compact_rows(common.positions, (kv_cache_gid, "positions"), tokens=True),
+            positions_cpu=(
+                self._compact_rows(common.positions_cpu, (kv_cache_gid, "positions_cpu"), tokens=True)
+                if common.positions_cpu is not None
+                else None
+            ),
             attn_state=type(common.attn_state).DecodeOnly,
             graph_pad_size=-1,
         )
@@ -221,7 +336,16 @@ class LayeredPrefillBatch:
             yield
 
     @staticmethod
-    def _join(d_state, p_state, p_start, p_end, d_indices, num_tokens):
+    def _join(
+        d_state,
+        p_state,
+        p_start,
+        p_end,
+        d_indices,
+        num_tokens,
+        *,
+        decode_is_prefix=False,
+    ):
         result = []
         for d, p in zip(d_state, p_state):
             if d is None and p is None:
@@ -229,10 +353,17 @@ class LayeredPrefillBatch:
                 continue
             if p is None or (d is None and d_indices.numel()):
                 raise ValueError("D/P residual contracts differ at the same layer")
-            mixed = p.new_zeros((num_tokens, *p.shape[1:]))
+            mixed = p.new_empty((num_tokens, *p.shape[1:]))
+            # Real rows are overwritten below; only TP padding needs clearing.
+            actual = p_end - p_start + d_indices.numel()
+            if num_tokens > actual:
+                mixed[actual:].zero_()
             mixed[p_start:p_end].copy_(p)
             if d is not None:
-                mixed.index_copy_(0, d_indices, d[: d_indices.numel()])
+                if decode_is_prefix:
+                    mixed[: d_indices.numel()].copy_(d[: d_indices.numel()])
+                else:
+                    mixed.index_copy_(0, d_indices, d[: d_indices.numel()])
             result.append(mixed)
         return tuple(result)
 
@@ -311,6 +442,7 @@ class LayeredPrefillBatch:
                     self.p_end,
                     self.d_indices,
                     self.num_tokens_padded,
+                    decode_is_prefix=self.decode_is_prefix,
                 )
                 if mixed
                 else d_state
@@ -321,8 +453,7 @@ class LayeredPrefillBatch:
             actual = self.p_tokens + self.d_tokens if mixed else self.d_tokens
             with self._context(metadata, pos, padded, actual, start):
                 if mixed:
-                    for idx in range(start, end):
-                        state = adapter._forward_layer(adapter.layers[idx], pos, *state, ids)
+                    state = self.executor.forward_mixed(start, end, state, ids, pos)
                 else:
                     state = self.executor.forward_decode(plan, start, end, state, ids, pos)
                 if mixed:

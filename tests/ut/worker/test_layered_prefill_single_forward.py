@@ -285,16 +285,21 @@ def test_decode_graph_refuses_opaque_metadata_instead_of_replaying_it():
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_decode_graph_switch_has_matching_scheduler_and_worker_values(enabled):
+@pytest.mark.parametrize("field", ["single_forward_decode_graph", "single_forward_compile"])
+def test_optimization_switch_has_matching_scheduler_and_worker_values(enabled, field):
     from vllm.v1.core.layered_prefill import LayeredPrefillConfig
 
     from vllm_ascend.ascend_config import SchedulerConfig
 
-    additional = {"scheduler_config": {"layered_prefill_config": {"single_forward_decode_graph": enabled}}}
+    additional = {"scheduler_config": {"layered_prefill_config": {field: enabled}}}
     assert (
-        LayeredPrefillConfig.from_vllm_config(NS(additional_config=additional)).single_forward_decode_graph == enabled
+        getattr(
+            LayeredPrefillConfig.from_vllm_config(NS(additional_config=additional)),
+            field,
+        )
+        == enabled
     )
-    assert SchedulerConfig(additional, False).layered_prefill_config.single_forward_decode_graph == enabled
+    assert getattr(SchedulerConfig(additional, False).layered_prefill_config, field) == enabled
 
 
 def test_graph_metadata_borrows_only_decode_storage_not_mixed_builder_storage():
@@ -321,3 +326,90 @@ def test_final_group_flag_must_agree_with_model_depth(monkeypatch):
     batch = LayeredPrefillSingleForward(runner_for()).prepare(plan(0, final=True), 8)
     with pytest.raises(ValueError, match="final-group"):
         batch.forward(torch.arange(8), torch.arange(8), None, {})
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_metadata_buffers_are_reused_refreshed_and_isolated_by_kv_group(prefix):
+    runner = runner_for(("d0", "d1", "p"), (1, 1, 5)) if prefix else runner_for()
+    executor = LayeredPrefillSingleForward(runner)
+    batch = executor.prepare(plan(0), 8)
+    value = torch.arange(12).reshape(3, 4)
+    result = batch._compact_rows(value, (0, "blocks"))
+    address = result.data_ptr()
+    torch.testing.assert_close(result[:2], value[batch.d_requests])
+    assert result[2:].count_nonzero() == 0
+    other = batch._compact_rows(value + 100, (1, "blocks"))
+    assert other.data_ptr() != address
+    again = executor.prepare(plan(0), 8)._compact_rows(value + 10, (0, "blocks"))
+    assert again.data_ptr() == address
+    torch.testing.assert_close(again[:2], (value + 10)[batch.d_requests])
+    torch.testing.assert_close(other[:2], (value + 100)[batch.d_requests])
+    torch.testing.assert_close(value, torch.arange(12).reshape(3, 4))
+
+
+@pytest.mark.parametrize("hyper", [False, True])
+@pytest.mark.parametrize("p_start", [0, 1, 2])
+def test_join_initializes_every_real_and_padding_row(hyper, p_start):
+    shape = (2, 3) if hyper else (3,)
+    p = torch.full((5, *shape), 7.0)
+    d = torch.full((4, *shape), 11.0)
+    indices = torch.tensor([i for i in range(7) if not p_start <= i < p_start + 5])
+    mixed, residual = LayeredPrefillBatch._join((d, None), (p, None), p_start, p_start + 5, indices, 8)
+    torch.testing.assert_close(mixed[p_start : p_start + 5], p)
+    torch.testing.assert_close(mixed[indices], d[:2])
+    assert mixed[7:].count_nonzero() == 0
+    assert residual is None
+
+
+def test_compile_groups_cached_by_range_without_extra_live_forward(monkeypatch):
+    import sys
+
+    from vllm.config import CompilationMode
+
+    from vllm_ascend.worker import layered_prefill_single_forward as module
+
+    calls = []
+    created = []
+
+    class Compiled:
+        def __init__(self, *, adapter, start, end, vllm_config):
+            self.range = (start, end)
+            self.vllm_config = vllm_config
+            created.append(self.range)
+
+        def __call__(self, hidden, residual, positions, input_ids):
+            calls.append(self.range)
+            return hidden + self.range[0] + 1, residual
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.worker.layered_prefill_compiled",
+        NS(LayeredPrefillCompiledGroup=Compiled),
+    )
+    monkeypatch.setattr(module, "set_current_vllm_config", lambda c: nullcontext())
+    context = NS(moe_comm_type="allgather")
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    runner = runner_for()
+    runner.compilation_config = NS(mode=CompilationMode.VLLM_COMPILE)
+    runner.model_config = NS(enforce_eager=False)
+    runner.vllm_config = NS(
+        additional_config={"original": True},
+        compilation_config=NS(cache_dir="full-model-cache", traced_files={"original"}),
+    )
+    runner.ascend_config = NS(scheduler_config=NS(layered_prefill_config=NS(single_forward_compile=True)))
+    executor = LayeredPrefillSingleForward(runner)
+    state = (torch.zeros(1), None)
+    for start in (0, 2, 0):
+        result, _ = executor.forward_mixed(start, start + 2, state, None, None)
+        torch.testing.assert_close(result, torch.tensor([start + 1.0]))
+    assert calls == [(0, 2), (2, 4), (0, 2)]
+    assert created == [(0, 2), (2, 4)]
+    context.moe_comm_type = "mc2"
+    executor.forward_mixed(0, 2, state, None, None)
+    assert created == [(0, 2), (2, 4), (0, 2)]
+    configs = [group.vllm_config for group in executor.compiled_groups.values()]
+    assert len({c.additional_config["layered_prefill_compile_key"] for c in configs}) == 3
+    assert runner.vllm_config.additional_config == {"original": True}
+    assert runner.vllm_config.compilation_config.cache_dir == "full-model-cache"
+    configs[0].compilation_config.traced_files.add("layer-group")
+    assert runner.vllm_config.compilation_config.traced_files == {"original"}

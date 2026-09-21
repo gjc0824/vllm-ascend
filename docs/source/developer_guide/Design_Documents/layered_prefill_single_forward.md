@@ -52,6 +52,32 @@ on a cache miss; there is no added device-wide D/P boundary synchronization on
 steady-state replay. Cold-shape capture cost must be reported separately from
 steady-state performance.
 
+## Compiled Prefill groups and buffer reuse
+
+The active P/D range uses a runner-owned `LayeredPrefillCompiledGroup` with
+the normal vLLM compilation decorator/backend. It shares existing layer modules
+and calls the model adapter; no model or attention implementation is replaced.
+This restores compiler optimization lost by the previous eager adapter loop.
+In particular, the DeepSeek-V4 HC residual clones disappear from the measured
+compiled kernel stream without removing alias-protection manually in model code.
+
+Compiled groups are isolated by layer range, MoE communication method, and
+residual contract. Each gets a shallow configuration copy with a distinct hash
+salt and private compilation bookkeeping. A backend prefix alone is insufficient:
+the AOT decorator hashes the function and configuration, not the module's layer
+list. Reusing the first range's AOT artifact for other ranges is incorrect.
+Weights and static attention bindings remain shared, not deep-copied. A compile
+failure is not retried eagerly on possibly already-modified live KV state.
+
+Decode common-metadata scratch is keyed by KV group and field. Every step
+refreshes real rows and invalidates padded rows; scratch never aliases mixed
+metadata. The usual Decode-prefix layout uses slices and cached device indices,
+while arbitrary P placement retains indexed compaction. Uniform query-start
+indices are reused without per-step host-to-device transfers. CPU positions
+are padded consistently with the physical Decode view. Join writes all real
+rows and clears only the TP-padding tail; P frontier copies are retained for
+ownership safety.
+
 ## Configuration
 
 The fields are under `additional_config.scheduler_config.layered_prefill_config`:
@@ -60,6 +86,7 @@ The fields are under `additional_config.scheduler_config.layered_prefill_config`
 | --- | --- | --- |
 | `single_forward` | `true` | Use row compaction on supported steps. `false` preserves the split D/P reference path. |
 | `single_forward_decode_graph` | `true` | Cache Decode layer groups when graph execution is enabled. `false` uses eager groups. |
+| `single_forward_compile` | `true` | Compile active P/D ranges when vLLM compilation is enabled; `false` retains eager P/D ranges for ablation. |
 
 For the tested TP4 configuration, use `max-num-seqs=64`, sufficient token budget
 for the complete P query plus D rows (16448 for 16K input), and
@@ -110,3 +137,23 @@ specifically to the earlier NPU0-3 run, not to every TP4 card placement.
 
 The full report is `SINGLE_FORWARD_REPORT.md` in the remote experiment directory:
 `/home/g00955623/layer_prefill/experiments/single_forward_20260920/`.
+
+The 2026-09-21 optimization on NPU0-3 increased single-forward Layer[4] throughput
+to 211.75 output tokens/s (three runs), but did not beat Chunk4160. Against the
+LP-disabled **serial** reference, all 8 serial, 8 concurrent, 8 staggered, and 64
+full-output concurrent fixtures matched. The baseline's own concurrent and
+staggered 8191-token fixture differed from its serial result; same-scenario
+comparisons therefore remain 22/24, not universally bitwise equal. The unchanged
+split reference produced 63/64 exact outputs, so its subsequent throughput run
+is a diagnostic comparison, not a passing correctness result.
+
+Detailed optimization results, the compile-disabled ablation, profiling, and
+the incremental patch are in:
+`/home/g00955623/layer_prefill/experiments/single_forward_optimization_20260921/`.
+
+A final-source restart retained 8/8 serial, 8/8 concurrent, and 64/64 full-output
+matches, but only 7/8 staggered matches: the 4096-token fixture diverged at output
+token 65. This is unresolved and must not be attributed to the baseline's separate
+8191-token instability without further evidence. All eight range/communication
+cache combinations loaded correctly in a separate restart smoke test, but that
+does not establish universal precision. Full acceptance remains incomplete.

@@ -4023,7 +4023,7 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     spec_decode_common_attn_metadata = cm
             decode_cm = (
-                layered_batch.compact_metadata(cm)
+                layered_batch.compact_metadata(cm, kv_cache_gid)
                 if layered_batch is not None and layered_batch.d_tokens else None
             )
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
