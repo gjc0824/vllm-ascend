@@ -8,7 +8,7 @@ import torch
 from vllm.config.model import ModelConfig
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
 from vllm_ascend.patch.platform.patch_pp_mtp import (
@@ -80,13 +80,17 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
     monkeypatch, is_sampling_step, p_sample_event
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.use_async_scheduling = False
+    runner._suppress_layered_prefill_spec_state = False
     events = []
+    sample_flags = []
     d_sub_batch = SimpleNamespace(kind="D")
     p_sub_batch = SimpleNamespace(kind="P")
     merged_output = object()
 
     def sample_sub_batch(sub_batch, _grammar_output):
         events.append("D-sample" if sub_batch.kind == "D" else p_sample_event)
+        sample_flags.append(runner._suppress_layered_prefill_spec_state)
         return object()
 
     draft_req_ids = iter(("decode", "prefill"))
@@ -119,7 +123,7 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
     runner.execute_model_state = None
     runner.kv_connector_output = None
     runner.input_batch = None
-    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    _fake_npu_current_stream(monkeypatch)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"decode": 1, "prefill": 1},
@@ -144,6 +148,222 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
     expected.extend(("merge-output", "merge-draft"))
     assert events == expected
     assert output is merged_output
+    # Sync mode never raises the suppress flag: both subbatches propose.
+    assert sample_flags == [False, False]
+    assert runner._suppress_layered_prefill_spec_state is False
+
+
+def _fake_npu_current_stream(monkeypatch):
+    monkeypatch.setattr(
+        torch.npu,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: None),
+    )
+
+
+@pytest.mark.parametrize("is_sampling_step", [False, True])
+def test_layered_mtp_async_skips_prefill_propose_and_pending(
+    monkeypatch, is_sampling_step
+):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.use_async_scheduling = True
+    runner._suppress_layered_prefill_spec_state = False
+    events = []
+    d_sub_batch = SimpleNamespace(kind="D")
+    p_output = object()
+    p_sub_batch = SimpleNamespace(
+        kind="P",
+        execute_state=SimpleNamespace(
+            layered_prefill_intermediate=not is_sampling_step
+        ),
+    )
+
+    def sample_sub_batch(sub_batch, _grammar_output):
+        events.append(
+            (
+                "D-sample" if sub_batch.kind == "D" else "P-sample",
+                runner._suppress_layered_prefill_spec_state,
+            )
+        )
+        return p_output if sub_batch.kind == "P" else object()
+
+    def raising_take():
+        raise AssertionError(
+            "take_draft_token_ids must not run under async scheduling"
+        )
+
+    commits = []
+    runner._sample_layered_mtp_subbatch = sample_sub_batch
+    runner.take_draft_token_ids = raising_take
+    runner._execute_pending_layered_prefill = lambda _pending: (
+        events.append("P-forward") or p_sub_batch
+    )
+    runner._commit_layered_sampled_tokens = lambda output: commits.append(output)
+    runner._merge_layered_outputs = lambda _scheduler, _outputs: "merged"
+    runner._restore_layered_sampling_masks = lambda _masks: None
+    runner._pending_layered_draft_token_ids = None
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.input_batch = None
+    _fake_npu_current_stream(monkeypatch)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 1},
+        layered_prefill_plan=SimpleNamespace(
+            prefill_req_ids=("prefill",),
+            is_sampling_step=is_sampling_step,
+        ),
+    )
+    state = SimpleNamespace(
+        scheduler_output=scheduler_output,
+        decode_sub_batch=d_sub_batch,
+        pending_prefill=object(),
+        main_input_batch=object(),
+        main_sampling_masks=(np.empty(0, dtype=np.int64), 0, np.empty(0, dtype=bool)),
+    )
+
+    output = NPUModelRunner._sample_layered_mtp_step(runner, state, None)
+
+    assert output == "merged"
+    assert events == [
+        ("D-sample", False),
+        "P-forward",
+        ("P-sample", True),
+    ]
+    assert commits == ([p_output] if is_sampling_step else [])
+    assert runner._pending_layered_draft_token_ids is None
+    assert runner._suppress_layered_prefill_spec_state is False
+
+
+def _make_sample_tokens_gate_runner():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.ascend_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            profiling_chunk_config=SimpleNamespace(enabled=False)
+        )
+    )
+    runner.kv_connector_output = None
+    runner.speculative_config = SimpleNamespace(
+        method="mtp",
+        use_eagle=lambda: False,
+        uses_draft_model=lambda: True,
+        uses_extract_hidden_states=lambda: False,
+        use_ngram_gpu=lambda: False,
+        disable_padded_drafter_batch=False,
+    )
+    runner.input_batch = SimpleNamespace(req_ids=["prefill"], sampling_metadata=None)
+    runner._draft_token_ids = "d-draft"
+    runner._draft_token_req_ids = None
+    runner.valid_sampled_token_count_gpu = "d-counts"
+    runner._suppress_layered_prefill_spec_state = False
+    runner.need_accepted_tokens = False
+    runner.use_async_scheduling = False
+    runner.routed_experts_initialized = False
+    runner.supports_mm_inputs = False
+    runner.dynamic_eplb = False
+    runner._finalize_dump_data = lambda: None
+    runner.finalize_kv_connector = lambda: None
+    runner._sample = lambda _logits, _spec_meta: SimpleNamespace(
+        sampled_token_ids=object()
+    )
+    runner._bookkeeping_sync = lambda *args: (
+        None,
+        [[5]],
+        {},
+        ["prefill"],
+        {"prefill": 0},
+        None,
+    )
+    calls = []
+
+    def fake_propose(*args, **kwargs):
+        calls.append("propose")
+        runner._draft_token_ids = "p-draft"
+        return "p-draft"
+
+    runner.propose_draft_token_ids = fake_propose
+    runner._copy_draft_token_ids_to_cpu = lambda _scheduler: calls.append("copy")
+    runner.execute_model_state = ExecuteModelState(
+        SimpleNamespace(total_num_scheduled_tokens=1),
+        None,
+        None,
+        "common-attn-metadata",
+        *([None] * 8),
+        False,
+    )
+    return runner, calls
+
+
+@pytest.mark.parametrize("suppress", [True, False])
+def test_layered_mtp_suppress_flag_gates_sample_tokens(monkeypatch, suppress):
+    monkeypatch.setattr(
+        "vllm_ascend.worker.model_runner_v1.get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    runner, calls = _make_sample_tokens_gate_runner()
+    runner._suppress_layered_prefill_spec_state = suppress
+
+    output = runner.sample_tokens(None)
+
+    assert output.req_ids == ["prefill"]
+    assert output.sampled_token_ids == [[5]]
+    if suppress:
+        # The P subbatch's sampling must leave D-side live spec state
+        # untouched: no counts reset, no draft clear, no propose.
+        assert calls == []
+        assert runner.valid_sampled_token_count_gpu == "d-counts"
+        assert runner._draft_token_ids == "d-draft"
+    else:
+        assert calls == ["propose", "copy"]
+        assert runner.valid_sampled_token_count_gpu is None
+
+
+@pytest.mark.parametrize(
+    ("use_async_scheduling", "expected_flag"),
+    [(True, True), (False, False)],
+)
+def test_layered_mtp_empty_decode_old_loop_suppress_flag(
+    monkeypatch, use_async_scheduling, expected_flag
+):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.use_async_scheduling = use_async_scheduling
+    runner._suppress_layered_prefill_spec_state = False
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    main_batch = object()
+    p_batch = SimpleNamespace(req_ids=["prefill"])
+    flags = []
+
+    def fake_sample_tokens(_grammar_output):
+        flags.append(runner._suppress_layered_prefill_spec_state)
+        return EMPTY_MODEL_RUNNER_OUTPUT
+
+    runner.sample_tokens = fake_sample_tokens
+    runner._restore_layered_sampling_masks = lambda _masks: None
+    runner._commit_layered_sampled_tokens = lambda _output: None
+    runner._merge_layered_outputs = lambda _scheduler, _outputs: "merged"
+    runner.kv_connector_output = None
+    runner.execute_model_state = LayeredExecuteModelState(
+        scheduler_output=object(),
+        sub_batches=(
+            SimpleNamespace(
+                input_batch=p_batch,
+                execute_state=ExecuteModelState(*([None] * 12), False),
+                kv_connector_output=None,
+                discard_request_indices=np.empty(0, dtype=np.int64),
+                num_discarded_requests=0,
+                discard_request_mask=np.empty(0, dtype=bool),
+            ),
+        ),
+        main_input_batch=main_batch,
+        main_sampling_masks=(np.empty(0, dtype=np.int64), 0, np.empty(0, dtype=bool)),
+    )
+    runner.input_batch = main_batch
+
+    output = NPUModelRunner._sample_layered_step(runner, None)
+
+    assert output == "merged"
+    assert flags == [expected_flag]
+    assert runner._suppress_layered_prefill_spec_state is False
 
 
 def test_layered_mtp_with_empty_decode_uses_existing_single_prefill_path(

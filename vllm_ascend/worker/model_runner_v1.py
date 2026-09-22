@@ -610,6 +610,11 @@ class NPUModelRunner(GPUModelRunner):
         self._executing_layered_subbatch = False
         self._layered_moe_comm_token_count: int | None = None
         self._pending_layered_draft_token_ids: DraftTokenIds | None = None
+        # Raised while the layered P subbatch samples under async scheduling:
+        # its propose has no consumer there and would clobber D-side live
+        # draft/counts state. Gates the counts reset and the propose block
+        # in sample_tokens().
+        self._suppress_layered_prefill_spec_state = False
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -2659,7 +2664,11 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "Layered MTP P forward returned an unexpected output"
             )
-        torch.npu.synchronize()
+        # P attention writes the prompt KV cache, and internal stream forks
+        # (DSA overlap, graph task updates) rejoin the current stream before
+        # forward returns.  Wait for that stream only, mirroring the layered
+        # loop's sync points.
+        torch.npu.current_stream().synchronize()
         execute_state = self.execute_model_state
         if not isinstance(execute_state, ExecuteModelState):
             raise RuntimeError(
@@ -2685,6 +2694,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output = state.scheduler_output
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
+        async_mode = self.use_async_scheduling
         drafts: list[DraftTokenIds | None] = []
         outputs: list[ModelRunnerOutput] = []
         try:
@@ -2694,33 +2704,51 @@ class NPUModelRunner(GPUModelRunner):
                     grammar_output,
                 )
             )
-            drafts.append(self.take_draft_token_ids())
+            if not async_mode:
+                drafts.append(self.take_draft_token_ids())
 
-            torch.npu.synchronize()
+            # D's sampled/proposed work must land before the P forward
+            # overwrites the shared target-forward workspaces.  Waiting for
+            # the current stream drains everything D enqueued; kernels that
+            # fork internally rejoin before returning.
+            torch.npu.current_stream().synchronize()
             p_sub_batch = self._execute_pending_layered_prefill(
                 state.pending_prefill
             )
-            outputs.append(
-                self._sample_layered_mtp_subbatch(
+            if async_mode:
+                # The P subbatch's propose has no consumer under async
+                # scheduling (its first decode step gets no draft slots)
+                # and would clobber D's live draft/counts state; bypass
+                # runner-level spec state for its sampling.
+                self._suppress_layered_prefill_spec_state = True
+            try:
+                p_output = self._sample_layered_mtp_subbatch(
                     p_sub_batch,
                     grammar_output,
                 )
-            )
-            drafts.append(
-                self.take_draft_token_ids()
-                if plan.is_sampling_step
-                else None
-            )
+            finally:
+                self._suppress_layered_prefill_spec_state = False
+            outputs.append(p_output)
+            if async_mode:
+                if not p_sub_batch.execute_state.layered_prefill_intermediate:
+                    self._commit_layered_sampled_tokens(p_output)
+            else:
+                drafts.append(
+                    self.take_draft_token_ids()
+                    if plan.is_sampling_step
+                    else None
+                )
             merged_output = self._merge_layered_outputs(
                 scheduler_output,
                 outputs,
             )
-            self._pending_layered_draft_token_ids = (
-                self._merge_layered_draft_token_ids(
-                    scheduler_output,
-                    drafts,
+            if not async_mode:
+                self._pending_layered_draft_token_ids = (
+                    self._merge_layered_draft_token_ids(
+                        scheduler_output,
+                        drafts,
+                    )
                 )
-            )
             return merged_output
         except Exception:
             self._pending_layered_draft_token_ids = None
@@ -2761,7 +2789,21 @@ class NPUModelRunner(GPUModelRunner):
                     for req_id in self.input_batch.req_ids
                 ):
                     active_grammar_output = None
-                output = self.sample_tokens(active_grammar_output)
+                suppress_spec_state = (
+                    self.use_async_scheduling
+                    and self.speculative_config is not None
+                    and sub_batch.input_batch is not layered_state.main_input_batch
+                )
+                if suppress_spec_state:
+                    # Same rationale as the MTP interleave path: the P
+                    # subbatch's propose has no consumer under async
+                    # scheduling and would clobber D-side live
+                    # draft/counts state.
+                    self._suppress_layered_prefill_spec_state = True
+                try:
+                    output = self.sample_tokens(active_grammar_output)
+                finally:
+                    self._suppress_layered_prefill_spec_state = False
                 if isinstance(output, AsyncModelRunnerOutput):
                     output = output.get_output()
                 if output is None:
@@ -3470,7 +3512,12 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        self.valid_sampled_token_count_gpu = None
+        # Keep the counts reference D's propose stashed when the layered P
+        # subbatch samples under async scheduling: nulling it here would
+        # silently disable both num_computed_tokens corrections on the next
+        # step.
+        if not self._suppress_layered_prefill_spec_state:
+            self.valid_sampled_token_count_gpu = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -3527,7 +3574,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
+            if (
+                self.speculative_config
+                and not self._suppress_layered_prefill_spec_state
+            ):
+                # The layered P subbatch under async scheduling bypasses
+                # the propose path entirely: its draft has no consumer
+                # there and its propose would clobber D-side live
+                # draft/counts state.
                 if not early_pp_padded_drafter:
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
