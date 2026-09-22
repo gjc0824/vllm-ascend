@@ -3928,6 +3928,36 @@ class NPUModelRunner(GPUModelRunner):
 
         return hidden_states
 
+    @staticmethod
+    def _round_capture_sizes_for_tp_padding(
+        sizes: list[int], max_size: int, query_len: int, tp_size: int
+    ) -> list[int] | None:
+        """Align spec-decode graph sizes to lcm(query_len, tp_size).
+
+        Spec decode rounds capture sizes to ``1 + num_speculative_tokens``,
+        but SP/DSA-CP runtimes round token counts up to ``tensor_parallel_size``
+        before dispatch.  Unless the graph buckets are aligned to the least
+        common multiple, a padded count can fall between buckets and pad up
+        to a descriptor whose ``num_reqs`` no longer matches the batch that
+        was built for the unpadded count (e.g. 372 -> 376 -> bucket 384,
+        62 rows vs 64 slots).
+        """
+        if tp_size <= 1 or query_len <= 1 or not sizes:
+            return None
+        lcm = tp_size * query_len // math.gcd(tp_size, query_len)
+        if lcm <= query_len:
+            return None
+        rounded = sorted(
+            {
+                round_up(size, lcm)
+                for size in sizes
+                if round_up(size, lcm) <= max_size
+            }
+        )
+        if not rounded and lcm <= max_size:
+            rounded = [lcm]
+        return rounded or None
+
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
@@ -6104,6 +6134,18 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config=self.kv_cache_config,
                 max_num_reqs=self.max_num_reqs,
             )
+            if self.speculative_config and self._pad_for_sequence_parallelism(1) != 1:
+                # Graph buckets must survive the runtime TP round-up done by
+                # _pad_for_sequence_parallelism (SP / DSA-CP); see the helper.
+                aligned = self._round_capture_sizes_for_tp_padding(
+                    self.compilation_config.cudagraph_capture_sizes,
+                    self.compilation_config.max_cudagraph_capture_size,
+                    self.uniform_decode_query_len,
+                    self.vllm_config.parallel_config.tensor_parallel_size,
+                )
+                if aligned is not None and aligned != self.compilation_config.cudagraph_capture_sizes:
+                    self.compilation_config.cudagraph_capture_sizes = aligned
+                    self.compilation_config.max_cudagraph_capture_size = aligned[-1]
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )
