@@ -81,7 +81,7 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.use_async_scheduling = False
-    runner._suppress_layered_prefill_spec_state = False
+    runner._layered_prefill_propose_seed_only = False
     events = []
     sample_flags = []
     d_sub_batch = SimpleNamespace(kind="D")
@@ -90,7 +90,7 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
 
     def sample_sub_batch(sub_batch, _grammar_output):
         events.append("D-sample" if sub_batch.kind == "D" else p_sample_event)
-        sample_flags.append(runner._suppress_layered_prefill_spec_state)
+        sample_flags.append(runner._layered_prefill_propose_seed_only)
         return object()
 
     draft_req_ids = iter(("decode", "prefill"))
@@ -150,7 +150,7 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
     assert output is merged_output
     # Sync mode never raises the suppress flag: both subbatches propose.
     assert sample_flags == [False, False]
-    assert runner._suppress_layered_prefill_spec_state is False
+    assert runner._layered_prefill_propose_seed_only is False
 
 
 def _fake_npu_current_stream(monkeypatch):
@@ -167,7 +167,7 @@ def test_layered_mtp_async_skips_prefill_propose_and_pending(
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.use_async_scheduling = True
-    runner._suppress_layered_prefill_spec_state = False
+    runner._layered_prefill_propose_seed_only = False
     events = []
     d_sub_batch = SimpleNamespace(kind="D")
     p_output = object()
@@ -182,7 +182,7 @@ def test_layered_mtp_async_skips_prefill_propose_and_pending(
         events.append(
             (
                 "D-sample" if sub_batch.kind == "D" else "P-sample",
-                runner._suppress_layered_prefill_spec_state,
+                runner._layered_prefill_propose_seed_only,
             )
         )
         return p_output if sub_batch.kind == "P" else object()
@@ -232,7 +232,7 @@ def test_layered_mtp_async_skips_prefill_propose_and_pending(
     ]
     assert commits == ([p_output] if is_sampling_step else [])
     assert runner._pending_layered_draft_token_ids is None
-    assert runner._suppress_layered_prefill_spec_state is False
+    assert runner._layered_prefill_propose_seed_only is False
 
 
 def _make_sample_tokens_gate_runner():
@@ -255,7 +255,8 @@ def _make_sample_tokens_gate_runner():
     runner._draft_token_ids = "d-draft"
     runner._draft_token_req_ids = None
     runner.valid_sampled_token_count_gpu = "d-counts"
-    runner._suppress_layered_prefill_spec_state = False
+    runner.prev_num_spec_tokens = 3
+    runner._layered_prefill_propose_seed_only = False
     runner.need_accepted_tokens = False
     runner.use_async_scheduling = False
     runner.routed_experts_initialized = False
@@ -301,16 +302,17 @@ def test_layered_mtp_suppress_flag_gates_sample_tokens(monkeypatch, suppress):
         lambda: SimpleNamespace(world_size=1),
     )
     runner, calls = _make_sample_tokens_gate_runner()
-    runner._suppress_layered_prefill_spec_state = suppress
+    runner._layered_prefill_propose_seed_only = suppress
 
     output = runner.sample_tokens(None)
 
     assert output.req_ids == ["prefill"]
     assert output.sampled_token_ids == [[5]]
     if suppress:
-        # The P subbatch's sampling must leave D-side live spec state
-        # untouched: no counts reset, no draft clear, no propose.
-        assert calls == []
+        # Seed-only: the drafter forward runs (seeding the MTP draft-layer
+        # KV) but its outputs are dropped, no CPU copy happens, and D-side
+        # live spec state survives.
+        assert calls == ["propose"]
         assert runner.valid_sampled_token_count_gpu == "d-counts"
         assert runner._draft_token_ids == "d-draft"
     else:
@@ -327,14 +329,14 @@ def test_layered_mtp_empty_decode_old_loop_suppress_flag(
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.use_async_scheduling = use_async_scheduling
-    runner._suppress_layered_prefill_spec_state = False
+    runner._layered_prefill_propose_seed_only = False
     runner.speculative_config = SimpleNamespace(method="mtp")
     main_batch = object()
     p_batch = SimpleNamespace(req_ids=["prefill"])
     flags = []
 
     def fake_sample_tokens(_grammar_output):
-        flags.append(runner._suppress_layered_prefill_spec_state)
+        flags.append(runner._layered_prefill_propose_seed_only)
         return EMPTY_MODEL_RUNNER_OUTPUT
 
     runner.sample_tokens = fake_sample_tokens
@@ -363,7 +365,7 @@ def test_layered_mtp_empty_decode_old_loop_suppress_flag(
 
     assert output == "merged"
     assert flags == [expected_flag]
-    assert runner._suppress_layered_prefill_spec_state is False
+    assert runner._layered_prefill_propose_seed_only is False
 
 
 def test_layered_mtp_with_empty_decode_uses_existing_single_prefill_path(

@@ -614,7 +614,7 @@ class NPUModelRunner(GPUModelRunner):
         # its propose has no consumer there and would clobber D-side live
         # draft/counts state. Gates the counts reset and the propose block
         # in sample_tokens().
-        self._suppress_layered_prefill_spec_state = False
+        self._layered_prefill_propose_seed_only = False
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -1495,6 +1495,12 @@ class NPUModelRunner(GPUModelRunner):
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        if self._layered_prefill_propose_seed_only:
+            # Seed-only propose (layered P subbatch under async scheduling):
+            # the shared CPU buffer and the GPU counts reference carry the D
+            # subbatch's live state, and the async D2H below cannot be undone
+            # once issued.  The P subbatch's counts have no consumer.
+            return
         if self.valid_sampled_token_count_event is None:
             return
 
@@ -2224,7 +2230,20 @@ class NPUModelRunner(GPUModelRunner):
                     include_one_time_updates=one_time_updates_pending,
                 )
                 one_time_updates_pending = False
+                # Same num_computed_tokens snapshot rationale as
+                # _execute_pending_layered_prefill: the P execute must not
+                # leave its prefill-start values in the shared GPU buffer
+                # that the next async spec step's correction kernel reads
+                # as the per-row base.
+                _saved_num_computed = (
+                    self.num_computed_tokens.clone()
+                    if active_batch is p_input_batch
+                    and getattr(self, "use_async_spec_decode", False)
+                    else None
+                )
                 result = self.execute_model(sub_output, active_intermediate)
+                if _saved_num_computed is not None:
+                    self.num_computed_tokens.copy_(_saved_num_computed)
                 if active_batch is p_input_batch:
                     # P attention writes the prompt KV cache, and internal
                     # stream forks (DSA overlap, graph task updates) rejoin
@@ -2652,6 +2671,18 @@ class NPUModelRunner(GPUModelRunner):
         self.kv_connector_output = None
         self._executing_layered_subbatch = True
         self._layered_moe_comm_token_count = pending.moe_comm_token_count
+        # The P subbatch's execute rewrites the shared per-request GPU
+        # num_computed_tokens buffer with the P batch's own (prefill-start)
+        # values.  Under async spec decode the next D step's
+        # update_num_computed_tokens_for_batch_change uses that buffer as the
+        # self-feeding correction base for the main batch's rows, so a P
+        # overwrite at row 0 would collapse the row-0 request's positions and
+        # permanently corrupt its KV frontier.  Snapshot and restore.
+        saved_num_computed = (
+            self.num_computed_tokens.clone()
+            if getattr(self, "use_async_spec_decode", False)
+            else None
+        )
         try:
             result = self.execute_model(
                 pending.scheduler_output,
@@ -2660,6 +2691,8 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             self._executing_layered_subbatch = False
             self._layered_moe_comm_token_count = None
+            if saved_num_computed is not None:
+                self.num_computed_tokens.copy_(saved_num_computed)
         if result is not None:
             raise RuntimeError(
                 "Layered MTP P forward returned an unexpected output"
@@ -2716,18 +2749,22 @@ class NPUModelRunner(GPUModelRunner):
                 state.pending_prefill
             )
             if async_mode:
-                # The P subbatch's propose has no consumer under async
-                # scheduling (its first decode step gets no draft slots)
-                # and would clobber D's live draft/counts state; bypass
-                # runner-level spec state for its sampling.
-                self._suppress_layered_prefill_spec_state = True
+                # The P subbatch's propose output has no consumer under async
+                # scheduling (its first decode step gets no draft slots) and
+                # would clobber D's live draft/counts state -- but the
+                # drafter forward itself must still run to seed the MTP
+                # draft-layer KV for the prompt positions.  Propose in
+                # seed-only mode: forward runs, outputs and state writes are
+                # dropped.  VLLM_DISABLE_P_SEED=1 reverts to full suppress
+                # for A/B debugging.
+                self._layered_prefill_propose_seed_only = True
             try:
                 p_output = self._sample_layered_mtp_subbatch(
                     p_sub_batch,
                     grammar_output,
                 )
             finally:
-                self._suppress_layered_prefill_spec_state = False
+                self._layered_prefill_propose_seed_only = False
             outputs.append(p_output)
             if async_mode:
                 if not p_sub_batch.execute_state.layered_prefill_intermediate:
@@ -2795,15 +2832,15 @@ class NPUModelRunner(GPUModelRunner):
                     and sub_batch.input_batch is not layered_state.main_input_batch
                 )
                 if suppress_spec_state:
-                    # Same rationale as the MTP interleave path: the P
-                    # subbatch's propose has no consumer under async
-                    # scheduling and would clobber D-side live
-                    # draft/counts state.
-                    self._suppress_layered_prefill_spec_state = True
+                    # Same rationale as the MTP interleave path: seed-only
+                    # propose -- the drafter forward seeds the MTP draft-layer
+                    # KV while D-side live draft/counts state survives.
+                    # VLLM_DISABLE_P_SEED=1 reverts to full suppress.
+                    self._layered_prefill_propose_seed_only = True
                 try:
                     output = self.sample_tokens(active_grammar_output)
                 finally:
-                    self._suppress_layered_prefill_spec_state = False
+                    self._layered_prefill_propose_seed_only = False
                 if isinstance(output, AsyncModelRunnerOutput):
                     output = output.get_output()
                 if output is None:
@@ -3504,7 +3541,6 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -3515,12 +3551,43 @@ class NPUModelRunner(GPUModelRunner):
         # Keep the counts reference D's propose stashed when the layered P
         # subbatch samples under async scheduling: nulling it here would
         # silently disable both num_computed_tokens corrections on the next
-        # step.
-        if not self._suppress_layered_prefill_spec_state:
+        # step.  (The P subbatch restores the reference after its seed-only
+        # propose as well.)
+        if not self._layered_prefill_propose_seed_only:
             self.valid_sampled_token_count_gpu = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            if self._layered_prefill_propose_seed_only:
+                # Seed-only: run the drafter forward so the MTP draft layer
+                # writes its KV for the prompt positions (skipping it leaves
+                # every later decode draft conditioned on missing context and
+                # permanently lowers the acceptance rate), but drop the
+                # returned drafts and keep D-side live state untouched.
+                saved_draft = self._draft_token_ids
+                saved_draft_reqs = self._draft_token_req_ids
+                saved_counts_gpu = self.valid_sampled_token_count_gpu
+                saved_prev_num_spec = self.prev_num_spec_tokens
+                try:
+                    self.propose_draft_token_ids(
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        scheduler_output,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        positions,
+                        scheduler_output.total_num_scheduled_tokens,
+                        hidden_states,
+                        aux_hidden_states,
+                        sample_hidden_states,
+                        batch_desc,
+                    )
+                finally:
+                    self._draft_token_ids = saved_draft
+                    self._draft_token_req_ids = saved_draft_reqs
+                    self.valid_sampled_token_count_gpu = saved_counts_gpu
+                    self.prev_num_spec_tokens = saved_prev_num_spec
+                return
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -3535,7 +3602,6 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
-
         output_spec_token_ids = None
         use_padded_batch = False
         early_pp_padded_drafter = False
@@ -3574,15 +3640,19 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with record_function_or_nullcontext("draft_token"):
-            if (
-                self.speculative_config
-                and not self._suppress_layered_prefill_spec_state
-            ):
-                # The layered P subbatch under async scheduling bypasses
-                # the propose path entirely: its draft has no consumer
-                # there and its propose would clobber D-side live
-                # draft/counts state.
-                if not early_pp_padded_drafter:
+            _p_full_suppress = (
+                self._layered_prefill_propose_seed_only
+                and os.getenv("VLLM_DISABLE_P_SEED") == "1"
+            )
+            if self.speculative_config and not _p_full_suppress:
+                # The layered P subbatch under async scheduling proposes in
+                # seed-only mode (see the closure): the drafter forward must
+                # seed the MTP draft-layer KV, while D-side live draft/counts
+                # state survives untouched.
+                if (
+                    not early_pp_padded_drafter
+                    and not self._layered_prefill_propose_seed_only
+                ):
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
                 if use_padded_batch and not early_pp_padded_drafter:
