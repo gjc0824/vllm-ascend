@@ -866,12 +866,12 @@ class NPUModelRunner(GPUModelRunner):
         # Async race: a request can be finished by an in-flight output (e.g.
         # reaching max tokens) while steps scheduled before the finish was
         # processed still carry its cached row.  The finished-pop removes it
-        # from self.requests, so super()._update_states would raise KeyError
-        # on self.requests[req_id].  Filter only the cached-row data here:
-        # the engine owns the other scheduler-output views (its copy is not
-        # shared across processes), and executing the request's already
-        # scheduled tokens one last time is safe -- its KV blocks are freed
-        # only after update_from_output processes the finish.
+        # from self.requests (and its batch row), so super()._update_states
+        # would raise KeyError on self.requests[req_id] and _prepare_inputs
+        # would see more scheduled tokens than batch rows.  Strip the dead
+        # request from this view's cached rows and token counts: the engine's
+        # own copy is a separate object, and its update loop skips requests
+        # it has already freed.
         if self.use_async_scheduling:
             new_req_ids = {
                 data.req_id
@@ -885,21 +885,44 @@ class NPUModelRunner(GPUModelRunner):
                 for req_id in req_data.req_ids
                 if req_id not in self.requests and req_id not in new_req_ids
             ]
+            dropped += [
+                req_id
+                for req_id, _ in scheduler_output.num_scheduled_tokens.items()
+                if req_id not in self.requests
+                and req_id not in new_req_ids
+                and req_id
+                not in self.input_batch.req_id_to_index
+            ]
             if dropped:
+                dropped = list(dict.fromkeys(dropped))
                 logger.warning(
-                    "Layered subbatch drops %d cached row(s) of request(s) "
-                    "finished by an in-flight output: %s",
+                    "Layered subbatch drops %d request(s) finished by an "
+                    "in-flight output: %s",
                     len(dropped),
                     dropped,
                 )
+                dropped_set = set(dropped)
                 keep = [
                     req_id
                     for req_id in req_data.req_ids
-                    if req_id not in dropped
+                    if req_id not in dropped_set
                 ]
                 scheduler_output.scheduled_cached_reqs = (
                     self._subset_cached_request_data(req_data, keep)
                 )
+                scheduler_output.num_scheduled_tokens = {
+                    req_id: tokens
+                    for req_id, tokens in scheduler_output.num_scheduled_tokens.items()
+                    if req_id not in dropped_set
+                }
+                scheduler_output.total_num_scheduled_tokens = sum(
+                    scheduler_output.num_scheduled_tokens.values()
+                )
+                scheduler_output.scheduled_spec_decode_tokens = {
+                    req_id: tokens
+                    for req_id, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+                    if req_id not in dropped_set
+                }
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)

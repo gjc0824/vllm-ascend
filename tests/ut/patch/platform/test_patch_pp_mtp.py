@@ -336,6 +336,9 @@ def test_update_states_drops_cached_rows_of_finished_inflight_requests():
     runner.requests = {
         "alive": SimpleNamespace(num_computed_tokens=10, prev_num_draft_len=0)
     }
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"alive": 0}, req_ids=["alive"]
+    )
     super_calls = []
 
     # Patch super() via the class: call the bound method through a stub.
@@ -366,8 +369,10 @@ def test_update_states_drops_cached_rows_of_finished_inflight_requests():
 
         filtered = super_calls[0].scheduled_cached_reqs
         assert filtered.req_ids == ["alive"]
-        # Token views must be untouched: the engine iterates its own copy.
-        assert scheduler_output.num_scheduled_tokens == {"alive": 4, "dead": 4}
+        # The dead request's stale token entry (its batch row was removed by
+        # the finished handling) must be stripped so _prepare_inputs sees as
+        # many tokens as batch rows.
+        assert scheduler_output.num_scheduled_tokens == {"alive": 4}
     finally:
         NPUModelRunner.__bases__[0]._update_states = original
         NPUModelRunner._apply_pp_sampled_tokens_from_scheduler_output = (

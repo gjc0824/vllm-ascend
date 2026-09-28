@@ -29,6 +29,7 @@ from functools import wraps
 from itertools import chain
 
 from vllm.logger import logger
+from vllm.v1.request import RequestStatus
 
 _PATCHED = False
 _PP_IN_FLIGHT_STEP = 1 << 60
@@ -244,6 +245,80 @@ def _patch_scheduler_update_from_output() -> None:
 
     @wraps(original_update_from_output)
     def _patched_update_from_output(self, scheduler_output, model_runner_output):
+        use_async = getattr(
+            getattr(self, "scheduler_config", None), "async_scheduling", False
+        )
+        if use_async:
+            # Heal the stale/in-flight accounting for requests whose share
+            # was reset by a preemption while later pipeline steps still
+            # carry scheduled tokens: raise the counters to this step's
+            # scheduled amount so the drain below lands exactly at zero
+            # instead of tripping the non-negative assertions.
+            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                request = self.requests.get(req_id)
+                if request is None:
+                    continue
+                stale = request.num_stale_output_tokens
+                if 0 < stale < num_tokens:
+                    request.num_in_flight_tokens += num_tokens - stale
+                    request.num_stale_output_tokens = num_tokens
+                if request.num_in_flight_tokens < num_tokens:
+                    request.num_in_flight_tokens = num_tokens
+        if use_async and model_runner_output.req_id_to_index:
+            # Async finish-vs-schedule race tolerance: a request finished by
+            # an in-flight output (or whose worker row was dropped after the
+            # finished-pop) may still be listed in this already-scheduled
+            # step while the worker output carries no row for it.  Skip such
+            # rows here instead of crashing on req_id_to_index[req_id]; the
+            # request (if still alive) is simply rescheduled next step.
+            missing = [
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if req_id not in model_runner_output.req_id_to_index
+            ]
+            if missing:
+                logger.warning(
+                    "update_from_output skips %d scheduled row(s) missing "
+                    "from the worker output: %s",
+                    len(missing),
+                    [req_id[-6:] for req_id in missing],
+                )
+                import time as _time
+
+                for req_id in missing:
+                    request = self.requests.get(req_id)
+                    if request is None or request.is_finished():
+                        continue
+                    if request.status != RequestStatus.RUNNING:
+                        # Already preempted by an earlier skipped step; its
+                        # requeued admission will reschedule it.
+                        continue
+                    # The worker produced no row for a live request: either
+                    # its finished-pop raced this step (the finish lands in a
+                    # later update) or its admission never reached the
+                    # worker.  Rescheduling in place would livelock the
+                    # second case, so preempt instead -- the request is
+                    # requeued for a full recompute, which is correct in
+                    # both cases.
+                    try:
+                        self.running.remove(request)
+                    except ValueError:
+                        continue
+                    self._preempt_request(request, _time.monotonic())
+                scheduler_output = copy.copy(scheduler_output)
+                scheduler_output.num_scheduled_tokens = {
+                    req_id: num_tokens
+                    for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
+                    if req_id not in missing
+                }
+                scheduler_output.total_num_scheduled_tokens = sum(
+                    scheduler_output.num_scheduled_tokens.values()
+                )
+                scheduler_output.scheduled_spec_decode_tokens = {
+                    req_id: token_ids
+                    for req_id, token_ids in scheduler_output.scheduled_spec_decode_tokens.items()
+                    if req_id not in missing
+                }
         use_pp_ipc_runtime_patch = _use_pp_ipc_runtime_patch(
             getattr(self, "vllm_config", None),
             getattr(self, "use_pp", False),
