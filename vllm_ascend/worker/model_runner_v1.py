@@ -615,6 +615,10 @@ class NPUModelRunner(GPUModelRunner):
         # draft/counts state. Gates the counts reset and the propose block
         # in sample_tokens().
         self._layered_prefill_propose_seed_only = False
+        # Backstop for the async finish race: the scheduler output of the
+        # layered step whose sample phase has not run yet.  Consumed by
+        # sample_tokens() when the layered execute state went missing.
+        self._pending_layered_sample_output = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -2144,6 +2148,7 @@ class NPUModelRunner(GPUModelRunner):
         """Execute D and P subbatches, carrying both through the PP chain."""
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
+        self._pending_layered_sample_output = scheduler_output
         layered_adapter = self.layered_prefill_model_adapter
         if layered_adapter is None:
             raise RuntimeError(
@@ -2839,6 +2844,7 @@ class NPUModelRunner(GPUModelRunner):
         state: LayeredMTPExecuteModelState,
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput:
+        self._pending_layered_sample_output = None
         scheduler_output = state.scheduler_output
         plan = scheduler_output.layered_prefill_plan
         assert plan is not None
@@ -2922,6 +2928,7 @@ class NPUModelRunner(GPUModelRunner):
     def _sample_layered_step(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput:
+        self._pending_layered_sample_output = None
         layered_state = self.execute_model_state
         assert isinstance(layered_state, LayeredExecuteModelState)
         self.execute_model_state = None
@@ -3621,6 +3628,31 @@ class NPUModelRunner(GPUModelRunner):
         use_pp_spec_decode = self.speculative_config is not None and pp.world_size > 1
 
         if self.execute_model_state is None:
+            if self._pending_layered_sample_output is not None:
+                # Async finish-race backstop: the layered step's execute
+                # state was lost (e.g. every subbatch was dropped as dead),
+                # but the engine still awaits a sample output for this
+                # step.  Synthesize an empty output covering the scheduled
+                # rows instead of returning None, which the engine treats
+                # as an execute failure and kills itself with.
+                pending = self._pending_layered_sample_output
+                self._pending_layered_sample_output = None
+                logger.warning(
+                    "sample_tokens: layered execute state missing (async "
+                    "finish race); synthesizing empty output"
+                )
+                return self._merge_layered_outputs(pending, [])
+            if pp.world_size == 1:
+                # PP=1 never legitimately reaches here: the empty-batch path
+                # of an all-dead scheduled step bypasses the execute-state
+                # stash, and returning None would make the engine kill itself
+                # ("unexpected error").  Return an empty output instead; the
+                # engine-side guard skips or preempts the dead rows.
+                logger.warning(
+                    "sample_tokens: no execute state at PP=1 (async finish "
+                    "race on an all-dead step); returning empty output"
+                )
+                return EMPTY_MODEL_RUNNER_OUTPUT
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
                 return None  # noqa

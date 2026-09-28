@@ -264,7 +264,7 @@ def _patch_scheduler_update_from_output() -> None:
                     request.num_stale_output_tokens = num_tokens
                 if request.num_in_flight_tokens < num_tokens:
                     request.num_in_flight_tokens = num_tokens
-        if use_async and model_runner_output.req_id_to_index:
+        if use_async and model_runner_output.req_id_to_index is not None:
             # Async finish-vs-schedule race tolerance: a request finished by
             # an in-flight output (or whose worker row was dropped after the
             # finished-pop) may still be listed in this already-scheduled
@@ -305,6 +305,13 @@ def _patch_scheduler_update_from_output() -> None:
                     except ValueError:
                         continue
                     self._preempt_request(request, _time.monotonic())
+                    # Requeue as WAITING (not PREEMPTED): a preempted
+                    # request re-enters via the resumed path without
+                    # scheduled_new_reqs, which the worker can never insert
+                    # (its cached state is gone), re-creating this exact
+                    # miss loop.  As WAITING the next admission carries it
+                    # in scheduled_new_reqs and the worker inserts it.
+                    request.status = RequestStatus.WAITING
                 scheduler_output = copy.copy(scheduler_output)
                 scheduler_output.num_scheduled_tokens = {
                     req_id: num_tokens
