@@ -101,6 +101,17 @@ class DeepseekV4LayeredPrefillAdapter(LayeredPrefillModelAdapter):
         # it is not part of the cross-group frontier.
         return output[0], None
 
+    def _capture_aux_hidden_state(
+        self,
+        global_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        # Mirrors the backbone forward's aux capture for DSpark / EAGLE3:
+        # the hc-branch mean of the layer output.  The base adapter only
+        # calls this when ``global_idx + 1`` is a configured aux layer.
+        return hidden_states.mean(dim=1)
+
     def _finalize(
         self,
         hidden_states: torch.Tensor,

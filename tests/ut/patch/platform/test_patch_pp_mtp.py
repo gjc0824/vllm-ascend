@@ -85,7 +85,10 @@ def test_layered_mtp_sampling_interleaves_forward_sample_and_draft(
     events = []
     sample_flags = []
     d_sub_batch = SimpleNamespace(kind="D")
-    p_sub_batch = SimpleNamespace(kind="P")
+    p_sub_batch = SimpleNamespace(
+        kind="P",
+        execute_state=SimpleNamespace(layered_prefill_intermediate=False),
+    )
     merged_output = object()
 
     def sample_sub_batch(sub_batch, _grammar_output):
@@ -233,6 +236,143 @@ def test_layered_mtp_async_skips_prefill_propose_and_pending(
     assert commits == ([p_output] if is_sampling_step else [])
     assert runner._pending_layered_draft_token_ids is None
     assert runner._layered_prefill_propose_seed_only is False
+
+
+def test_layered_mtp_dead_p_cohort_skips_prefill_forward(monkeypatch):
+    """A P request finished by an in-flight output must not crash sampling.
+
+    The deferred P forward is skipped end-to-end (execute_state=None stub),
+    its sample and commit are skipped, and the merged output still covers
+    the dead request id (empty tokens) so the engine-side update stays
+    consistent.
+    """
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.use_async_scheduling = True
+    runner._layered_prefill_propose_seed_only = False
+    runner.requests = {}
+    events = []
+    d_sub_batch = SimpleNamespace(kind="D")
+
+    def sample_sub_batch(sub_batch, _grammar_output):
+        events.append("D-sample" if sub_batch.kind == "D" else "P-sample")
+        return object()
+
+    runner._sample_layered_mtp_subbatch = sample_sub_batch
+    runner.take_draft_token_ids = lambda: (_ for _ in ()).throw(
+        AssertionError("take_draft_token_ids must not run under async")
+    )
+    runner._commit_layered_sampled_tokens = lambda _output: events.append(
+        "commit"
+    )
+    merged_req_ids = []
+
+    def fake_merge(scheduler_output, outputs):
+        merged_req_ids.extend(scheduler_output.num_scheduled_tokens)
+        return "merged"
+
+    runner._merge_layered_outputs = fake_merge
+    runner._restore_layered_sampling_masks = lambda _masks: None
+    runner._pending_layered_draft_token_ids = None
+    runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.input_batch = None
+    _fake_npu_current_stream(monkeypatch)
+
+    pending = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["prefill"]),
+        scheduler_output=SimpleNamespace(
+            num_scheduled_tokens={"prefill": 12418},
+            scheduled_new_reqs=[],
+        ),
+        intermediate_tensors=None,
+        moe_comm_token_count=12418,
+    )
+    stub = NPUModelRunner._execute_pending_layered_prefill(runner, pending)
+    assert stub.execute_state is None
+
+    def dead_forward(_pending):
+        events.append("P-forward")
+        return stub
+
+    runner._execute_pending_layered_prefill = dead_forward
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 1, "prefill": 12418},
+        layered_prefill_plan=SimpleNamespace(
+            prefill_req_ids=("prefill",),
+            is_sampling_step=True,
+        ),
+    )
+    state = SimpleNamespace(
+        scheduler_output=scheduler_output,
+        decode_sub_batch=d_sub_batch,
+        pending_prefill=pending,
+        main_input_batch=object(),
+        main_sampling_masks=(np.empty(0, dtype=np.int64), 0, np.empty(0, dtype=bool)),
+    )
+
+    output = NPUModelRunner._sample_layered_mtp_step(runner, state, None)
+
+    assert output == "merged"
+    assert events == ["D-sample", "P-forward"]
+    # The merged output must still enumerate the dead P request so the
+    # engine-side req_id_to_index covers every scheduled id.
+    assert merged_req_ids == ["decode", "prefill"]
+    assert runner._layered_prefill_propose_seed_only is False
+
+
+def test_update_states_drops_cached_rows_of_finished_inflight_requests():
+    """A request finished by an in-flight output must not crash the worker.
+
+    Under async scheduling a request can reach max tokens while steps
+    scheduled before the finish was processed still carry its cached row:
+    the finished-pop removes it from self.requests, so the cached-row update
+    in super()._update_states would raise KeyError.  The runner must filter
+    exactly those rows (and nothing else -- token views and batch rows stay
+    untouched so the engine-side copy of the scheduler output remains
+    consistent with the worker's merged output).
+    """
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.use_async_scheduling = True
+    runner.requests = {
+        "alive": SimpleNamespace(num_computed_tokens=10, prev_num_draft_len=0)
+    }
+    super_calls = []
+
+    # Patch super() via the class: call the bound method through a stub.
+    original_apply = NPUModelRunner._apply_pp_sampled_tokens_from_scheduler_output
+    NPUModelRunner._apply_pp_sampled_tokens_from_scheduler_output = (
+        lambda self, scheduler_output: None
+    )
+    original = NPUModelRunner.__bases__[0]._update_states
+    NPUModelRunner.__bases__[0]._update_states = (
+        lambda self, scheduler_output: super_calls.append(scheduler_output)
+    )
+    try:
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["alive", "dead"],
+                resumed_req_ids=set(),
+                new_token_ids=[[], []],
+                all_token_ids={},
+                new_block_ids=[[], []],
+                num_computed_tokens=[10, 20],
+                num_output_tokens=[1, 2],
+            ),
+            scheduled_new_reqs=[],
+            num_scheduled_tokens={"alive": 4, "dead": 4},
+            scheduled_spec_decode_tokens={},
+        )
+        NPUModelRunner._update_states(runner, scheduler_output)
+
+        filtered = super_calls[0].scheduled_cached_reqs
+        assert filtered.req_ids == ["alive"]
+        # Token views must be untouched: the engine iterates its own copy.
+        assert scheduler_output.num_scheduled_tokens == {"alive": 4, "dead": 4}
+    finally:
+        NPUModelRunner.__bases__[0]._update_states = original
+        NPUModelRunner._apply_pp_sampled_tokens_from_scheduler_output = (
+            original_apply
+        )
 
 
 def _make_sample_tokens_gate_runner():

@@ -27,6 +27,7 @@ import torch
 import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
+from vllm.v1.core.layered_prefill import make_layer_group_ranges
 
 # todo: please remove it when solve cuda hard code in vllm
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
@@ -988,13 +989,58 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None and not (
             is_deepseek_v4
-            and getattr(speculative_config, "method", None) == "mtp"
+            and getattr(speculative_config, "method", None) in ("mtp", "dspark")
             and parallel_config.pipeline_parallel_size == 1
         ):
             raise ValueError(
                 "layered_prefill_config currently only supports "
-                "DeepSeek-V4 MTP with PP=1"
+                "DeepSeek-V4 MTP or DSpark with PP=1"
             )
+        if (
+            speculative_config is not None
+            and getattr(speculative_config, "method", None) == "dspark"
+        ):
+            # DSpark seeds its draft context K/V from the target model's aux
+            # hidden states (captured after the dspark target layers).  The
+            # layered forward can only emit that list from the single group
+            # whose range owns every target layer, so every selectable group
+            # layout must keep them inside its final group.
+            draft_hf_config = getattr(
+                getattr(speculative_config, "draft_model_config", None),
+                "hf_config",
+                None,
+            )
+            target_layer_ids = getattr(
+                draft_hf_config, "dspark_target_layer_ids", None
+            ) or getattr(draft_hf_config, "target_layer_ids", None)
+            if not target_layer_ids:
+                raise ValueError(
+                    "layered_prefill_config with DSpark requires the draft "
+                    "config to declare dspark_target_layer_ids"
+                )
+            num_hidden_layers = getattr(
+                getattr(vllm_config.model_config, "hf_text_config", None)
+                or vllm_config.model_config,
+                "num_hidden_layers",
+                0,
+            )
+            for num_groups in layered_prefill_config.allowed_num_groups:
+                num_groups = max(1, min(int(num_groups), num_hidden_layers))
+                ranges = make_layer_group_ranges(num_hidden_layers, num_groups)
+                last_group = ranges[-1]
+                outside = [
+                    layer_id
+                    for layer_id in target_layer_ids
+                    if not last_group.start <= layer_id < last_group.end
+                ]
+                if outside:
+                    raise ValueError(
+                        f"layered_prefill_config with DSpark requires every "
+                        f"allowed group layout to keep the draft target "
+                        f"layers {list(target_layer_ids)} inside its final "
+                        f"group; num_groups={num_groups} splits {outside}. "
+                        "Reduce allowed_num_groups."
+                    )
         if getattr(vllm_config, "lora_config", None) is not None:
             raise ValueError(
                 "layered_prefill_config Phase 1 does not support LoRA"

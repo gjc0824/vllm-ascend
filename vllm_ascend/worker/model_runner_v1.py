@@ -863,6 +863,44 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
+        # Async race: a request can be finished by an in-flight output (e.g.
+        # reaching max tokens) while steps scheduled before the finish was
+        # processed still carry its cached row.  The finished-pop removes it
+        # from self.requests, so super()._update_states would raise KeyError
+        # on self.requests[req_id].  Filter only the cached-row data here:
+        # the engine owns the other scheduler-output views (its copy is not
+        # shared across processes), and executing the request's already
+        # scheduled tokens one last time is safe -- its KV blocks are freed
+        # only after update_from_output processes the finish.
+        if self.use_async_scheduling:
+            new_req_ids = {
+                data.req_id
+                for data in getattr(
+                    scheduler_output, "scheduled_new_reqs", ()
+                )
+                or ()
+            }
+            dropped = [
+                req_id
+                for req_id in req_data.req_ids
+                if req_id not in self.requests and req_id not in new_req_ids
+            ]
+            if dropped:
+                logger.warning(
+                    "Layered subbatch drops %d cached row(s) of request(s) "
+                    "finished by an in-flight output: %s",
+                    len(dropped),
+                    dropped,
+                )
+                keep = [
+                    req_id
+                    for req_id in req_data.req_ids
+                    if req_id not in dropped
+                ]
+                scheduler_output.scheduled_cached_reqs = (
+                    self._subset_cached_request_data(req_data, keep)
+                )
+
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)
 
@@ -2114,7 +2152,7 @@ class NPUModelRunner(GPUModelRunner):
 
         use_layered_mtp_interleave = (
             self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
+            and self.speculative_config.method in ("mtp", "dspark")
             and get_pp_group().world_size == 1
         )
         if use_layered_mtp_interleave and d_req_ids:
@@ -2230,6 +2268,28 @@ class NPUModelRunner(GPUModelRunner):
                     include_one_time_updates=one_time_updates_pending,
                 )
                 one_time_updates_pending = False
+                if active_batch is p_input_batch and not any(
+                    req_id in self.requests
+                    or req_id
+                    in {
+                        data.req_id
+                        for data in getattr(
+                            sub_output, "scheduled_new_reqs", ()
+                        )
+                        or ()
+                    }
+                    for req_id in sub_output.num_scheduled_tokens
+                ):
+                    # Same async finish-vs-schedule race as the deferred
+                    # interleave forward: skip the dead P subbatch entirely;
+                    # the merged output covers its request ids with empty
+                    # token lists.
+                    logger.warning(
+                        "Layered P subbatch skipped: all requests finished "
+                        "by in-flight outputs: %s",
+                        req_ids,
+                    )
+                    continue
                 # Same num_computed_tokens snapshot rationale as
                 # _execute_pending_layered_prefill: the P execute must not
                 # leave its prefill-start values in the shared GPU buffer
@@ -2669,6 +2729,38 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch = pending.input_batch
         self.execute_model_state = None
         self.kv_connector_output = None
+        # Async race: the P request can be finished by an in-flight output
+        # (e.g. it reached max tokens before being preempted and resumed)
+        # after this layered cohort step was already scheduled.  Its cached
+        # state is gone, and its row may already have been dropped from the
+        # pending batch, so executing the subbatch would fail.  Skip the
+        # forward entirely: the merged step output still covers the request
+        # with an empty token list, and the scheduler-side update ignores
+        # freed requests.
+        new_req_ids = {
+            data.req_id
+            for data in getattr(
+                pending.scheduler_output, "scheduled_new_reqs", ()
+            )
+            or ()
+        }
+        if not any(
+            req_id in self.requests or req_id in new_req_ids
+            for req_id in pending.scheduler_output.num_scheduled_tokens
+        ):
+            logger.warning(
+                "Layered P subbatch skipped: all requests finished by "
+                "in-flight outputs: %s",
+                list(pending.scheduler_output.num_scheduled_tokens),
+            )
+            return LayeredSubBatchState(
+                input_batch=pending.input_batch,
+                execute_state=None,
+                kv_connector_output=None,
+                discard_request_indices=np.empty(0, dtype=np.int64),
+                num_discarded_requests=0,
+                discard_request_mask=np.empty(0, dtype=bool),
+            )
         self._executing_layered_subbatch = True
         self._layered_moe_comm_token_count = pending.moe_comm_token_count
         # The P subbatch's execute rewrites the shared per-request GPU
@@ -2748,6 +2840,12 @@ class NPUModelRunner(GPUModelRunner):
             p_sub_batch = self._execute_pending_layered_prefill(
                 state.pending_prefill
             )
+            if p_sub_batch.execute_state is None:
+                # Dead P cohort (all requests finished by in-flight outputs):
+                # no forward ran, so there is nothing to sample or commit for
+                # its rows.  The merge below still covers the request ids
+                # with empty token lists for the engine-side update.
+                return self._merge_layered_outputs(scheduler_output, outputs)
             if async_mode:
                 # The P subbatch's propose output has no consumer under async
                 # scheduling (its first decode step gets no draft slots) and
@@ -3370,6 +3468,28 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and layered_plan is None:
                 hidden_states, aux_hidden_states = hidden_states
+            if layered_plan is not None and self.use_aux_hidden_state_outputs:
+                # DSpark-style drafters consume target aux hidden states of
+                # the P rows at their first sampling step.  The layered
+                # adapter captures them inside the executing group (the base
+                # adapter fails closed if the group layout splits the aux
+                # layers), so the list is complete exactly when the group
+                # that owns the aux layers ran.  Intermediate groups never
+                # touch aux layers and their sampling is skipped anyway.
+                aux_hidden_states = layered_output.aux_hidden_states
+                if layered_plan.is_sampling_step:
+                    aux_layers = getattr(
+                        layered_adapter.backbone, "aux_hidden_state_layers", ()
+                    )
+                    if not aux_hidden_states or len(aux_hidden_states) != len(
+                        tuple(aux_layers)
+                    ):
+                        raise RuntimeError(
+                            "Layered final group did not capture the "
+                            "complete aux hidden states required by the "
+                            f"drafter (got {len(aux_hidden_states or [])}, "
+                            f"expected {len(tuple(aux_layers))})"
+                        )
             if layered_plan is not None and not get_pp_group().is_last_rank:
                 # Let the outer worker perform the single PP send for the
                 # packed D/P payload.  This also avoids the broadcast-output
