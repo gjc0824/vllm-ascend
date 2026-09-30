@@ -21,12 +21,14 @@ from types import ModuleType
 
 _triton_available = importlib.util.find_spec("triton") is not None
 
-for _gluon_stub in (
-    "triton.experimental.gluon",
-    "triton.experimental.gluon.language",
-):
-    if _gluon_stub not in sys.modules:
-        sys.modules[_gluon_stub] = ModuleType(_gluon_stub)
+# Preserve the real Gluon package when provided by current Triton.
+if not _triton_available or importlib.util.find_spec("triton.experimental.gluon") is None:
+    for _gluon_stub in (
+        "triton.experimental.gluon",
+        "triton.experimental.gluon.language",
+    ):
+        if _gluon_stub not in sys.modules:
+            sys.modules[_gluon_stub] = ModuleType(_gluon_stub)
 
 # main2main compat: `_aggregate` was added to triton.language.core in
 # vllm main post-0.26.0. Stub it here so vllm.triton_utils can import it

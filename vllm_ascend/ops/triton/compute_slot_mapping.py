@@ -44,7 +44,6 @@ def _compute_slot_mapping_kernel(
     end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
 
     row_offset = req_idx * block_table_stride
-    block_table_offsets = tl.arange(0, BLOCK_TABLE_WINDOW_SIZE)
     for i in range(start_idx, end_idx, TILE_BLOCK_SIZE):
         offsets = i + tl.arange(0, TILE_BLOCK_SIZE)
         mask = offsets < end_idx
@@ -64,20 +63,15 @@ def _compute_slot_mapping_kernel(
             block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
             slot_offsets = local_block_offsets % block_size
 
-        INT32_MAX = 2147483647
-        valid_block_indices = tl.where(mask, block_indices, INT32_MAX)
-        block_idx_base = tl.min(valid_block_indices, axis=0)
-        block_table_window_offsets = block_idx_base + block_table_offsets
-        block_table_window = tl.load(
-            block_table_ptr + row_offset + block_table_window_offsets,
-            mask=block_table_window_offsets < block_table_stride,
+        # Direct indexed loads avoid a BiShengHIR gather-in-loop lowering failure.
+        load_mask = mask
+        if TOTAL_CP_WORLD_SIZE != 1:
+            load_mask = load_mask & is_local
+        block_numbers = tl.load(
+            block_table_ptr + row_offset + block_indices,
+            mask=load_mask,
             other=0,
-        ).to(tl.float32)
-        if TOTAL_CP_WORLD_SIZE == 1:
-            relative_block_indices = tl.where(mask, block_indices - block_idx_base, 0)
-        else:
-            relative_block_indices = tl.where(mask & is_local, block_indices - block_idx_base, 0)
-        block_numbers = tl.gather(block_table_window, relative_block_indices, 0).to(tl.int32)
+        )
         slot_ids = block_numbers * block_size + slot_offsets
         if TOTAL_CP_WORLD_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)

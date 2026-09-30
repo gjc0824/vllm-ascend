@@ -18,7 +18,6 @@
 #
 
 import logging
-import os
 import math
 import sys
 import time
@@ -2415,17 +2414,13 @@ class NPUModelRunner(GPUModelRunner):
         # older upstream versions.  Preserve it when present without making the
         # upstream dataclass depend on the plugin extension.
         if any(hasattr(output, "spec_token_ids") for output in outputs):
-            setattr(
-                merged,
-                "spec_token_ids",
-                [
-                    getattr(by_req_id[req_id][0], "spec_token_ids", [])[by_req_id[req_id][1]]
-                    if req_id in by_req_id
-                    and getattr(by_req_id[req_id][0], "spec_token_ids", None) is not None
-                    else []
-                    for req_id in req_ids
-                ],
-            )
+            merged.spec_token_ids = [
+                getattr(by_req_id[req_id][0], "spec_token_ids", [])[by_req_id[req_id][1]]
+                if req_id in by_req_id
+                and getattr(by_req_id[req_id][0], "spec_token_ids", None) is not None
+                else []
+                for req_id in req_ids
+            ]
         return merged
 
     def _sample_layered_step(
