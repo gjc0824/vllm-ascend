@@ -174,3 +174,36 @@ def test_factory_uses_standard_adapter_for_common_decoder_contract():
     adapter = create_layered_prefill_model_adapter(model)
 
     assert isinstance(adapter, StandardDecoderLayeredPrefillAdapter)
+
+
+def test_deepseek_v4_adapter_captures_aux_hidden_state_mean_over_hc_branches():
+    model = _DeepseekV4ForCausalLM()
+    adapter = DeepseekV4LayeredPrefillAdapter(model)
+    hidden_states = torch.tensor([[[1.0], [3.0]], [[5.0], [7.0]]])
+
+    captured = adapter._capture_aux_hidden_state(0, hidden_states, None)
+
+    # DSpark draft context K/V derives from the hc-branch mean, matching the
+    # backbone forward's own aux capture.
+    torch.testing.assert_close(captured, torch.tensor([[2.0], [6.0]]))
+
+
+def test_deepseek_v4_adapter_collects_aux_from_configured_layers():
+    model = _DeepseekV4ForCausalLM()
+    model.model.aux_hidden_state_layers = (2,)
+    adapter = create_layered_prefill_model_adapter(model)
+
+    output = adapter.forward(
+        input_ids=torch.tensor([2, 4]),
+        positions=torch.arange(2),
+        layer_start=0,
+        layer_end=2,
+    )
+
+    assert output.aux_hidden_states is not None
+    assert len(output.aux_hidden_states) == 1
+    # Each layer adds the token id to every hc branch of the embedding, so
+    # after two layers (ids 2 and 4) the branch mean equals embed + 2 * id.
+    torch.testing.assert_close(
+        output.aux_hidden_states[0], torch.tensor([[6.0], [12.0]])
+    )

@@ -108,8 +108,12 @@ def rejection_greedy_sample_triton(
         is_greedy = tl.load(is_greedy_ptr + offset, mask=mask, other=0)
         is_greedy_mask = mask & (is_greedy != 0)
 
-    start_idx = tl.where(offset == 0, 0, tl.load(cu_num_draft_tokens_ptr + offset - 1, is_greedy_mask))
-    end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask)
+    start_idx = tl.load(
+        cu_num_draft_tokens_ptr + offset - 1,
+        mask=is_greedy_mask & (offset > 0),
+        other=0,
+    )
+    end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask, other=0)
     num_draft_tokens = end_idx - start_idx
 
     for pos in tl.range(0, BLOCK_SIZE):
@@ -203,8 +207,12 @@ def rejection_random_sample_kernel(
     mask = offsets < vec_len
     is_greedy = tl.load(is_greedy_ptr + offsets, mask, other=1)
     not_greedy_mask = is_greedy == 0
-    start_idxs = tl.where(offsets == 0, 0, tl.load(cu_num_draft_tokens_ptr + offsets - 1, not_greedy_mask))
-    end_idxs = tl.load(cu_num_draft_tokens_ptr + offsets, not_greedy_mask)
+    start_idxs = tl.load(
+        cu_num_draft_tokens_ptr + offsets - 1,
+        mask=not_greedy_mask & (offsets > 0),
+        other=0,
+    )
+    end_idxs = tl.load(cu_num_draft_tokens_ptr + offsets, not_greedy_mask, other=0)
     n_num_draft_tokens = end_idxs - start_idxs
 
     for req_i in range(BLOCK_SIZE):
@@ -368,8 +376,12 @@ def expand_kernel(
     offset = req_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     len_mask = offset < vec_len
 
-    start_idx = tl.where(offset == 0, 0, tl.load(cu_num_tokens_ptr + offset - 1, len_mask))
-    end_idx = tl.load(cu_num_tokens_ptr + offset, len_mask)
+    start_idx = tl.load(
+        cu_num_tokens_ptr + offset - 1,
+        mask=len_mask & (offset > 0),
+        other=0,
+    )
+    end_idx = tl.load(cu_num_tokens_ptr + offset, len_mask, other=0)
     num_tokens = end_idx - start_idx
 
     src_val = tl.load(input_ptr + offset, len_mask)
@@ -402,8 +414,9 @@ def sample_recovered_tokens_kernel(
     req_idx = tl.program_id(0)
     pos = tl.program_id(1)
 
-    # Compute token index
-    start_idx = tl.where(req_idx == 0, 0, tl.load(cu_num_draft_tokens_ptr + req_idx - 1))
+    # Compute token index without reading before the cumulative-length buffer.
+    prev_req_idx = tl.maximum(req_idx - 1, 0)
+    start_idx = tl.where(req_idx == 0, 0, tl.load(cu_num_draft_tokens_ptr + prev_req_idx))
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
 
