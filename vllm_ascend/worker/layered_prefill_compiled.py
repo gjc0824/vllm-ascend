@@ -21,6 +21,7 @@ class LayeredPrefillCompiledGroup(nn.Module):
     def __init__(self, *, adapter, start, end, vllm_config):
         super().__init__()
         self.adapter = adapter
+        self.vllm_config = vllm_config
         self.layers = nn.ModuleList(adapter.layers[start:end])
 
     def forward(

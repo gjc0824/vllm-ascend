@@ -134,7 +134,13 @@ class LayeredDecodeGraphCache:
         context = get_forward_context()
         adapter = runner.layered_prefill_model_adapter
         inputs = (state, input_ids, positions)
-        metadata = context.attn_metadata
+        # MRV2 attention consumes these tensors outside attention metadata.
+        # Snapshot and refresh their storage as part of the replay contract.
+        metadata = {
+            name: getattr(context, name)
+            for name in ("attn_metadata", "slot_mapping", "is_padding")
+            if hasattr(context, name)
+        }
 
         def run(values):
             active, ids, pos = values
@@ -174,7 +180,8 @@ class LayeredDecodeGraphCache:
         if entry is None:
             static_inputs = snapshot_tree(inputs)
             static_metadata = view.metadata
-            context.attn_metadata = static_metadata
+            for name, value in static_metadata.items():
+                setattr(context, name, value)
             was_capturing = context.capturing
             try:
                 current = torch.npu.current_stream()
@@ -202,7 +209,8 @@ class LayeredDecodeGraphCache:
                     )
             finally:
                 context.capturing = was_capturing
-                context.attn_metadata = metadata
+                for name, value in metadata.items():
+                    setattr(context, name, value)
         else:
             refresh_tree(entry.inputs, inputs)
         entry.graph.replay()

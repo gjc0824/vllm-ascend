@@ -19,10 +19,14 @@ import numpy as np
 import torch
 from vllm.config import CompilationMode, CUDAGraphMode, set_current_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.v1.core.layered_prefill import LayeredFrontier, make_layer_group_ranges
-
+from vllm.v1.core.layered_prefill import (
+    LayeredFrontier,
+    make_layer_group_ranges,
+    make_pp_aligned_layer_group_ranges,
+)
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
+
 from vllm_ascend.worker.layered_prefill_decode_graph import LayeredDecodeGraphCache
 
 
@@ -476,3 +480,104 @@ class LayeredPrefillBatch:
                     return output
         # A P-only non-final group has no sampled logits.
         return p_state[0]
+
+
+class LayeredPrefillGroupExecutor:
+    """Reuse compiled active ranges and exact-contract Decode graphs."""
+
+    def __init__(self, runner):
+        self.runner = runner
+        self.decode_graph_cache = None
+        self.compiled_groups: dict[tuple, Any] = {}
+
+    def forward_decode(self, plan, start, end, state, input_ids, positions):
+        runner = self.runner
+        compilation = getattr(runner, "compilation_config", None)
+        use_graph = (
+            compilation is not None
+            and compilation.cudagraph_mode != CUDAGraphMode.NONE
+            and not runner.model_config.enforce_eager
+            and runner.ascend_config.scheduler_config.layered_prefill_config.single_forward_decode_graph
+        )
+        adapter = runner.layered_prefill_model_adapter
+        if not use_graph:
+            for idx in range(start, end):
+                state = adapter._forward_layer(adapter.layers[idx], positions, *state, input_ids)
+            return state
+        if self.decode_graph_cache is None:
+            self.decode_graph_cache = LayeredDecodeGraphCache(runner)
+        # Use the same boundaries for every active P group, so D groups are
+        # reusable across the other steps of a P request, including ramp-up.
+        parallel = getattr(runner, "parallel_config", None)
+        if getattr(parallel, "pipeline_parallel_size", 1) == 2 and 2 <= plan.num_groups <= adapter.num_hidden_layers:
+            # Reuse the scheduler's global PP-aligned boundaries. Dividing a
+            # local stage end by the global group count splits stage-local
+            # Decode spans into unnecessary graph replays on PP0.
+            groups = make_pp_aligned_layer_group_ranges(adapter.num_hidden_layers, plan.num_groups, 2)
+        else:
+            groups = make_layer_group_ranges(adapter.end_layer, plan.num_groups)
+        for group in groups:
+            group_start, group_end = max(start, group.start), min(end, group.end)
+            if group_start < group_end:
+                state = self.decode_graph_cache.forward(
+                    group_start,
+                    group_end,
+                    state,
+                    input_ids,
+                    positions,
+                )
+        return state
+
+    def forward_mixed(self, start, end, state, input_ids, positions):
+        runner = self.runner
+        adapter = runner.layered_prefill_model_adapter
+        compilation = getattr(runner, "compilation_config", None)
+        use_compile = (
+            getattr(compilation, "mode", None) == CompilationMode.VLLM_COMPILE
+            and not runner.model_config.enforce_eager
+            and runner.ascend_config.scheduler_config.layered_prefill_config.single_forward_compile
+        )
+        if not use_compile:
+            for idx in range(start, end):
+                state = adapter._forward_layer(adapter.layers[idx], positions, *state, input_ids)
+            return state
+
+        # Lazy import: compilation infrastructure is not needed by fallback
+        # runners. Compilation does not add a warmup forward on live KV caches.
+        from vllm.compilation.backends import set_model_tag
+
+        from vllm_ascend.worker.layered_prefill_compiled import (
+            LayeredPrefillCompiledGroup,
+        )
+
+        # Python-side communication dispatch must not be frozen from a small
+        # MC2 batch and reused for a large AllGather batch (or conversely).
+        comm = str(get_forward_context().moe_comm_type)
+        key = (start, end, comm, state[1] is None)
+        group = self.compiled_groups.get(key)
+        if group is None:
+            # The AOT decorator hashes the function and config, not module
+            # attributes or backend prefix. Isolate each layer/comm contract
+            # in BOTH caches without mutating the full model's configuration.
+            config = copy(runner.vllm_config)
+            config.additional_config = dict(config.additional_config or {})
+            config.additional_config["layered_prefill_compile_key"] = key
+            config.compilation_config = copy(config.compilation_config)
+            config.compilation_config.cache_dir = ""
+            config.compilation_config.local_cache_dir = None
+            config.compilation_config.traced_files = set(config.compilation_config.traced_files)
+        else:
+            config = group.vllm_config
+        with (
+            set_current_vllm_config(config),
+            set_model_tag(f"layered_prefill_{start}_{end}_{comm}_{state[1] is None}"),
+        ):
+            if group is None:
+                group = LayeredPrefillCompiledGroup(
+                    adapter=adapter,
+                    start=start,
+                    end=end,
+                    vllm_config=config,
+                )
+                self.compiled_groups[key] = group
+            return group(*state, positions, input_ids)
