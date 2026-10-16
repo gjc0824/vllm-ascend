@@ -566,6 +566,11 @@ class NPUWorker(WorkerBase):
                     factor,
                 )
 
+        # Layered frontiers coexist with the next forward. Reserve the portion
+        # that was not already included in the profile high-water mark.
+        frontier_extra = int(getattr(self.model_runner, "layered_frontier_profile_bytes", 0) or 0)
+        self.available_kv_cache_memory_bytes -= frontier_extra
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"

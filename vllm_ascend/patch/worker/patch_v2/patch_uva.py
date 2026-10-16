@@ -152,12 +152,13 @@ class UvaBufferWrapper:
             dirty_rows = sorted(self._modified_indices)
             n_dirty = len(dirty_rows)
             if dirty_rows[0] == 0 and dirty_rows[-1] == n_dirty - 1:
-                # Common path: dirty rows are a contiguous prefix [0..n-1].
-                # This is always the case when copy_to_uva writes via
-                # dst[:n] = x.  Contiguous slice copy_ keeps the CPU source
-                # pinned and enables true async DMA without an intermediate
-                # tensor or stream sync.
-                self._uva[:n_dirty].copy_(self._cpu[:n_dirty], non_blocking=True)
+                # A pool may rotate while the previous H2D is still queued.
+                # Device stream ordering does not order CPU writes to _cpu.
+                # Give DMA its own pinned snapshot, as the sparse path does;
+                # the pinned allocator tracks its lifetime through copy_.
+                src = torch.empty_like(self._cpu[:n_dirty], pin_memory=True)
+                src.copy_(self._cpu[:n_dirty])
+                self._uva[:n_dirty].copy_(src, non_blocking=True)
             else:
                 # Sparse modification pattern — fall back to indexed copy.
                 # Explicitly re-pin the CPU source so that non_blocking is

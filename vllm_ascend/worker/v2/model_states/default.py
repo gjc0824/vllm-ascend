@@ -41,16 +41,26 @@ class AscendModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        num_input_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
+        """Override prepare_attn method because `build_attn_metadata` is different from vllm.
+
+        ``num_input_tokens`` overrides the physical input width.  Layered P
+        uses this for DSA-CP TP pad: metadata keeps ``num_actual_tokens`` at
+        the logical query length while kernels/collectives see the padded
+        width.  Regular eager batches omit it and stay unpadded.
+        """
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
-            num_input_tokens = input_batch.num_tokens_after_padding
+            resolved_num_input_tokens = input_batch.num_tokens_after_padding
         else:
-            # For piecewise cudagraphs and eager, use unpadded sizes.
+            # For piecewise cudagraphs and eager, use unpadded sizes unless a
+            # caller (layered P + dsa_cp) supplies a physical pad width.
             num_reqs = input_batch.num_reqs
-            num_input_tokens = input_batch.num_tokens
+            resolved_num_input_tokens = input_batch.num_tokens
+        if num_input_tokens is not None:
+            resolved_num_input_tokens = num_input_tokens
 
         num_actual_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
@@ -61,9 +71,10 @@ class AscendModelState(DefaultModelState):
         self.attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
-            num_tokens=num_input_tokens,
+            num_reqs_actual=input_batch.num_reqs,
+            num_tokens=resolved_num_input_tokens,
             num_actual_tokens=num_actual_tokens,
-            num_input_tokens=num_input_tokens,
+            num_input_tokens=resolved_num_input_tokens,
             is_prefilling=is_prefilling,
             query_start_loc_gpu=input_batch.query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,

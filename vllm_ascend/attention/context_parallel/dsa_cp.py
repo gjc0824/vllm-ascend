@@ -11,7 +11,6 @@ from vllm.distributed import get_tp_group
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionImplBase, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
-
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_v1 import (
     build_dspark_swa_indices,
@@ -274,6 +273,35 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _zero_graph_padding_rows(self, num_reqs: int, num_reqs_actual: int | None) -> int:
+        """Clear dummy FULL-graph / FIA pad rows so CP does not read stale KV.
+
+        ``num_reqs`` is the padded request count used by the graph; ``num_reqs_actual``
+        is the real batch.  Padding rows keep leftover ``seq_lens`` / ``block_table``
+        from the previous step; DSA-CP then shards those tokens onto other TP ranks
+        and the kernel MTE-faults (507011).
+        """
+        if num_reqs_actual is None:
+            return num_reqs
+        num_reqs_actual = min(int(num_reqs_actual), num_reqs)
+        if num_reqs_actual >= num_reqs:
+            return num_reqs_actual
+        seq_lens = getattr(self, "seq_lens", None)
+        if seq_lens is not None and seq_lens.shape[0] > num_reqs_actual:
+            seq_lens[num_reqs_actual:num_reqs].fill_(0)
+        seq_lens_cpu = getattr(self, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            end = min(num_reqs, int(seq_lens_cpu.shape[0]))
+            if num_reqs_actual < end:
+                seq_lens_cpu[num_reqs_actual:end].fill_(0)
+        block_table = getattr(self, "block_table", None)
+        if block_table is not None and block_table.shape[0] > num_reqs_actual:
+            block_table[num_reqs_actual:num_reqs, ...].fill_(0)
+        start_pos = getattr(self, "start_pos_prefill", None)
+        if start_pos is not None:
+            start_pos[num_reqs_actual:].fill_(0)
+        return num_reqs_actual
+
     def build(
         self,
         common_prefix_len: int,
@@ -343,6 +371,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        num_reqs_actual = self._zero_graph_padding_rows(num_reqs, num_reqs_actual)
 
         req_metadata = self.build_req_metadata(
             common_attn_metadata,
@@ -674,6 +703,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         has_prefill = self.num_prefills > 0
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        num_reqs_actual = self._zero_graph_padding_rows(num_reqs, num_reqs_actual)
 
         # ── GPU local metadata (cached across kv-cache groups) ──
         (
@@ -727,14 +757,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
         max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
 
-        if num_reqs_actual is None:
-            num_reqs_actual = num_reqs
-        else:
-            num_reqs_actual = min(num_reqs_actual, num_reqs)
-            if num_reqs_actual < num_reqs:
-                self.start_pos_prefill[num_reqs_actual:].fill_(0)
-                self.block_table[num_reqs_actual:num_reqs, ...].fill_(0)
-
         # --- Compressed positions ---
         full_compress_cos, full_compress_sin = None, None
         cu_cmp_seqlens = self._get_cmp_seqlens_for_metadata(has_prefill)
@@ -773,7 +795,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             seq_lens=local_seq_lens,
             seq_lens_q=local_seq_lens_q,
             num_reqs=num_reqs,
+            max_query_len=max_local_query_len,
+            max_seq_lens=max_local_seq_lens,
         )
+        # Local-metadata kernels can rewrite start_pos as seq_lens - query_len.
+        # Dummy FIA rows have query tokens but seq_lens=0; re-clear them.
+        if num_reqs_actual < num_reqs:
+            self.start_pos_prefill[num_reqs_actual:num_reqs].fill_(0)
+            self.block_table[num_reqs_actual:num_reqs, ...].fill_(0)
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -991,7 +1020,16 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.req_sas_metadata[:1024] = metadata
         return self.req_sas_metadata[:1024]
 
-    def _build_qli_metadata(self, query_start_loc, seq_lens, seq_lens_q, num_reqs):
+    def _build_qli_metadata(
+        self,
+        query_start_loc,
+        seq_lens,
+        seq_lens_q,
+        num_reqs,
+        *,
+        max_query_len: int,
+        max_seq_lens: int,
+    ):
         if self.compressor_ratio != 4:
             return None
 
@@ -999,8 +1037,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         metadata = self.common_ratio_to_sas_metadata.get(cache_key)
 
         if metadata is None:
-            max_seqlen_q = max(1, int(seq_lens_q.max().item()))
-            max_seqlen_k = max(1, int(seq_lens.max().item()))
             metadata = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer_metadata(
                 actual_seq_lengths_query=query_start_loc[1:].clone(),
                 actual_seq_lengths_key=seq_lens.clone(),
@@ -1010,8 +1046,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 query_quant_mode=0,
                 key_quant_mode=0,
                 batch_size=num_reqs,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_seq_lens,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=self.model_config.hf_config.index_topk,
@@ -1054,6 +1090,19 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
     """
 
     o_proj_full_pools: ClassVar[dict[Any, torch.Tensor]] = {}
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        draft_attn_metadatas=None,
+    ):
+        # Same as AscendDSAImpl: DSA-CP decode graphs do not bind per-step
+        # FIA args through GraphParams; capture already baked the shapes.
+        pass
 
     def __init__(
         self,

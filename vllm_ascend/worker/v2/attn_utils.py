@@ -41,9 +41,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
-
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import (
@@ -53,6 +52,9 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import AscendDeviceType, calc_split_factor, enable_sfa, get_ascend_device_type
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -184,15 +186,28 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
+    num_reqs_actual: int | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
     # an error.
+    if num_reqs_actual is None:
+        num_reqs_actual = num_reqs
+    else:
+        num_reqs_actual = min(int(num_reqs_actual), num_reqs)
     if seq_lens_np is None:
         seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
+    # FULL graph / FIA pad invents dummy rows so hidden_states matches
+    # actual_seq_lengths_q.  Those rows must not keep leftover KV lengths —
+    # DSA-CP shards tokens across TP and would otherwise treat stale
+    # seq_lens / block_table as real requests (MTE 507011).
+    if num_reqs_actual < num_reqs:
+        seq_lens_cpu[num_reqs_actual:].fill_(0)
+        if seq_lens.shape[0] > num_reqs_actual:
+            seq_lens[num_reqs_actual:num_reqs].fill_(0)
     if seq_lens_cpu_upper_bound is None:
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
@@ -243,31 +258,52 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
+            attn_metadata_extra_kwargs = (
+                model_specific_attn_metadata.get_extra_attn_kwargs(
+                    attn_metadata_builder,
+                    num_reqs,
+                )
+                if model_specific_attn_metadata is not None
+                else {}
+            )
+            ratio_to_sas = common_ratio_to_sas_metadata
+            if isinstance(
+                attn_metadata_builder,
+                (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder),
+            ):
+                if for_cudagraph_capture:
+                    ratio_to_sas = {}
+                attn_metadata_extra_kwargs.update(
+                    num_reqs_actual=num_reqs_actual,
+                    common_ratio_to_sas_metadata=ratio_to_sas,
+                )
+
+            # DSA / DSA-CP / SFA-CP must use build() so shared SAS metadata is
+            # populated; build_for_cudagraph_capture skips those kwargs (V1 parity).
+            if for_cudagraph_capture and not isinstance(
+                attn_metadata_builder,
+                (
+                    AscendDSAMetadataBuilder,
+                    AscendDSACPMetadataBuilder,
+                    AscendSFADCPMetadataBuilder,
+                ),
+            ):
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
-                    attn_metadata_extra_kwargs.update(
-                        num_reqs_actual=num_reqs,
-                        common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
-                    )
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
-                if isinstance(attn_metadata_builder, AscendDSAMetadataBuilder):
+                if isinstance(
+                    attn_metadata_builder,
+                    (AscendDSAMetadataBuilder, AscendDSACPMetadataBuilder),
+                ):
                     # Preserve sharing even if a builder replaces one of the
                     # dictionaries while constructing its metadata.
-                    common_ratio_to_sas_metadata = attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
+                    common_ratio_to_sas_metadata = (
+                        attn_metadata_builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
@@ -306,8 +342,14 @@ def build_attn_state(
             attn_state = AscendAttentionState.SpecDecoding
         else:
             attn_state = AscendAttentionState.ChunkedPrefill
-    # splitfuse
-    elif vllm_config.scheduler_config.enable_chunked_prefill:
+    # Decode + prefill in one supported single-forward batch.  PrefillCacheHit
+    # attends only to paged KV; a new prefill has empty cache and last-token
+    # hidden collapses to zeros (smoke: 48× token-id 0).
+    elif (
+        np.any(np.asarray(num_scheduled_tokens) > 1)
+        and np.any(seq_lens_np[:num_reqs] > np.asarray(num_scheduled_tokens))
+        or vllm_config.scheduler_config.enable_chunked_prefill
+    ):
         attn_state = AscendAttentionState.ChunkedPrefill
     else:
         attn_state = AscendAttentionState.PrefillCacheHit

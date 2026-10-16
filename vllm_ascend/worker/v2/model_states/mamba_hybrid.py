@@ -50,13 +50,16 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        num_input_tokens: int | None = None,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
-            num_tokens = input_batch.num_tokens_after_padding
+            resolved_num_input_tokens = input_batch.num_tokens_after_padding
         else:
             num_reqs = input_batch.num_reqs
-            num_tokens = input_batch.num_tokens
+            resolved_num_input_tokens = input_batch.num_tokens
+        if num_input_tokens is not None:
+            resolved_num_input_tokens = num_input_tokens
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(input_batch.is_prefilling_np)
@@ -87,7 +90,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self.attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
-            num_tokens=num_tokens,
+            num_reqs_actual=input_batch.num_reqs,
+            num_tokens=resolved_num_input_tokens,
+            num_actual_tokens=input_batch.num_tokens,
+            num_input_tokens=resolved_num_input_tokens,
             query_start_loc_gpu=input_batch.query_start_loc,
             query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
             max_query_len=input_batch.num_scheduled_tokens.max().item(),

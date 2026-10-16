@@ -95,6 +95,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     ),
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+    # Opt in to MRV2 layered-prefill asynchronous compute completion.
+    # Values: "0" (default, disabled) or "1". Not sensitive. Runtime safety
+    # guards still require validated PP=2, DP=1, non-UVA synchronous scheduling.
+    # The legacy VLLM_LAYERED_ASYNC_COMPUTE name is a fallback for existing
+    # launch scripts; the VLLM_ASCEND_* value takes precedence when present.
+    "VLLM_ASCEND_LAYERED_ASYNC_COMPUTE": lambda: os.getenv(
+        "VLLM_ASCEND_LAYERED_ASYNC_COMPUTE", os.getenv("VLLM_LAYERED_ASYNC_COMPUTE", "0")
+    )
+    == "1",
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
 }
 
