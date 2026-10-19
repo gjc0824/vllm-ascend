@@ -617,3 +617,98 @@ def test_partial_stage_execute_keeps_wire_and_samples_p_only_at_final_chunk(
     assert (frontier is None) == plan.is_final_group
     if frontier is not None:
         assert frontier.group_id == group + 1
+
+
+@pytest.mark.parametrize("num_groups", [4, 8, 16])
+@pytest.mark.parametrize("mode", ["tail", "head"])
+def test_boundary_cross_stage_is_one_interval_with_complete_decode(implementation, num_groups, mode):
+    """Both ranks execute the same global plan; only its local intersection mixes P."""
+    impl = implementation
+    layout = PP2_RANGES[num_groups]
+    handoff = next(i for i, (start, _) in enumerate(layout) if start == 22)
+    first = 0 if mode == "tail" else handoff - 1
+    stop = handoff + 1 if mode == "tail" else num_groups
+    plan = NS(
+        prefill_req_ids=["p"],
+        query_tokens={"p": 3},
+        num_groups=num_groups,
+        group_id=first,
+        resume_group_id=stop,
+        group_start=layout[first][0],
+        group_end=layout[stop - 1][1],
+        is_final_group=stop == num_groups,
+        is_sampling_step=stop == num_groups,
+        boundary_mode=mode,
+        cohort_id=73,
+    )
+    p_wire = None
+    d_wire = None
+    p_layers = []
+    all_runners = []
+    finalized = []
+    expected_p = None
+    for last in (False, True):
+        runner, _, _, _ = stage_runner(impl, last)
+        all_runners.append(runner)
+        adapter = runner.layered_prefill_model_adapter
+        adapter.start_layer, adapter.end_layer = (22, 43) if last else (0, 22)
+        adapter.num_hidden_layers = 43
+        runner._layered_next_group_owner = lambda _: None if plan.is_final_group else 1
+        runner._layered_pp_group_owner = lambda _: -1
+        views = runner._layered_single_forward_executor
+        views._private_groups = lambda: []
+        prepared = impl.base["prepared"](["d0", "p", "d1", "d2"], p_tokens=3, pad_to=2)
+        batch = prepared.input_batch
+        p_start, p_end = map(int, batch.query_start_loc_np[1:3])
+        if not last:
+            expected_p = batch.input_ids[p_start:p_end].float()[:, None] if first == 0 else torch.full((3, 1), 5.0)
+        incoming_p = p_wire
+        runner._prepare_layered_p_activation = lambda *args, last=last, incoming_p=incoming_p, **kwargs: (
+            ["p"],
+            None if last or first == 0 else (torch.full((3, 1), 5.0), None),
+            None,
+            incoming_p if last else None,
+            "pp_recv" if last else "frontier",
+        )
+        stage_layers = []
+
+        def layers(kind, start, end, state, ids, positions, stage_layers=stage_layers):
+            stage_layers.extend(range(start, end))
+            if kind == "mixed":
+                p_layers.extend(range(start, end))
+            return state[0] + sum(range(start + 1, end + 1)), state[1]
+
+        runner._layered_group_executor.forward_mixed = lambda *args: layers("mixed", *args)
+        runner._layered_group_executor.forward_decode = lambda _, *args: layers("decode", *args)
+
+        def finalize(hidden, residual, last=last):
+            finalized.append(last)
+            return hidden * 10, residual
+
+        adapter._finalize = finalize
+        schedule = NS(num_scheduled_tokens={"d0": 1, "p": 3, "d1": 1, "d2": 1})
+        assert impl.LayeredV2PPStageForward.supported(runner, plan, ["d0", "d1", "d2"], schedule)
+        _, d_output, p_output = impl.LayeredV2PPStageForward(runner).forward_stage(
+            prepared, plan, d_wire, incoming_p, 8
+        )
+        assert stage_layers == list(range(adapter.start_layer, adapter.end_layer))
+        local_start = max(plan.group_start, adapter.start_layer)
+        local_end = min(plan.group_end, adapter.end_layer)
+        expected_p = expected_p + sum(range(local_start + 1, local_end + 1))
+        if last and plan.is_final_group:
+            expected_p *= 10
+        torch.testing.assert_close(p_output[0][:3], expected_p)
+        p_wire = impl.IntermediateTensors({"hidden_states": p_output[0].clone()})
+        d_wire = impl.IntermediateTensors({"hidden_states": d_output[0].clone()})
+        if not last:
+            assert runner.layered_prefill_state.get("p") is None
+            # A cross-stage plan always sends all P rows, never the one-row fence.
+            assert runner._layered_nonfused_pp_payload(plan, p_wire)["hidden_states"].shape[0] == 4
+    assert p_layers == list(range(plan.group_start, plan.group_end))
+    assert finalized == [True]
+    frontier = all_runners[1].layered_prefill_state.get("p")
+    if plan.is_final_group:
+        assert frontier is None
+    else:
+        assert frontier.group_id == stop and frontier.cohort_id == 73
+        torch.testing.assert_close(frontier.hidden_states, expected_p)

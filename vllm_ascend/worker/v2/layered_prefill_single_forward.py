@@ -339,7 +339,8 @@ class LayeredV2SingleForward:
         store.put(
             LayeredFrontier(
                 req_id=req_id,
-                group_id=plan.group_id + 1,
+                group_id=getattr(plan, "resume_group_id", plan.group_id + 1),
+                cohort_id=plan.cohort_id if getattr(plan, "boundary_mode", None) else None,
                 query_len=state[0].shape[0],
                 hidden_states=saved[0],
                 residual=saved[1],

@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.offloader.base import get_offloader
@@ -198,7 +199,12 @@ class LayeredDecodeGraphCache:
                 current.wait_stream(self.stream)
                 entry = DecodeGraphEntry(static_inputs, static_metadata, graph, output)
                 self.entries[key] = entry
-                if runner.tp_rank == 0:
+                # MRV1 caches this rank on the runner; MRV2 exposes it through
+                # the common distributed API instead.
+                tp_rank = getattr(runner, "tp_rank", None)
+                if tp_rank is None:
+                    tp_rank = get_tensor_model_parallel_rank()
+                if tp_rank == 0:
                     logger.info(
                         "Layered Decode graph captured layers=[%d,%d) tokens=%d entries=%d moe=%s",
                         start,

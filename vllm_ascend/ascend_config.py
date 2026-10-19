@@ -74,6 +74,25 @@ class AscendConfig:
             additional_config,
             balance_env_value=ascend_envs.VLLM_ASCEND_BALANCE_SCHEDULING,
         )
+        boundary_config = self.scheduler_config.layered_prefill_config
+        if boundary_config.boundary_policy != "off":
+            parallel = vllm_config.parallel_config
+            if (
+                not vllm_config.use_v2_model_runner
+                or parallel.pipeline_parallel_size != 2
+                or parallel.data_parallel_size != 1
+                or getattr(parallel, "enable_dbo", False)
+                or getattr(parallel, "decode_context_parallel_size", 1) != 1
+                or getattr(parallel, "prefill_context_parallel_size", 1) != 1
+                or vllm_config.cache_config.enable_prefix_caching
+                or vllm_config.scheduler_config.async_scheduling
+                or vllm_config.speculative_config is not None
+                or vllm_config.kv_transfer_config is not None
+            ):
+                raise ValueError(
+                    "layered boundary_policy requires MRV2, PP=2, DP=1, "
+                    "no prefix caching, async scheduling, speculation, KV connector, DBO or context parallelism"
+                )
         if self.scheduler_config.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
             if max_batched < self.scheduler_config.profiling_chunk_config.min_chunk:
@@ -1255,6 +1274,8 @@ class SchedulerConfig:
         self.layered_prefill_config = LayeredPrefillConfig(
             enabled=bool(layered_prefill_raw.get("enabled", False)),
             mode=str(layered_prefill_raw.get("mode", "one_group")),
+            boundary_policy=str(layered_prefill_raw.get("boundary_policy", "off")),
+            boundary_trace=bool(layered_prefill_raw.get("boundary_trace", False)),
             group_token_target=int(layered_prefill_raw.get("group_token_target", 512)),
             allowed_num_groups=tuple(int(v) for v in allowed_num_groups),
             max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),

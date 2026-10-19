@@ -28,6 +28,9 @@ class LayeredV2PPStageForward:
     @staticmethod
     def supported(runner, plan, d_req_ids, scheduler_output):
         adapter = runner.layered_prefill_model_adapter
+        boundary = bool(getattr(plan, "boundary_mode", None))
+        local_start = max(adapter.start_layer, plan.group_start)
+        local_end = min(adapter.end_layer, plan.group_end)
         return (
             bool(getattr(runner, "_single_forward", False))
             and not getattr(runner, "_fuse_mixed_batch", False)
@@ -40,9 +43,15 @@ class LayeredV2PPStageForward:
             and LayeredV2SingleForward.supported(runner, allow_pipeline_parallel=True)
             and getattr(runner.vllm_config, "kv_transfer_config", None) is None
             and not getattr(runner, "is_encoder_decoder", False)
-            and adapter.start_layer <= plan.group_start < plan.group_end <= adapter.end_layer
-            and runner._layered_pp_group_owner(plan) == (0 if runner.is_first_pp_rank else 1)
-            and plan.is_final_group == (plan.group_id + 1 == plan.num_groups)
+            and local_start < local_end
+            and (
+                boundary
+                or (
+                    adapter.start_layer <= plan.group_start < plan.group_end <= adapter.end_layer
+                    and runner._layered_pp_group_owner(plan) == (0 if runner.is_first_pp_rank else 1)
+                )
+            )
+            and plan.is_final_group == (getattr(plan, "resume_group_id", plan.group_id + 1) == plan.num_groups)
             and plan.is_final_group == (plan.group_end == adapter.num_hidden_layers)
             and all(scheduler_output.num_scheduled_tokens[r] == 1 for r in d_req_ids)
         )
@@ -79,7 +88,9 @@ class LayeredV2PPStageForward:
         runner = self.runner
         adapter = runner.layered_prefill_model_adapter
         views = self.views
-        partial_stage = (plan.group_start, plan.group_end) != (
+        local_start = max(plan.group_start, adapter.start_layer)
+        local_end = min(plan.group_end, adapter.end_layer)
+        partial_stage = (local_start, local_end) != (
             adapter.start_layer,
             adapter.end_layer,
         )
@@ -129,6 +140,12 @@ class LayeredV2PPStageForward:
             intermediate_tensors=p_intermediate,
         )
         runner._record_layered_activation(plan, source)
+        if getattr(plan, "boundary_mode", None) and intermediate is not None:
+            # The upstream stage sends TP-padded P rows. Mixed metadata owns
+            # only logical P rows; drop transport padding before joining D/P.
+            if any(value.shape[0] < p_count for value in intermediate.tensors.values()):
+                raise RuntimeError("Boundary PP activation is shorter than its logical query")
+            intermediate = IntermediateTensors({key: value[:p_count] for key, value in intermediate.tensors.items()})
         p_state = adapter._prepare_initial_state(
             input_ids=batch.input_ids[p_start:p_end],
             frontier=frontier,
@@ -138,12 +155,12 @@ class LayeredV2PPStageForward:
         if p_state[0].shape[0] != p_count:
             raise RuntimeError("PP Prefill frontier does not match logical query rows")
 
-        if plan.group_start > adapter.start_layer:
+        if local_start > adapter.start_layer:
             with views.context(decode, adapter.start_layer):
                 d_state = runner._layered_group_executor.forward_decode(
                     plan,
                     adapter.start_layer,
-                    plan.group_start,
+                    local_start,
                     d_state,
                     decode.input_batch.input_ids,
                     decode.input_batch.positions,
@@ -173,17 +190,17 @@ class LayeredV2PPStageForward:
                     d_value[:d_count],
                 )
             joined.append(value)
-        with views.context(prepared, plan.group_start):
+        with views.context(prepared, local_start):
             group_trace = torch.profiler.record_function("layered_pp_mixed_group") if trace else nullcontext()
             with group_trace:
                 state = runner._layered_group_executor.forward_mixed(
-                    plan.group_start,
-                    plan.group_end,
+                    local_start,
+                    local_end,
                     tuple(joined),
                     batch.input_ids,
                     batch.positions,
                 )
-            if plan.is_final_group:
+            if plan.is_final_group and runner.is_last_pp_rank:
                 state = adapter._finalize(*state)
             # Own P at its frontier before D continues through the suffix.
             # Only the global final group applies the model's final norm to P.
@@ -205,15 +222,15 @@ class LayeredV2PPStageForward:
                     ("pp_d_output", index),
                     value,
                     decode.rows,
-                    decode.input_batch.num_tokens_after_padding if plan.group_end < adapter.end_layer else wire_tokens,
+                    decode.input_batch.num_tokens_after_padding if local_end < adapter.end_layer else wire_tokens,
                 )
                 for index, value in enumerate(state)
             )
-        if plan.group_end < adapter.end_layer:
-            with views.context(decode, plan.group_end):
+        if local_end < adapter.end_layer:
+            with views.context(decode, local_end):
                 d_output = runner._layered_group_executor.forward_decode(
                     plan,
-                    plan.group_end,
+                    local_end,
                     adapter.end_layer,
                     d_output,
                     decode.input_batch.input_ids,
@@ -229,8 +246,12 @@ class LayeredV2PPStageForward:
                 )
         if plan.is_final_group:
             runner.layered_prefill_state.clear(p_id)
-        else:
+        elif not getattr(plan, "boundary_mode", None) or runner._layered_next_group_owner(plan) == (
+            0 if runner.is_first_pp_rank else 1
+        ):
             views.save_frontier(p_id, plan, tuple(None if x is None else x[:p_count] for x in p_output))
+        else:
+            runner.layered_prefill_state.clear(p_id)
         runner._synchronize_layered_compute()
         return decode, d_output, p_output
 

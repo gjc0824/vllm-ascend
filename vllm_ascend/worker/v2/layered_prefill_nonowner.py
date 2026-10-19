@@ -41,7 +41,7 @@ def can_compact_internal_prefill_payload(runner, plan):
         and not getattr(config, "same_layer_batch", False)
         # The P-only relay shortcut returns before waiting on received
         # tensors. Keep its existing transport contract outside this path.
-        and not getattr(extensions, "skip_relay_stages", False)
+        and (getattr(plan, "boundary_mode", None) or not getattr(extensions, "skip_relay_stages", False))
         and getattr(parallel, "pipeline_parallel_size", 1) == 2
         and getattr(parallel, "data_parallel_size", 1) == 1
         and not getattr(parallel, "enable_dbo", False)
@@ -55,7 +55,7 @@ def can_compact_internal_prefill_payload(runner, plan):
         and not plan.is_final_group
         and not plan.is_sampling_step
         and len(plan.prefill_req_ids) == 1
-        and plan.query_tokens[plan.prefill_req_ids[0]] > 1
+        and plan.query_tokens[plan.prefill_req_ids[0]] > (0 if getattr(plan, "boundary_mode", None) else 1)
         and callable(owner)
         and callable(next_owner)
         and owner(plan) == 0
@@ -102,6 +102,9 @@ def run_nonowner_prefill(runner, scheduler_output, plan, intermediate_tensors):
     collective remain in the caller. This only removes P work on an empty local
     layer range; it never substitutes another request's activation.
     """
+    # Boundary plans use the general local-range path, including one-token chunks.
+    if getattr(plan, "boundary_mode", None):
+        return None
     if (
         runner.parallel_config.pipeline_parallel_size != 2
         or getattr(runner, "_fuse_mixed_batch", False)

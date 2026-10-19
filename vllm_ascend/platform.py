@@ -880,20 +880,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # its existing TP collectives remain ordered.  TP>1 is supported;
         # when EP is enabled, the Ascend AlltoAll path restores the physical
         # TP token split after vLLM collapses routed-expert TP to one.
-        # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
-        # one message per step.  Async scheduling stays supported only while
-        # the engine keeps at most one execute in flight per worker (V1 runner
-        # with PP=1); async PP broadcasts sampled tokens through a GPU ring
-        # that the layered one-send-per-step payload does not join, so the
-        # combination below stays rejected.  DBO remains disabled because it
-        # introduces multiple in-flight frontiers.
-        # sequence parallelism is still rejected below because it changes the
-        # frontier/token-row layout.  DP remains restricted to one rank until
-        # the scheduler plan is synchronized across DP/EP ranks.
-        if getattr(vllm_config, "use_v2_model_runner", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires the V1 model runner"
-            )
+        # Both runner generations transport D/P rows in one PP message per
+        # step. MRV2 additionally merges D and final-P sampling into one
+        # PPHandler slot; intermediate P groups do not sample. Boundary plans
+        # can span stages and each runner executes only its local intersection.
+        # Keep async PP, DBO and distributed/context-parallel gates below:
+        # admitting MRV2 does not enable those independent capabilities.
         if (
             vllm_config.scheduler_config.async_scheduling
             and parallel_config.pipeline_parallel_size > 1
@@ -959,15 +951,16 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         if cudagraph_mode_name not in allowed_cudagraph_modes:
             raise ValueError(
                 "layered_prefill_config supports cudagraph_mode=NONE or "
-                "FULL_DECODE_ONLY; Prefill layer groups remain eager"
+                "FULL_DECODE_ONLY; Prefill groups use their separate layer-range executor"
             )
         compilation_mode = getattr(compilation_config, "mode", None)
         compilation_mode_name = getattr(compilation_mode, "name", None)
         if cudagraph_mode_name == "FULL_DECODE_ONLY":
             # vLLM represents the standard Ascend full Decode graph setup as
             # VLLM_COMPILE + FULL_DECODE_ONLY. The partial-layer P call bypasses
-            # the wrapped full-model forward and is forced eager in the runner.
-            # Compilation also initializes the attention graph workspaces.
+            # the wrapped full-model forward; its range executor separately
+            # chooses eager or compiled execution. Compilation also initializes
+            # the attention graph workspaces.
             allowed_compilation_modes = ["VLLM_COMPILE"]
         else:
             allowed_compilation_modes = [None, "NONE"]
@@ -987,6 +980,12 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 "layered_prefill_config Phase 1 requires connector-free PD-mixed mode"
             )
         speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None and getattr(vllm_config, "use_v2_model_runner", False):
+            # MRV1's MTP/DSpark exception below relies on its draft/aux-output
+            # lifecycle. The MRV2 layered path does not implement that contract.
+            raise ValueError(
+                "layered_prefill_config on Model Runner V2 does not support speculative decoding"
+            )
         if speculative_config is not None and not (
             is_deepseek_v4
             and getattr(speculative_config, "method", None) in ("mtp", "dspark")

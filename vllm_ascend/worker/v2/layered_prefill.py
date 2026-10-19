@@ -602,6 +602,7 @@ def store_req_frontiers(
     batch_req_ids: Sequence[str] | None = None,
     keep_ids: Sequence[str] | None = None,
     reuse_existing: bool = False,
+    cohort_id: int | None = None,
 ) -> None:
     """Slice mixed hidden/residual back into per-request frontiers.
 
@@ -663,6 +664,7 @@ def store_req_frontiers(
             LayeredFrontier(
                 req_id=req_id,
                 group_id=next_group_id,
+                cohort_id=cohort_id,
                 query_len=end - start,
                 hidden_states=persist_rows(hidden_states, None if previous is None else previous.hidden_states),
                 residual=(
