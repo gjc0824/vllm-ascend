@@ -1276,6 +1276,8 @@ class SchedulerConfig:
             mode=str(layered_prefill_raw.get("mode", "one_group")),
             boundary_policy=str(layered_prefill_raw.get("boundary_policy", "off")),
             boundary_trace=bool(layered_prefill_raw.get("boundary_trace", False)),
+            decode_first=bool(layered_prefill_raw.get("decode_first", False)),
+            max_prefill_batch_size=int(layered_prefill_raw.get("max_prefill_batch_size", 1)),
             group_token_target=int(layered_prefill_raw.get("group_token_target", 512)),
             allowed_num_groups=tuple(int(v) for v in allowed_num_groups),
             max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),

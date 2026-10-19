@@ -172,7 +172,7 @@ def split_d_p_req_ids(
 ) -> tuple[list[str], list[str]]:
     all_req_ids = list(scheduler_output.num_scheduled_tokens)
     p_req_ids = list(plan.prefill_req_ids)
-    if len(p_req_ids) != 1:
+    if len(p_req_ids) != 1 and not getattr(plan, "boundary_mode", None):
         raise RuntimeError("Layered prefill Phase 1 supports exactly one P request")
     p_req_set = set(p_req_ids)
     if not p_req_set.issubset(all_req_ids):

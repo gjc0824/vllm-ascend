@@ -6,9 +6,44 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).parents[4] / "vllm_ascend"
+
+
+def test_mixed_final_and_partial_chunks_keep_native_per_request_sample_mask():
+    source = ROOT.parent.parent / "vllm/vllm/v1/worker/gpu/pp_utils.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "compute_need_sampled_mask"
+    ]
+    namespace = {"np": np, "InputBatch": NS}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    batch = NS(
+        num_computed_tokens_np=np.array([20, 0, 4096]),
+        prefill_len_np=np.array([16, 16384, 16384]),
+        max_seq_len_np=np.array([100, 16400, 16400]),
+        num_scheduled_tokens=np.array([1, 16384, 3071]),
+    )
+    mask = namespace["compute_need_sampled_mask"](batch)
+    assert mask.tolist() == [True, True, False]
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+def test_multi_prefill_split_is_limited_to_boundary_plans(boundary):
+    source = ROOT / "worker/v2/layered_prefill.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "split_d_p_req_ids"]
+    namespace = {"SchedulerOutput": NS, "LayeredPrefillPlan": NS}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    schedule = NS(num_scheduled_tokens={"long": 16384, "d": 1, "partial": 3071})
+    p = NS(prefill_req_ids=("long", "partial"), boundary_mode="head" if boundary else None)
+    if boundary:
+        assert namespace["split_d_p_req_ids"](schedule, p) == (["d"], ["long", "partial"])
+    else:
+        with pytest.raises(RuntimeError, match="exactly one"):
+            namespace["split_d_p_req_ids"](schedule, p)
 
 
 @pytest.fixture

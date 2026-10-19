@@ -411,6 +411,7 @@ class NPUModelRunner(GPUModelRunner):
         single_forward = (
             bool(getattr(self, "_single_forward", False))
             and bool(p_req_ids)
+            and len(p_req_ids) == 1
             and LayeredV2SingleForward.supports_plan(layered_plan)
             and LayeredV2SingleForward.supported(self)
         )

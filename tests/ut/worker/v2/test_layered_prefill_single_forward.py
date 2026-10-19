@@ -38,7 +38,8 @@ def implementation():
 
 
 def prepared(order, p_tokens=3, pad_to=4):
-    lengths = np.array([p_tokens if name == "p" else 1 for name in order], dtype=np.int32)
+    queries = p_tokens if isinstance(p_tokens, dict) else {"p": p_tokens}
+    lengths = np.array([queries.get(name, 1) for name in order], dtype=np.int32)
     starts = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
     tokens = int(starts[-1])
     padded = (tokens + pad_to - 1) // pad_to * pad_to
@@ -58,7 +59,7 @@ def prepared(order, p_tokens=3, pad_to=4):
         num_computed_tokens_np=np.arange(count),
         prefill_len_np=np.arange(count),
         num_computed_prefill_tokens_np=np.arange(count),
-        is_prefilling_np=np.array([x == "p" for x in order]),
+        is_prefilling_np=np.array([x in queries for x in order]),
         max_seq_len_np=None,
         prompt_lens=None,
         dcp_local_seq_lens=None,

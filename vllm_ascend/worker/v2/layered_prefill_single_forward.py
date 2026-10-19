@@ -113,7 +113,7 @@ class LayeredV2SingleForward:
         # cached RoPE views then alias the global runtime buffer overwritten
         # by the compact D builder, even though the builders are private.
         # Keep these steps on the established separate D/P execution path.
-        return len(plan.prefill_req_ids) == 1 and all(
+        return (len(plan.prefill_req_ids) == 1 or bool(getattr(plan, "boundary_mode", None))) and all(
             int(plan.query_tokens.get(req_id, 0)) > 1 for req_id in plan.prefill_req_ids
         )
 
@@ -177,14 +177,23 @@ class LayeredV2SingleForward:
     def prepare_decode(self, prepared, plan, *, build_attention_metadata=True):
         """Compact input/common metadata fields, never derived backend metadata."""
         batch = prepared.input_batch
-        if len(plan.prefill_req_ids) != 1:
-            raise ValueError("Single-forward requires exactly one prefill request")
-        p_id = plan.prefill_req_ids[0]
-        p_index = batch.req_ids.index(p_id)
-        p_start, p_end = map(int, batch.query_start_loc_np[p_index : p_index + 2])
-        if p_end - p_start != plan.query_tokens[p_id]:
-            raise ValueError("Single-forward P query length does not match plan")
-        requests = [i for i in range(batch.num_reqs) if i != p_index]
+        if len(plan.prefill_req_ids) != 1 and not getattr(plan, "boundary_mode", None):
+            raise ValueError("Single-forward requires exactly one prefill request outside boundary mode")
+        p_ids = set(plan.prefill_req_ids)
+        p_indices = [i for i, req_id in enumerate(batch.req_ids[: batch.num_reqs]) if req_id in p_ids]
+        if len(p_indices) != len(p_ids) or not p_indices:
+            raise ValueError("Single-forward batch is missing a prefill request")
+        if p_indices != list(range(p_indices[0], p_indices[-1] + 1)):
+            raise ValueError("Single-forward requires contiguous prefill request rows")
+        p_start = int(batch.query_start_loc_np[p_indices[0]])
+        p_end = int(batch.query_start_loc_np[p_indices[-1] + 1])
+        for index in p_indices:
+            if (
+                int(batch.query_start_loc_np[index + 1] - batch.query_start_loc_np[index])
+                != plan.query_tokens[batch.req_ids[index]]
+            ):
+                raise ValueError("Single-forward P query length does not match plan")
+        requests = [i for i in range(batch.num_reqs) if i not in p_indices]
         if any(int(batch.num_scheduled_tokens[i]) != 1 for i in requests):
             raise ValueError("Single-forward Decode requires one token per request")
         rows = [int(batch.query_start_loc_np[i]) for i in requests]
@@ -348,7 +357,7 @@ class LayeredV2SingleForward:
         )
 
     def forward(self, prepared, plan):
-        if not self.supports_plan(plan):
+        if len(plan.prefill_req_ids) != 1 or not self.supports_plan(plan):
             raise ValueError("Single-forward requires one P request with more than one query token")
         runner, adapter = self.runner, self.runner.layered_prefill_model_adapter
         adapter._validate_range(plan.group_start, plan.group_end)

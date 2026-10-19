@@ -64,6 +64,10 @@ def implementation():
     # Use the real wire packer: only the transport wrapper is replaced.
     runner_source = source.with_name("model_runner.py")
     runner_tree = ast.parse(runner_source.read_text(encoding="utf-8"))
+    core_source = source.parents[3].parent / "vllm/vllm/v1/worker/gpu/model_runner.py"
+    core_tree = ast.parse(core_source.read_text(encoding="utf-8"))
+    sort_function = next(n for n in core_tree.body if isinstance(n, ast.FunctionDef) and n.name == "sort_batch_req_ids")
+    exec(compile(ast.Module(body=[sort_function], type_ignores=[]), str(core_source), "exec"), namespace)
     runner_class = next(n for n in runner_tree.body if isinstance(n, ast.ClassDef) and n.name == "NPUModelRunner")
     packer = next(
         n for n in runner_class.body if isinstance(n, ast.FunctionDef) and n.name == "_combine_layered_pp_intermediate"
@@ -220,6 +224,84 @@ def test_stage_layers_once_match_separate_rows_with_native_wire_padding(implemen
         assert torch.equal(frontier.hidden_states, expected_p)
     else:
         assert runner.layered_prefill_state.get("p") is None
+
+
+@pytest.mark.parametrize("last", [False, True])
+@pytest.mark.parametrize("order", [["d0", "short", "long", "d1"], ["short", "long", "d0", "d1"]])
+def test_boundary_multi_prefill_slices_frontiers_in_batch_order(implementation, last, order):
+    impl = implementation
+    runner, plan, calls, _ = stage_runner(impl, last)
+    plan.boundary_mode = "isolated"
+    plan.cohort_id = 19
+    plan.prefill_req_ids = ["long", "short"]
+    plan.query_tokens = {"long": 5, "short": 2}
+    plan.is_final_chunk = False
+    plan.sampling_req_ids = ("long",)
+    runner._layered_next_group_owner = lambda _: 0
+    data = impl.base["prepared"](order, p_tokens=plan.query_tokens, pad_to=2)
+    restored_ids = []
+
+    def restore(*args, **kwargs):
+        restored_ids.extend(kwargs["req_ids"])
+        return (
+            kwargs["req_ids"],
+            (torch.arange(7).float()[:, None], None) if last else None,
+            None,
+            None,
+            "frontier" if last else "embed",
+        )
+
+    runner._prepare_layered_p_activation = restore
+    incoming = impl.IntermediateTensors({"hidden_states": torch.full((8, 1), 2.0)}) if last else None
+    decode, d_out, p_out = impl.LayeredV2PPStageForward(runner).forward_stage(data, plan, incoming, None, 8)
+    assert restored_ids == ["short", "long"]
+    assert calls == list(range(plan.group_start, plan.group_end))
+    assert decode.input_batch.req_ids == ["d0", "d1"]
+    assert p_out[0].shape == (8, 1) and not p_out[0][7:].any()
+    assert not d_out[0][2:].any()
+    if last:
+        assert runner.layered_prefill_state.get("short") is None
+        assert runner.layered_prefill_state.get("long") is None
+    else:
+        short = runner.layered_prefill_state.get("short")
+        long = runner.layered_prefill_state.get("long")
+        assert (short.query_len, long.query_len) == (2, 5)
+        assert short.cohort_id == long.cohort_id == 19
+        torch.testing.assert_close(short.hidden_states, p_out[0][:2])
+        torch.testing.assert_close(long.hidden_states, p_out[0][2:7])
+        saved = long.hidden_states.clone()
+        p_out[0].zero_()
+        torch.testing.assert_close(long.hidden_states, saved)
+
+
+def test_boundary_mixed_chunk_sampling_uses_sorted_p_batch(implementation):
+    impl = implementation
+    runner, plan, _, _ = stage_runner(impl, True)
+    plan.boundary_mode = "tail"
+    plan.cohort_id = 23
+    plan.prefill_req_ids = ["long", "short"]
+    plan.query_tokens = {"long": 5, "short": 2}
+    plan.is_final_chunk = False
+    plan.sampling_req_ids = ("long",)
+    def prepare(schedule, **kw):
+        order = impl.sort_batch_req_ids(schedule.num_scheduled_tokens, 1)
+        return impl.base["prepared"](order, p_tokens=plan.query_tokens, pad_to=2)
+
+    runner._prepare_layered_batch = prepare
+    runner._prepare_layered_p_activation = lambda *a, **kw: (
+        kw["req_ids"],
+        (torch.ones(7, 1), None),
+        None,
+        None,
+        "frontier",
+    )
+    schedule = NS(num_scheduled_tokens={"long": 5, "d0": 1, "short": 2}, finished_req_ids=set())
+    incoming = impl.IntermediateTensors({"hidden_states": torch.ones(8, 1)})
+    impl.LayeredV2PPStageForward(runner).execute(schedule, plan, ["d0"], incoming, None)
+    state = runner.execute_model_state
+    assert state.sample_p and not plan.is_final_chunk
+    assert state.p_state.input_batch.req_ids == ["short", "long"]
+    assert state.p_state.hidden_states.shape == (8, 1)
 
 
 @pytest.mark.parametrize("last", [False, True])

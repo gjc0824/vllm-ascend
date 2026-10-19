@@ -100,7 +100,7 @@ class LayeredV2PPStageForward:
         batch = prepared.input_batch
         d_count = decode.input_batch.num_tokens
         p_count = p_end - p_start
-        p_id = plan.prefill_req_ids[0]
+        p_ids = [req_id for req_id in batch.req_ids[: batch.num_reqs] if req_id in plan.prefill_req_ids]
 
         if runner.is_first_pp_rank:
             d_state = adapter._prepare_initial_state(
@@ -134,7 +134,7 @@ class LayeredV2PPStageForward:
             )
         _, frontier, embeds, intermediate, source = runner._prepare_layered_p_activation(
             plan,
-            req_ids=[p_id],
+            req_ids=p_ids,
             num_tokens_padded=p_count,
             inputs_embeds=None,
             intermediate_tensors=p_intermediate,
@@ -244,14 +244,20 @@ class LayeredV2PPStageForward:
                     else views.buffers.select(("pp_d_wire", index), value, range(d_count), wire_tokens)
                     for index, value in enumerate(d_output)
                 )
-        if plan.is_final_group:
-            runner.layered_prefill_state.clear(p_id)
-        elif not getattr(plan, "boundary_mode", None) or runner._layered_next_group_owner(plan) == (
-            0 if runner.is_first_pp_rank else 1
-        ):
-            views.save_frontier(p_id, plan, tuple(None if x is None else x[:p_count] for x in p_output))
-        else:
-            runner.layered_prefill_state.clear(p_id)
+        retain = not plan.is_final_group and (
+            not getattr(plan, "boundary_mode", None)
+            or runner._layered_next_group_owner(plan) == (0 if runner.is_first_pp_rank else 1)
+        )
+        offset = 0
+        for p_id in p_ids:
+            count = plan.query_tokens[p_id]
+            if retain:
+                views.save_frontier(
+                    p_id, plan, tuple(None if x is None else x[offset : offset + count] for x in p_output)
+                )
+            else:
+                runner.layered_prefill_state.clear(p_id)
+            offset += count
         runner._synchronize_layered_compute()
         return decode, d_output, p_output
 
@@ -318,6 +324,9 @@ class LayeredV2PPStageForward:
             )
             with runner._layered_p_buffers():
                 p_prepared = runner._prepare_layered_batch(p_schedule, build_attention_metadata=False)
+            mixed_p_order = [req_id for req_id in prepared.input_batch.req_ids if req_id in plan.prefill_req_ids]
+            if list(p_prepared.input_batch.req_ids) != mixed_p_order:
+                raise RuntimeError("PP Prefill sampling order disagrees with activation order")
             p_state = ExecuteModelState(
                 input_batch=p_prepared.input_batch,
                 attn_metadata=p_prepared.attn_metadata,
@@ -328,7 +337,7 @@ class LayeredV2PPStageForward:
             )
         else:
             p_state = ExecuteModelState(
-                input_batch=SimpleNamespace(req_ids=list(plan.prefill_req_ids), num_reqs=1),
+                input_batch=SimpleNamespace(req_ids=list(plan.prefill_req_ids), num_reqs=len(plan.prefill_req_ids)),
                 attn_metadata=None,
                 slot_mappings_by_layer=None,
                 hidden_states=None,

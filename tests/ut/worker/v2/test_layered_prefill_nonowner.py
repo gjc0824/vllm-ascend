@@ -571,6 +571,23 @@ def test_internal_fence_waits_for_async_activation_before_completing_lifecycle(i
     assert not runner.layered_prefill_state.rows
 
 
+def test_boundary_internal_fence_preserves_all_unequal_prefill_rows(impl):
+    runner, schedule, plan, received, _ = setup_case(1, num_groups=16, group_id=6)
+    enable_group0_compaction(runner)
+    plan.boundary_mode = "head"
+    plan.prefill_req_ids = ("p", "partial")
+    plan.query_tokens = {"p": 7, "partial": 1}
+    schedule.num_scheduled_tokens = dict(plan.query_tokens)
+    schedule.total_num_scheduled_tokens = 8
+    received.tensors = {key: value[:1] for key, value in received.tensors.items()}
+    assert impl.can_compact_internal_prefill_payload(runner, plan)
+    state, output = impl.run_internal_prefill_fence(runner, schedule, plan, received)
+    assert state.input_batch.req_ids == ["p", "partial"]
+    assert state.input_batch.num_reqs == 2
+    assert output.hidden_states.shape[0] == 0
+    assert not runner.layered_prefill_state.rows
+
+
 @pytest.mark.parametrize(
     "blocked",
     [

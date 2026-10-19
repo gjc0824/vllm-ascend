@@ -54,8 +54,11 @@ def can_compact_internal_prefill_payload(runner, plan):
         and 0 <= getattr(plan, "group_start", -1) < getattr(plan, "group_end", 0)
         and not plan.is_final_group
         and not plan.is_sampling_step
-        and len(plan.prefill_req_ids) == 1
-        and plan.query_tokens[plan.prefill_req_ids[0]] > (0 if getattr(plan, "boundary_mode", None) else 1)
+        and (len(plan.prefill_req_ids) == 1 or bool(getattr(plan, "boundary_mode", None)))
+        and all(
+            plan.query_tokens[req_id] > (0 if getattr(plan, "boundary_mode", None) else 1)
+            for req_id in plan.prefill_req_ids
+        )
         and callable(owner)
         and callable(next_owner)
         and owner(plan) == 0
@@ -67,9 +70,11 @@ def run_internal_prefill_fence(runner, scheduler_output, plan, intermediate_tens
     """Wait for a one-row P fence, discard its value, and preserve lifecycle."""
     if not can_compact_internal_prefill_payload(runner, plan) or runner.is_first_pp_rank:
         return None
-    req_id = plan.prefill_req_ids[0]
-    query = plan.query_tokens[req_id]
-    if scheduler_output.num_scheduled_tokens != {req_id: query} or scheduler_output.total_num_scheduled_tokens != query:
+    req_ids = list(plan.prefill_req_ids)
+    queries = {req_id: plan.query_tokens[req_id] for req_id in req_ids}
+    if scheduler_output.num_scheduled_tokens != queries or scheduler_output.total_num_scheduled_tokens != sum(
+        queries.values()
+    ):
         raise RuntimeError("Internal P fence schedule disagrees with its plan")
     if intermediate_tensors is None:
         raise RuntimeError("Internal P fence requires one-row wire metadata")
@@ -80,7 +85,7 @@ def run_internal_prefill_fence(runner, scheduler_output, plan, intermediate_tens
     runner._record_layered_activation(plan, "internal_fence")
     return (
         ExecuteModelState(
-            input_batch=SimpleNamespace(req_ids=[req_id], num_reqs=1),
+            input_batch=SimpleNamespace(req_ids=req_ids, num_reqs=len(req_ids)),
             attn_metadata=None,
             slot_mappings_by_layer=None,
             hidden_states=None,
