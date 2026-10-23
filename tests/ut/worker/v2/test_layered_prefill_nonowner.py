@@ -447,6 +447,7 @@ def enable_group0_compaction(runner):
 
 
 @pytest.mark.parametrize("d_rows", [0, 8])
+@pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("local_fastpath", [False, True])
 @pytest.mark.parametrize("single_forward", [False, True])
 @pytest.mark.parametrize(
@@ -454,7 +455,7 @@ def enable_group0_compaction(runner):
     [(count, group) for count, ranges in PP2_RANGES.items() for group, (_, end) in enumerate(ranges) if end < 22],
 )
 def test_group0_one_row_fence_pairs_sender_and_receiver_without_local_capability_gate(
-    impl, d_rows, local_fastpath, single_forward, num_groups, group_id
+    impl, d_rows, async_scheduling, local_fastpath, single_forward, num_groups, group_id
 ):
     class Intermediate:
         def __init__(self, tensors):
@@ -485,6 +486,7 @@ def test_group0_one_row_fence_pairs_sender_and_receiver_without_local_capability
     receiver, schedule, _, _, _ = setup_case(1, num_groups=num_groups, group_id=group_id)
     for runner in (sender, receiver):
         enable_group0_compaction(runner)
+        runner.scheduler_config.async_scheduling = async_scheduling
         runner.ascend_config.scheduler_config.layered_prefill_config.single_forward = single_forward
         runner._single_forward = single_forward
     receiver.eligible = False  # Rank-local adapter/attention fallback cannot alter the wire.
@@ -549,9 +551,11 @@ def test_every_group_transports_only_the_frontier_needed_by_next_stage(impl, num
         assert impl.can_compact_internal_prefill_payload(runner, plan) == (expected_rows == 1)
 
 
-def test_internal_fence_waits_for_async_activation_before_completing_lifecycle(impl):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_internal_fence_waits_for_async_activation_before_completing_lifecycle(impl, async_scheduling):
     runner, schedule, plan, received, _ = setup_case(1, num_groups=16, group_id=6)
     enable_group0_compaction(runner)
+    runner.scheduler_config.async_scheduling = async_scheduling
     waited = []
 
     class AsyncIntermediate:
@@ -569,6 +573,15 @@ def test_internal_fence_waits_for_async_activation_before_completing_lifecycle(i
     assert state.input_batch.req_ids == ["p"]
     assert output.hidden_states.shape[0] == 0
     assert not runner.layered_prefill_state.rows
+
+
+def test_async_compaction_ignores_disabled_relay_shortcut_on_both_ranks(impl):
+    for rank in (0, 1):
+        runner, _, plan, _, _ = setup_case(rank, num_groups=4, group_id=0)
+        enable_group0_compaction(runner)
+        runner.scheduler_config.async_scheduling = True
+        runner.ascend_config.scheduler_config.layered_prefill_extensions = NS(skip_relay_stages=True)
+        assert impl.can_compact_internal_prefill_payload(runner, plan)
 
 
 def test_boundary_internal_fence_preserves_all_unequal_prefill_rows(impl):
@@ -594,7 +607,6 @@ def test_boundary_internal_fence_preserves_all_unequal_prefill_rows(impl):
         "disabled",
         "fuse",
         "same",
-        "async",
         "pp",
         "dp",
         "dbo",
@@ -619,8 +631,6 @@ def test_group0_compaction_shared_gate_falls_back_on_both_ranks(impl, blocked):
                 "fuse_mixed_batch" if blocked == "fuse" else "same_layer_batch",
                 True,
             )
-        elif blocked == "async":
-            runner.scheduler_config.async_scheduling = True
         elif blocked in ("pp", "dp"):
             setattr(
                 runner.parallel_config,

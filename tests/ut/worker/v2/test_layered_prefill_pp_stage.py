@@ -351,7 +351,6 @@ def test_stage_execute_preserves_d_p_sampling_states_and_wire(implementation, la
         "prefill_context_parallel_size",
         "decode_context_parallel_size",
         "pipeline_parallel_size",
-        "async_scheduling",
         "speculative_config",
         "_fuse_mixed_batch",
         "_same_layer_batch",
@@ -374,8 +373,6 @@ def test_stage_unsupported_envelopes_fall_back(implementation, field):
     assert supported()
     if field.endswith("parallel_size"):
         setattr(runner.parallel_config, field, 4)
-    elif field == "async_scheduling":
-        runner.scheduler_config.async_scheduling = True
     elif field == "num_groups":
         plan.num_groups = 1
     elif field == "group_start":
@@ -389,6 +386,15 @@ def test_stage_unsupported_envelopes_fall_back(implementation, field):
     else:
         setattr(runner, field, field != "_single_forward")
     assert not supported()
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_async_scheduling_keeps_pp_mixed_stage_available(implementation, last):
+    runner, plan, _, _ = stage_runner(implementation, last)
+    runner.use_async_scheduling = True
+    runner.scheduler_config.async_scheduling = True
+    schedule = NS(num_scheduled_tokens={"d0": 1, "p": 3})
+    assert implementation.LayeredV2PPStageForward.supported(runner, plan, ["d0"], schedule)
 
 
 def test_stage_rejects_short_native_decode_activation(implementation):

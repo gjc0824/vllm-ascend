@@ -367,6 +367,7 @@ class TestNPUWorker(TestBase):
         with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
             worker = NPUWorker()
         worker.sleep_wakeup_manager = MagicMock()
+        worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
 
         worker.sleep()
 
@@ -1639,6 +1640,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.model_runner = MagicMock()
         worker.model_runner.model = MagicMock()
         worker.model_config = MagicMock()
+        worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
         return worker
 
     def test_check_engine_raises_when_unconfigured(self):

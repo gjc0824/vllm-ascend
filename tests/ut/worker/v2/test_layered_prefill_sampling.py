@@ -2,10 +2,12 @@
 
 from unittest.mock import MagicMock
 
+import numpy as np
+import pytest
 import torch
 from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 
 from vllm_ascend.worker.v2.layered_prefill import (
@@ -68,6 +70,61 @@ def test_merge_intermediate_p_emits_empty_sampled_tokens():
         [d_out, p_out],
     )
     assert merged.sampled_token_ids == [[7], []]
+
+
+@pytest.mark.parametrize("sample_p", [False, True])
+@pytest.mark.parametrize("prefill_first", [False, True])
+def test_merge_logprobs_aligns_final_and_unsampled_prefill(sample_p, prefill_first):
+    d_out = ModelRunnerOutput(
+        req_ids=["d1", "d0"],
+        req_id_to_index={"d1": 0, "d0": 1},
+        sampled_token_ids=[[11], [12]],
+        logprobs=LogprobsLists(
+            np.array([[11, 21], [12, 22]]),
+            np.array([[-0.1, -1.1], [-0.2, -1.2]], dtype=np.float32),
+            np.array([1, 2]),
+        ),
+    )
+    p_out = ModelRunnerOutput(
+        req_ids=["p"],
+        req_id_to_index={"p": 0},
+        sampled_token_ids=[[13]] if sample_p else [[]],
+        logprobs=(
+            LogprobsLists(np.array([[13, 23, 33]]), np.array([[-0.3, -1.3, -2.3]]), np.array([3])) if sample_p else None
+        ),
+    )
+    order = ["p", "d0", "d1"] if prefill_first else ["d0", "d1", "p"]
+    merged = NPUModelRunner._merge_layered_v2_outputs(_scheduler_output(dict.fromkeys(order, 1)), [d_out, p_out])
+    assert merged.req_ids == order
+    expected = {"d0": (12, -0.2, 2), "d1": (11, -0.1, 1), "p": (13, -0.3, 3)}
+    for row, req_id in enumerate(order):
+        count = 0 if req_id == "p" and not sample_p else 1
+        result = merged.logprobs.slice_request(row, count)
+        assert result.logprobs.shape[0] == count
+        if count:
+            token, value, rank = expected[req_id]
+            assert result.logprob_token_ids[0, 0] == token
+            assert result.logprobs[0, 0] == pytest.approx(value)
+            assert result.sampled_token_ranks[0] == rank
+    # A narrower Decode top-k must not inherit Prefill's extra candidates.
+    if sample_p:
+        result = merged.logprobs.slice_request(order.index("d0"), 1)
+        assert np.isneginf(result.logprobs[0, 2])
+
+
+def test_merge_logprobs_keeps_offsets_when_one_sample_does_not_request_logprobs():
+    outputs = [
+        ModelRunnerOutput(req_ids=["d"], req_id_to_index={"d": 0}, sampled_token_ids=[[7]]),
+        ModelRunnerOutput(
+            req_ids=["p"],
+            req_id_to_index={"p": 0},
+            sampled_token_ids=[[8]],
+            logprobs=LogprobsLists(np.array([[8]]), np.array([[-0.5]]), np.array([1])),
+        ),
+    ]
+    merged = NPUModelRunner._merge_layered_v2_outputs(_scheduler_output({"d": 1, "p": 4}), outputs)
+    assert merged.logprobs.cu_num_generated_tokens == [0, 1, 2]
+    assert merged.logprobs.slice_request(1, 1).logprob_token_ids.tolist() == [[8]]
 
 
 def test_frontier_store_clears_finished_and_preempted():

@@ -85,13 +85,12 @@ class AscendConfig:
                 or getattr(parallel, "decode_context_parallel_size", 1) != 1
                 or getattr(parallel, "prefill_context_parallel_size", 1) != 1
                 or vllm_config.cache_config.enable_prefix_caching
-                or vllm_config.scheduler_config.async_scheduling
                 or vllm_config.speculative_config is not None
                 or vllm_config.kv_transfer_config is not None
             ):
                 raise ValueError(
                     "layered boundary_policy requires MRV2, PP=2, DP=1, "
-                    "no prefix caching, async scheduling, speculation, KV connector, DBO or context parallelism"
+                    "no prefix caching, speculation, KV connector, DBO or context parallelism"
                 )
         if self.scheduler_config.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens

@@ -365,7 +365,6 @@ def supported_runner():
         "decode_context_parallel_size",
         "speculative_config",
         "lora_config",
-        "async_scheduling",
     ],
 )
 def test_single_forward_and_separate_compilation_reject_unsupported_envelopes(implementation, field):
@@ -373,8 +372,6 @@ def test_single_forward_and_separate_compilation_reject_unsupported_envelopes(im
     assert implementation.LayeredV2SingleForward.supported(runner)
     if field.endswith("parallel_size"):
         setattr(runner.parallel_config, field, 2)
-    elif field == "async_scheduling":
-        runner.scheduler_config.async_scheduling = True
     else:
         setattr(runner, field, object())
     assert not implementation.LayeredV2SingleForward.supported(runner)
@@ -392,6 +389,29 @@ def test_single_forward_and_separate_compilation_reject_unsupported_envelopes(im
         compile(ast.Expression(choice), str(source), "eval"),
         dict(self=runner, LayeredV2SingleForward=implementation.LayeredV2SingleForward),
     ) == (field == "pipeline_parallel_size")
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_async_scheduling_keeps_compiled_layer_groups_available(implementation, pp_size):
+    runner = supported_runner()
+    runner.use_async_scheduling = True
+    runner.scheduler_config.async_scheduling = True
+    runner.parallel_config.pipeline_parallel_size = pp_size
+    assert implementation.LayeredV2SingleForward.supported(runner, allow_pipeline_parallel=True)
+
+
+def test_compact_decode_host_lengths_survive_next_step_preparation(implementation):
+    execution, _ = executor(implementation)
+    first = prepared(["d", "p"])
+    decode, _, _ = execution.prepare_decode(first, plan(0))
+    lengths = decode.input_batch.seq_lens_np.copy()
+    upper_bound = decode.input_batch.seq_lens_cpu_upper_bound.clone()
+    second = prepared(["d", "p"])
+    second.input_batch.seq_lens_np[:] = 99
+    second.input_batch.seq_lens_cpu_upper_bound.fill_(99)
+    execution.prepare_decode(second, plan(0))
+    np.testing.assert_array_equal(decode.input_batch.seq_lens_np, lengths)
+    torch.testing.assert_close(decode.input_batch.seq_lens_cpu_upper_bound, upper_bound)
 
 
 @pytest.mark.parametrize("group", [0, 1, 2])
@@ -461,7 +481,7 @@ def test_single_forward_sampling_has_one_connector_pair(implementation, has_deco
         ExecuteModelState=NS,
         LayeredV2ExecuteModelState=NS,
         ModelRunnerOutput=Output,
-        AsyncOutput=type("Async", (), {}),
+        AsyncModelRunnerOutput=type("Async", (), {}),
         EMPTY_MODEL_RUNNER_OUTPUT=Output(),
     )
     module = ast.fix_missing_locations(ast.Module(body=[runner_class], type_ignores=[]))

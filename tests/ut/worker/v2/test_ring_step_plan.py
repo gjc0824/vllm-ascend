@@ -1,9 +1,11 @@
 """RingStepPlan: participation is shared; the local mask only applies rows."""
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -105,6 +107,56 @@ def test_broadcast_enqueues_without_reading_sampled_gpu_values():
     assert len(rank.entered) == 1
     assert rank.ring_ledger[0].participated
     assert rank.ring_ledger[0].apply_count == -1
+
+
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_skipped_prefill_steps_preserve_async_ring_delay_and_cancelled_indices(pp_size):
+    """No-sample P steps occupy time slots; cancellation only filters writes."""
+    rank = PPHandler.__new__(PPHandler)
+    rank.queue = deque([None] * pp_size)
+    rank.req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    rank.device = torch.device("cpu")
+    waits = []
+    rank.main_stream = SimpleNamespace(wait_event=waits.append)
+    assert rank.get_prev_sampled_outputs() is None
+    event = object()
+    rank.queue[-1] = SimpleNamespace(
+        event=event,
+        sampled_tokens=torch.tensor([[11], [22]]),
+        num_sampled=torch.ones(2, dtype=torch.int32),
+        num_rejected=torch.zeros(2, dtype=torch.int32),
+        idx_mapping=torch.tensor([1, 2], dtype=torch.int32),
+        idx_mapping_np=np.array([1, 2], dtype=np.int32),
+        need_sampled_mask=np.array([True, True]),
+        gen_at_receive_np=np.array([0, 0], dtype=np.int32),
+    )
+    skip = _plan([], sampling=False, computed=[], prefill=[], scheduled=[], max_seq=[])
+    rank.bind_plan(skip)
+    rank.ring_ledger = []
+    for _ in range(pp_size - 1):
+        assert rank.get_prev_sampled_outputs() is None
+        rank.record_ring_skip("receive")
+    rank.on_req_idx_freed(2)
+    assert waits == []
+    with patch(
+        "vllm.v1.worker.gpu.pp_utils.async_copy_to_gpu", side_effect=lambda data, device: torch.from_numpy(data)
+    ):
+        output = rank.get_prev_sampled_outputs()
+    assert output["sampled_tokens"].tolist() == [[11], [22]]
+    assert output["idx_mapping"].tolist() == [1, -1]
+    assert waits == [event]
+    assert len(rank.queue) == pp_size
+    assert rank.get_prev_sampled_outputs() is None
+
+
+def test_empty_sender_payload_uses_collective_device():
+    plan = _plan(["p"], sampling=True, computed=[8], prefill=[8], scheduled=[1], max_seq=[64])
+    rank = _Rank(plan, last=True)
+    rank.device = torch.device("meta")
+    LayeredPPHandlerCapture(rank).flush(sample_p=True, p_req_ids={"p"}, plan=plan)
+    _, tokens, sampled, rejected = rank.entered[0]
+    assert tokens.device == sampled.device == rejected.device == rank.device
+    assert tokens.shape == (1, 1)
 
 
 def _output(order, scheduled, *, computed, layered=None):

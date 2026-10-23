@@ -39,9 +39,8 @@ from vllm.v1.core.layered_prefill import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
-from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, get_uniform_token_count
@@ -57,6 +56,9 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
     sort_batch_req_ids,
 )
+
+from vllm_ascend import envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
@@ -73,9 +75,6 @@ from vllm_ascend.utils import (
     set_potential_max_tokens,
     vllm_version_is,
 )
-
-from vllm_ascend import envs as envs_ascend
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.layered_prefill_single_forward import LayeredPrefillGroupExecutor
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
@@ -87,12 +86,13 @@ from vllm_ascend.worker.v2.layered_prefill import (
     concat_req_frontiers,
     detach_execute_model_state,
     empty_layered_prefill_counters,
+    merge_layered_logprobs,
     pad_activation_rows,
     split_d_p_req_ids,
     store_req_frontiers,
     subset_scheduler_output,
 )
-from vllm_ascend.worker.v2.layered_prefill_async import LayeredPrefillAsyncOutput
+from vllm_ascend.worker.v2.layered_prefill_async import LayeredPrefillAsyncOutput, LayeredPrefillMergedAsyncOutput
 from vllm_ascend.worker.v2.layered_prefill_nonowner import (
     can_compact_internal_prefill_payload,
     run_internal_prefill_fence,
@@ -137,6 +137,8 @@ class NPUModelRunner(GPUModelRunner):
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        # MRV2 does not expose the MRV1 async-scheduling convenience flag.
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.use_aclgraph = (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
@@ -192,6 +194,8 @@ class NPUModelRunner(GPUModelRunner):
         # must not share storage.  See layered_prefill_v2_migration_plan.md §3.1.
         layered_cfg = self.ascend_config.scheduler_config.layered_prefill_config
         self._layered_prefill_enabled = bool(layered_cfg.enabled)
+        if self._layered_prefill_enabled and self.use_async_scheduling:
+            self._layered_async_compute_enabled()
         self._boundary_prefill_enabled = self._layered_prefill_enabled and (
             getattr(layered_cfg, "boundary_policy", "off") == "pp_transition"
         )
@@ -452,7 +456,10 @@ class NPUModelRunner(GPUModelRunner):
             # to avoid double update_requests, so sync explicitly here.
             scheduled_ids = list(scheduler_output.num_scheduled_tokens)
             self._sync_ascend_num_computed_tokens_cpu(scheduled_ids)
-            self._sync_gpu_num_computed_tokens(scheduled_ids)
+            # Decode already advances its device cursor through the native
+            # postprocess path. Only P needs the scheduler cursor while its
+            # non-sampling layer groups skip postprocess.
+            self._sync_gpu_num_computed_tokens(p_req_ids if self.use_async_scheduling else scheduled_ids)
 
             if single_forward:
                 return self._execute_layered_single_forward(scheduler_output, layered_plan, p_req_ids)
@@ -574,7 +581,7 @@ class NPUModelRunner(GPUModelRunner):
             self._layered_skip_pp_decode_update = False
 
     def _synchronize_layered_compute(self) -> None:
-        if self.parallel_config.pipeline_parallel_size <= 1:
+        if self.parallel_config.pipeline_parallel_size <= 1 and not self._layered_async_compute_enabled():
             torch.npu.synchronize()
             return
         # DSA attention and MoE join auxiliary work onto the caller stream.
@@ -589,6 +596,21 @@ class NPUModelRunner(GPUModelRunner):
             compute_stream.synchronize()
 
     def _layered_async_compute_enabled(self) -> bool:
+        async_scheduling = bool(
+            getattr(self, "use_async_scheduling", False)
+            or getattr(getattr(self, "scheduler_config", None), "async_scheduling", False)
+        )
+        if async_scheduling:
+            from vllm_ascend.patch.worker.patch_v2.patch_uva import is_uva_available
+
+            # CPU writes to mapped host memory are not ordered by device events.
+            # The ordinary staged H2D path owns a snapshot of each input instead.
+            if is_uva_available():
+                raise ValueError(
+                    "Layered prefill with async scheduling requires staged H2D buffers; "
+                    "remove pinned_mem_register:True from PYTORCH_NPU_ALLOC_CONF"
+                )
+            return True
         # Unsampled P retires through a completion event, including empty
         # local layer ranges. The separate relay bypass has no such event.
         if not envs_ascend.VLLM_ASCEND_LAYERED_ASYNC_COMPUTE or self.parallel_config.pipeline_parallel_size != 2:
@@ -618,7 +640,7 @@ class NPUModelRunner(GPUModelRunner):
             and state.d_state is None
             and not state.sample_p
         ):
-            # D/final-P already drains AsyncOutput in _sample_layered_v2.
+            # D/final-P carries a deferred output completion event.
             # Unsampled P must provide the same EngineCore completion boundary
             # or its empty result would retire KV/pinned-buffer ownership early.
             event = torch.npu.Event()
@@ -887,6 +909,10 @@ class NPUModelRunner(GPUModelRunner):
             return None
         if not self._skip_relay_stages:
             return None
+        # Async steps need the common lifecycle, including the ring skip slot
+        # and the final-rank device completion event.
+        if self.use_async_scheduling:
+            return None
         if self.parallel_config.pipeline_parallel_size <= 1:
             return None
         if self.dp_size > 1:
@@ -1045,6 +1071,8 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(value, int) and not isinstance(value, bool):
             row_count = value
         elif isinstance(value, torch.Tensor) and value.numel() == 1:
+            if value.device.type != "cpu":
+                raise RuntimeError(f"Layered PP metadata {key} must remain on the host")
             row_count = int(value.item())
         else:
             raise RuntimeError(f"Layered PP metadata {key} must be an integer or scalar tensor")
@@ -1574,7 +1602,7 @@ class NPUModelRunner(GPUModelRunner):
         return super().sample_tokens(grammar_output)
 
     def _sample_layered_v2(self, grammar_output, state: LayeredV2ExecuteModelState):
-        outputs: list[ModelRunnerOutput] = []
+        outputs: list[ModelRunnerOutput | AsyncModelRunnerOutput] = []
         p_req_ids = list(state.p_state.input_batch.req_ids) if state.p_state is not None else []
         with self._layered_pp_handler_capture() as capture:
             try:
@@ -1587,11 +1615,9 @@ class NPUModelRunner(GPUModelRunner):
                     ):
                         active_grammar = None
                     output = super().sample_tokens(active_grammar)
-                    if isinstance(output, AsyncOutput):
-                        output = output.get_output()
                     if output is None:
                         output = EMPTY_MODEL_RUNNER_OUTPUT
-                    if not isinstance(output, ModelRunnerOutput):
+                    if not isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
                         raise RuntimeError("Layered Prefill D sampling returned PP tensors")
                     outputs.append(output)
 
@@ -1613,11 +1639,9 @@ class NPUModelRunner(GPUModelRunner):
                         ):
                             active_grammar = None
                         output = super().sample_tokens(active_grammar)
-                        if isinstance(output, AsyncOutput):
-                            output = output.get_output()
                         if output is None:
                             output = EMPTY_MODEL_RUNNER_OUTPUT
-                        if not isinstance(output, ModelRunnerOutput):
+                        if not isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
                             raise RuntimeError("Layered Prefill P sampling returned PP tensors")
                         outputs.append(output)
                     else:
@@ -1651,6 +1675,21 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 self._record_layered_pp_slot(slot)
 
+        if any(isinstance(output, AsyncModelRunnerOutput) for output in outputs):
+            # D's copy event can precede unsampled P work. Retire the complete
+            # step only after both the outputs and the final compute are ready.
+            event = torch.npu.Event()
+            event.record(torch.npu.current_stream())
+            return LayeredPrefillMergedAsyncOutput(
+                outputs,
+                lambda resolved: (
+                    resolved[0]
+                    if len(resolved) == 1
+                    else self._merge_layered_v2_outputs(state.scheduler_output, resolved)
+                ),
+                event=event,
+                keepalive=state,
+            )
         if not outputs:
             output = EMPTY_MODEL_RUNNER_OUTPUT
         elif len(outputs) == 1:
@@ -1683,7 +1722,7 @@ class NPUModelRunner(GPUModelRunner):
             req_ids=req_ids,
             req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
             sampled_token_ids=sampled_token_ids,
-            logprobs=next((o.logprobs for o in outputs if o.logprobs is not None), None),
+            logprobs=merge_layered_logprobs(req_ids, by_req_id),
             prompt_logprobs_dict=prompt_logprobs,
             pooler_output=[],
             kv_connector_output=next(
@@ -1986,7 +2025,9 @@ class NPUModelRunner(GPUModelRunner):
                 # TODO: only populated for R-SWA (not supported yet).
                 prompt_lens=prompt_lens,
                 # extra attributes for ascend npus.
-                seq_lens_np=self.input_buffers.seq_lens_np,
+                # Attention metadata retains a CPU tensor view of these values.
+                # A queued step must not observe the next preparation's writes.
+                seq_lens_np=self.input_buffers.seq_lens_np.copy(),
                 attn_state=attn_state,
             )
 
@@ -2208,7 +2249,8 @@ class NPUModelRunner(GPUModelRunner):
                 # TODO: only populated for R-SWA (not supported yet).
                 prompt_lens=prompt_lens,
                 # extra attributes for ascend npus.
-                seq_lens_np=self.input_buffers.seq_lens_np,
+                # Match the per-step host ownership of the 0.27.1 API above.
+                seq_lens_np=self.input_buffers.seq_lens_np.copy(),
                 attn_state=attn_state,
             )
 

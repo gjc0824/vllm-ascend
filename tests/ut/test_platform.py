@@ -310,11 +310,19 @@ class TestNPUPlatform(TestBase):
 
     def test_layered_prefill_rejects_async_scheduling_with_pp_gt_one(self):
         vllm_config, ascend_config = self._make_layered_prefill_configs()
+        vllm_config.use_v2_model_runner = False
         vllm_config.scheduler_config.async_scheduling = True
         vllm_config.parallel_config.pipeline_parallel_size = 2
 
         with pytest.raises(ValueError, match="async_scheduling with pipeline_parallel_size > 1"):
             _check_ascend_config(vllm_config, ascend_config)
+
+    def test_layered_prefill_v2_accepts_async_scheduling_with_pp(self):
+        vllm_config, ascend_config = self._make_layered_prefill_configs()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.scheduler_config.async_scheduling = True
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        _check_ascend_config(vllm_config, ascend_config)
 
     def test_layered_prefill_accepts_deepseek_v4_mtp_on_pp1(self):
         vllm_config = self.mock_vllm_config()

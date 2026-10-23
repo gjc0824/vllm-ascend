@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import pickle
 from collections import deque, namedtuple
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -55,6 +56,10 @@ def implementation():
         "dataclass": dataclass,
         "pickle": pickle,
         "TensorMetadata": TensorMetadata,
+        "deque": deque,
+        "Future": Future,
+        "ThreadPoolExecutor": ThreadPoolExecutor,
+        "_MAX_PENDING_SENDS_PER_RANK": 2,
     }
     load(CORE / "sequence.py", ns, classes=("IntermediateTensors",))
     load(
@@ -65,10 +70,22 @@ def implementation():
     load(
         CORE / "distributed/parallel_state.py",
         ns,
+        classes=("_SendHandle",),
+        functions=("_wait_for_send",),
+    )
+    load(
+        CORE / "distributed/parallel_state.py",
+        ns,
         classes=("GroupCoordinator",),
         functions=("_split_tensor_dict",),
         methods={
             "send_object",
+            "_prepare_isend",
+            "_submit_isend",
+            "_reap_completed_isends",
+            "drain_isends",
+            "shutdown_isends",
+            "_post_object_send",
             "recv_object",
             "isend_tensor_dict",
             "irecv_tensor_dict",
@@ -106,8 +123,7 @@ class Handle:
 
 class Wire:
     def __init__(self, monkeypatch):
-        self.blocking = deque()
-        self.async_queue = deque()
+        self.queue = deque()
         self.calls = []
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "send", self.send)
@@ -117,21 +133,21 @@ class Wire:
 
     def send(self, tensor, *, dst, group):
         self.calls.append(("send", tuple(tensor.shape)))
-        self.blocking.append(tensor.clone())
+        self.queue.append(tensor.clone())
 
     def recv(self, tensor, *, src, group):
         self.calls.append(("recv", tuple(tensor.shape)))
-        tensor.copy_(self.blocking.popleft())
+        tensor.copy_(self.queue.popleft())
         return src
 
     def isend(self, tensor, *, dst, group):
         self.calls.append(("isend", tuple(tensor.shape)))
-        self.async_queue.append(tensor.clone())
+        self.queue.append(tensor.clone())
         return Handle()
 
     def irecv(self, tensor, *, src, group):
         self.calls.append(("irecv", tuple(tensor.shape)))
-        value = self.async_queue.popleft()
+        value = self.queue.popleft()
         return Handle(lambda: tensor.copy_(value))
 
 
@@ -151,6 +167,7 @@ def round_trip(impl, packed, gather=None):
     sent = sender.isend_tensor_dict(packed.tensors, all_gather_group=gather)
     values, received, callbacks = receiver.irecv_tensor_dict(all_gather_group=gather)
     result = impl.AsyncIntermediateTensors(values, received, callbacks)
+    sender.shutdown_isends()
     return result, sent, received
 
 
@@ -217,10 +234,10 @@ def test_int_metadata_roundtrip_with_real_serialization_and_lazy_waits(
     assert clone["layered_pp_d_rows"] == d_rows
     assert clone["hidden_states"].data_ptr() != received["hidden_states"].data_ptr()
     assert recvs[0].waits == 1
-    assert sum(name == "send" for name, _ in wire.calls) == 2
-    assert sum(name == "isend" for name, _ in wire.calls) == 1
+    assert sum(name == "send" for name, _ in wire.calls) == 0
+    assert sum(name == "isend" for name, _ in wire.calls) == 3
     assert not any(shape == () for _, shape in wire.calls)
-    assert not wire.blocking and not wire.async_queue
+    assert not wire.queue
 
 
 def test_two_scalar_transfers_removed_and_legacy_wire_still_accepted(
@@ -233,13 +250,13 @@ def test_two_scalar_transfers_removed_and_legacy_wire_still_accepted(
     packed, legacy = row_metadata_payloads
 
     received, sends, recvs = round_trip(impl, legacy)
-    assert len(sends) == len(recvs) == 4
+    assert len(sends) == 1 and len(recvs) == 4
     _, legacy_p = impl.NPUModelRunner._split_layered_pp_intermediate(received)
     assert sum(name == "isend" and shape == () for name, shape in wire.calls) == 2
 
     wire.calls.clear()
     received, sends, recvs = round_trip(impl, packed)
-    assert len(sends) == len(recvs) == 2
+    assert len(sends) == 1 and len(recvs) == 2
     _, new_p = impl.NPUModelRunner._split_layered_pp_intermediate(received)
     for name in ("hidden_states", "residual"):
         torch.testing.assert_close(new_p[name], legacy_p[name])
@@ -265,12 +282,13 @@ def test_empty_placeholder_has_only_object_metadata_and_relay_preserves_ints(
         with_row_metadata=True,
     )
     received, sends, recvs = round_trip(impl, packed)
-    assert not sends and not recvs
+    assert len(sends) == 1 and not recvs
     assert received["layered_pp_d_rows"] == received["layered_pp_p_rows"] == 0
 
     # A relay sends the same packed object without invoking generic slicing.
     relayed, sends, recvs = round_trip(impl, received)
-    assert not sends and not recvs
+    assert len(sends) == 1 and not recvs
     d, p = impl.NPUModelRunner._split_layered_pp_intermediate(relayed)
     assert d["hidden_states"].shape == p["hidden_states"].shape == (0, 2)
-    assert not any(name in ("isend", "irecv") for name, _ in wire.calls)
+    assert sum(name == "isend" for name, _ in wire.calls) == 4
+    assert not any(name == "irecv" for name, _ in wire.calls)

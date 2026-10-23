@@ -231,7 +231,6 @@ def valid_config():
         ("parallel_config", "decode_context_parallel_size", 2),
         ("parallel_config", "prefill_context_parallel_size", 2),
         ("cache_config", "enable_prefix_caching", True),
-        ("scheduler_config", "async_scheduling", True),
     ],
 )
 def test_boundary_configuration_fails_closed(validate_config, section, key, value):
@@ -241,6 +240,12 @@ def test_boundary_configuration_fails_closed(validate_config, section, key, valu
     with pytest.raises(ValueError, match="requires MRV2"):
         validate_config(config)
     validate_config(config, policy="off")
+
+
+def test_boundary_configuration_accepts_async_scheduling(validate_config):
+    config = valid_config()
+    config.scheduler_config.async_scheduling = True
+    validate_config(config)
 
 
 @pytest.fixture

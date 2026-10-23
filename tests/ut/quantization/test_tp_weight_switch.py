@@ -77,6 +77,70 @@ def test_enable_input_sharded_state_builds_gather_and_repeat_tensors() -> None:
     torch.testing.assert_close(state.repeat_parts["input_scale"].full_tensor, torch.tensor([2.0, 2.0]))
 
 
+def test_tp1_switch_is_identity_without_collective() -> None:
+    layer = SimpleNamespace(
+        input_size=4096,
+        input_size_per_partition=4096,
+        output_size=8192,
+        output_size_per_partition=8192,
+        weight=torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        weight_scale=torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        input_scale=torch.tensor([2.0]),
+    )
+    original = {
+        name: (getattr(layer, name).shape, getattr(layer, name).data_ptr())
+        for name in ("weight", "weight_scale", "input_scale")
+    }
+    method = _TestLinearMethod()
+
+    state = method.enable_tp_weight_switch(layer, tp_size=1, clone_tp_tensors=True)
+
+    assert not state.gather_parts
+    assert not state.repeat_parts
+    assert not state.handles
+    with patch("vllm_ascend.distributed.utils.all_gather_async") as all_gather_async:
+        method.all_gather_tp_weight(state, group=object())
+    all_gather_async.assert_not_called()
+    method.wait_tp_weight_all_gather(state)
+    method.switch_tp_weight(layer, state, use_full_weight=True)
+    for name, (shape, data_ptr) in original.items():
+        assert getattr(layer, name).shape == shape
+        assert getattr(layer, name).data_ptr() == data_ptr
+    method.switch_tp_weight(layer, state, use_full_weight=False)
+    for name, (shape, data_ptr) in original.items():
+        assert getattr(layer, name).shape == shape
+        assert getattr(layer, name).data_ptr() == data_ptr
+
+
+def test_enable_rejects_nonpositive_tp_size() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        _TestLinearMethod().enable_tp_weight_switch(_input_sharded_layer(), tp_size=0)
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        _input_sharded_layer(),
+        _output_sharded_layer(),
+        SimpleNamespace(
+            input_size=8,
+            input_size_per_partition=4,
+            output_size=6,
+            output_size_per_partition=3,
+        ),
+        SimpleNamespace(
+            input_size=None,
+            input_size_per_partition=None,
+            output_size=6,
+            output_size_per_partition=6,
+        ),
+    ],
+)
+def test_tp1_rejects_invalid_dimensions(layer: SimpleNamespace) -> None:
+    with pytest.raises(RuntimeError, match="TP size 1 requires complete, unsharded"):
+        _TestLinearMethod().enable_tp_weight_switch(layer, tp_size=1)
+
+
 def test_enable_output_sharded_state_moves_gather_dim_and_reuses_pool() -> None:
     method = _TestLinearMethod()
     pool: dict[object, torch.Tensor] = {}

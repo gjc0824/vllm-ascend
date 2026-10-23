@@ -192,6 +192,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             )
 
     def _release_hccl_resources(self) -> bool:
+        self.drain_isends()
         destroyed = False
         device_communicator = getattr(self, "device_communicator", None)
         if device_communicator is not None:
@@ -214,6 +215,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
         return destroyed
 
     def destroy(self):
+        self.shutdown_isends()
         if getattr(self, "mq_broadcaster", None) is not None:
             self.mq_broadcaster = None
 

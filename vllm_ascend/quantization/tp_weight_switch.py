@@ -136,6 +136,8 @@ class TPWeightSwitchMixin:
         """Allocate TP/full aliases and buffers for one compatible linear layer."""
         if not self.supports_tp_weight_switch:
             raise RuntimeError(f"{type(self).__name__} does not support TP weight switching.")
+        if tp_size < 1:
+            raise ValueError(f"TP size must be positive, got {tp_size}.")
 
         input_size = getattr(layer, "input_size", None)
         input_size_per_partition = getattr(layer, "input_size_per_partition", None)
@@ -149,6 +151,23 @@ class TPWeightSwitchMixin:
             and output_size_per_partition is not None
             and output_size != output_size_per_partition
         )
+        if tp_size == 1:
+            dimensions = (
+                input_size,
+                input_size_per_partition,
+                output_size,
+                output_size_per_partition,
+            )
+            if any(size is None for size in dimensions) or input_sharded or output_sharded:
+                raise RuntimeError(
+                    "TP weight switching with TP size 1 requires complete, unsharded linear dimensions, "
+                    f"got input_size={input_size}, input_size_per_partition={input_size_per_partition}, "
+                    f"output_size={output_size}, output_size_per_partition={output_size_per_partition}."
+                )
+            # The local tensors are already the full tensors.  Keep an empty
+            # state so callers can use the same gather/wait/switch lifecycle
+            # without allocating buffers or launching a collective.
+            return TPWeightSwitchState()
         if input_sharded == output_sharded:
             raise RuntimeError(
                 "TP weight switching requires a linear layer with exactly one TP-sharded axis, "

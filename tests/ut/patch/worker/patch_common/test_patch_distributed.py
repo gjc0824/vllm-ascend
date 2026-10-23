@@ -143,7 +143,11 @@ def _load_patch_distributed_module():
     parallel_state_module: Any = ModuleType("vllm.distributed.parallel_state")
 
     class BaseGroupCoordinator:
-        pass
+        def drain_isends(self):
+            pass
+
+        def shutdown_isends(self):
+            pass
 
     def _get_unique_name(group_name: str) -> str:
         unique_name_counter["value"] += 1
@@ -604,6 +608,19 @@ def test_hccl_sleep_destroy_and_restore_shared_group(module_env):
     assert group.device == "npu:0"
 
     assert group.restore_hccl() is False
+
+
+@pytest.mark.parametrize("teardown", ["destroy", "destroy_hccl"])
+def test_pending_sends_finish_before_hccl_resources_are_released(module_env, teardown):
+    group = _make_group(module_env, group_name="pp", use_device_communicator=True)
+    order = []
+    group.shutdown_isends = lambda: order.append("shutdown")
+    group.drain_isends = lambda: order.append("drain")
+    group.device_communicator.destroy.side_effect = lambda: order.append("release")
+
+    getattr(group, teardown)()
+
+    assert order == (["shutdown", "drain", "release"] if teardown == "destroy" else ["drain", "release"])
 
 
 def test_non_hccl_destroy_path_destroys_device_group_directly(module_env):

@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.outputs import LogprobsLists
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState
 from vllm.v1.worker.gpu.pp_utils import (
     RingStepPlan,
@@ -83,6 +84,42 @@ def detach_execute_model_state(state: ExecuteModelState) -> ExecuteModelState:
         hidden_states=None if hidden is None else hidden.clone(),
         aux_hidden_states=(None if aux is None else [tensor.clone() for tensor in aux]),
     )
+
+
+def merge_layered_logprobs(req_ids, by_req_id):
+    """Align D/P logprobs with the merged request and generated-token order.
+
+    Sub-batches may request different top-k widths or no logprobs at all.
+    Empty P rows consume no generated-token rows; cumulative offsets keep
+    later Decode rows aligned even when P precedes D in scheduler order.
+    """
+    parts = [output.logprobs for output, _ in by_req_id.values() if output.logprobs is not None]
+    if not parts:
+        return None
+    width = max(part.logprobs.shape[1] for part in parts)
+    lengths = [
+        len(by_req_id[req_id][0].sampled_token_ids[by_req_id[req_id][1]]) if req_id in by_req_id else 0
+        for req_id in req_ids
+    ]
+    offsets = np.concatenate(([0], np.cumsum(lengths))).tolist()
+    tokens = np.zeros((offsets[-1], width), dtype=parts[0].logprob_token_ids.dtype)
+    values = np.full((offsets[-1], width), -np.inf, dtype=parts[0].logprobs.dtype)
+    ranks = np.zeros(offsets[-1], dtype=parts[0].sampled_token_ranks.dtype)
+    for row, req_id in enumerate(req_ids):
+        if lengths[row] == 0:
+            continue
+        output, index = by_req_id[req_id]
+        if output.logprobs is None:
+            # This request did not ask for logprobs. Keep its token positions
+            # so the scheduler can slice subsequent requests normally.
+            continue
+        part = output.logprobs.slice_request(index, lengths[row])
+        start, end = offsets[row : row + 2]
+        count = part.logprobs.shape[1]
+        tokens[start:end, :count] = part.logprob_token_ids
+        values[start:end, :count] = part.logprobs
+        ranks[start:end] = part.sampled_token_ranks
+    return LogprobsLists(tokens, values, ranks, offsets)
 
 
 def subset_cached_request_data(data: CachedRequestData, req_ids: list[str]) -> CachedRequestData:
@@ -363,7 +400,7 @@ def _select_pp_batches(batches, request_order: Sequence[str]):
         return np.stack(parts)
 
     idx = torch.tensor(
-        [int(found[req_id][0].idx_mapping[found[req_id][1]]) for req_id in chosen],
+        [int(found[req_id][0].idx_mapping_np[found[req_id][1]]) for req_id in chosen],
         dtype=torch.int32,
     )
     return SimpleNamespace(
@@ -509,9 +546,10 @@ class LayeredPPHandlerCapture:
             num_sampled = torch.cat(sampled_rows, dim=0)
             num_rejected = torch.cat(rejected_rows, dim=0)
         else:
-            tokens = torch.empty((0, plan.sample_width), dtype=torch.int64)
-            num_sampled = torch.empty(0, dtype=torch.int32)
-            num_rejected = torch.empty(0, dtype=torch.int32)
+            device = getattr(self.inner, "device", None)
+            tokens = torch.empty((0, plan.sample_width), dtype=torch.int64, device=device)
+            num_sampled = torch.empty(0, dtype=torch.int32, device=device)
+            num_rejected = torch.empty(0, dtype=torch.int32, device=device)
         aligned_tokens, aligned_sampled, aligned_rejected = align_sampled_payload(
             plan, req_ids, tokens, num_sampled, num_rejected
         )

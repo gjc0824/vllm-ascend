@@ -41,12 +41,15 @@ def can_compact_internal_prefill_payload(runner, plan):
         and not getattr(config, "same_layer_batch", False)
         # The P-only relay shortcut returns before waiting on received
         # tensors. Keep its existing transport contract outside this path.
-        and (getattr(plan, "boundary_mode", None) or not getattr(extensions, "skip_relay_stages", False))
+        and (
+            getattr(plan, "boundary_mode", None)
+            or getattr(scheduler, "async_scheduling", False)
+            or not getattr(extensions, "skip_relay_stages", False)
+        )
         and getattr(parallel, "pipeline_parallel_size", 1) == 2
         and getattr(parallel, "data_parallel_size", 1) == 1
         and not getattr(parallel, "enable_dbo", False)
         and scheduler is not None
-        and not getattr(scheduler, "async_scheduling", True)
         and getattr(runner, "speculative_config", None) is None
         and getattr(runner.vllm_config, "kv_transfer_config", None) is None
         and getattr(plan, "num_groups", 0) >= 2

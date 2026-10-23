@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.pp_utils import build_ring_step_plan, compute_need_sampl
 from vllm_ascend.worker.v2.layered_prefill import (
     LayeredPPHandlerCapture,
     LayeredV2ExecuteModelState,
+    _select_pp_batches,
     compute_layered_need_sampled_mask,
     concat_pp_input_batches,
     snapshot_pp_input_batch,
@@ -211,6 +212,27 @@ def test_snapshot_pp_input_batch_is_detached():
     batch.num_computed_tokens_np[0] = 99
     assert snap.idx_mapping.tolist() == [7]
     assert snap.num_computed_tokens_np.tolist() == [4]
+
+
+def test_pp_plan_selection_never_reads_device_request_indices():
+    batch = _pp_batch(
+        ["p", "d"],
+        computed=[0, 8],
+        prefill=[4, 8],
+        scheduled=[4, 1],
+        max_seq=[32, 32],
+        req_indices=[7, 3],
+    )
+
+    class DeviceIndices:
+        def __getitem__(self, index):
+            raise AssertionError("PP selection must use its CPU index mirror")
+
+    batch.idx_mapping = DeviceIndices()
+    ordered = _select_pp_batches([batch], ["d", "p"])
+    assert ordered.req_ids == ["d", "p"]
+    assert ordered.idx_mapping_np.tolist() == [3, 7]
+    assert ordered.num_computed_tokens_np.tolist() == [8, 0]
 
 
 def test_capture_flush_merges_d_and_final_p_broadcast():
@@ -839,6 +861,7 @@ def test_nonfused_pp_payload_keeps_consumed_p_rows(monkeypatch, rank, partitions
 def _relay_runner(*, pp_size=4, dp_size=1, enabled=True, num_layers=48):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner._skip_relay_stages = enabled
+    runner.use_async_scheduling = False
     runner.dp_size = dp_size
     runner.parallel_config = SimpleNamespace(pipeline_parallel_size=pp_size)
     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)

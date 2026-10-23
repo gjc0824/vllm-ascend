@@ -103,7 +103,6 @@ def test_both_runners_admit_supported_layered_configs(validate, groups, v2, pp, 
         ("vllm", "parallel_config.prefill_context_parallel_size", 2, "context parallelism"),
         ("vllm", "parallel_config.decode_context_parallel_size", 2, "context parallelism"),
         ("vllm", "parallel_config.enable_dbo", True, "DBO"),
-        ("vllm", "scheduler_config.async_scheduling", True, "async_scheduling"),
         ("vllm", "test_sequence_parallel", True, "sequence-parallel"),
         ("vllm", "parallel_config.enable_eplb", True, "upstream EPLB"),
         ("vllm", "cache_config.kv_offloading_size", 1, "KV offloading"),
@@ -151,6 +150,34 @@ def test_v1_mtp_exception_is_preserved(validate):
     vllm, ascend = configuration(v2=False, pp=1)
     vllm.speculative_config = NS(method="mtp")
     validate(vllm, ascend)
+
+
+@pytest.mark.parametrize("policy", ["off", "pp_transition"])
+def test_async_pp_is_supported_by_v2(validate, policy):
+    vllm, ascend = configuration(v2=True, policy=policy)
+    vllm.scheduler_config.async_scheduling = True
+    validate(vllm, ascend)
+
+
+@pytest.mark.parametrize("pp", [1, 2, 3, 4])
+@pytest.mark.parametrize("groups", [4, 8, 16])
+@pytest.mark.parametrize("eager", [False, True])
+def test_ordinary_layered_async_supports_single_and_multiple_stages(validate, pp, groups, eager):
+    vllm, ascend = configuration(v2=True, pp=pp, policy="off", groups=groups)
+    vllm.scheduler_config.async_scheduling = True
+    if eager:
+        vllm.model_config.enforce_eager = True
+        ascend.scheduler_config.layered_prefill_config.require_eager = True
+        vllm.compilation_config.cudagraph_mode = NS(name="NONE")
+        vllm.compilation_config.mode = NS(name="NONE")
+    validate(vllm, ascend)
+
+
+def test_async_pp_is_rejected_by_v1(validate):
+    vllm, ascend = configuration(v2=False)
+    vllm.scheduler_config.async_scheduling = True
+    with pytest.raises(ValueError, match="Model Runner V1"):
+        validate(vllm, ascend)
 
 
 @pytest.mark.parametrize("v2,pp", [(False, 2), (True, 1), (True, 3)])

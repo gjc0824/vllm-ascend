@@ -884,15 +884,16 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         # step. MRV2 additionally merges D and final-P sampling into one
         # PPHandler slot; intermediate P groups do not sample. Boundary plans
         # can span stages and each runner executes only its local intersection.
-        # Keep async PP, DBO and distributed/context-parallel gates below:
-        # admitting MRV2 does not enable those independent capabilities.
+        # MRV2 uses one scheduler-owned sampled-token ring slot per step.
+        # MRV1 does not implement the matching asynchronous PP protocol.
         if (
             vllm_config.scheduler_config.async_scheduling
             and parallel_config.pipeline_parallel_size > 1
+            and not getattr(vllm_config, "use_v2_model_runner", False)
         ):
             raise ValueError(
                 "layered_prefill_config does not support async_scheduling "
-                "with pipeline_parallel_size > 1"
+                "with pipeline_parallel_size > 1 on Model Runner V1"
             )
         if getattr(parallel_config, "enable_dbo", False):
             raise ValueError(

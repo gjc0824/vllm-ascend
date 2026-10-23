@@ -11,20 +11,21 @@ from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.v1.core.layered_prefill import LayeredFrontier
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 
 
 class LayeredV2Buffers:
-    """Runner-owned storage reused only after the previous step was sampled."""
+    """Runner-owned device storage reused in compute-stream submission order."""
 
     def __init__(self):
         self.tensors = {}
@@ -128,8 +129,6 @@ class LayeredV2SingleForward:
             and getattr(parallel, "decode_context_parallel_size", 1) == 1
             and getattr(parallel, "prefill_context_parallel_size", 1) == 1
             and runner.speculative_config is None
-            and not getattr(runner, "use_async_scheduling", False)
-            and not getattr(getattr(runner, "scheduler_config", None), "async_scheduling", False)
             and not getattr(runner, "supports_mm_inputs", False)
             and not getattr(model, "is_multimodal_model", False)
             and not getattr(model, "is_hybrid", False)
@@ -214,7 +213,14 @@ class LayeredV2SingleForward:
             "prompt_lens",
         ):
             value = getattr(batch, name)
-            updates[name] = None if value is None else b.select(name, value, requests)
+            if value is None:
+                updates[name] = None
+            elif name == "seq_lens_cpu_upper_bound":
+                # A later step may prepare metadata before this step's device
+                # work completes. Keep its host lengths out of reusable scratch.
+                updates[name] = value[requests].clone()
+            else:
+                updates[name] = b.select(name, value, requests)
         for name in (
             "idx_mapping_np",
             "num_scheduled_tokens",
@@ -229,7 +235,8 @@ class LayeredV2SingleForward:
         for name in ("input_ids", "positions", "is_padding"):
             updates[name] = b.select(name, getattr(batch, name), rows, padded, fill=(name == "is_padding"))
         updates["seq_lens"] = b.select("seq_lens", batch.seq_lens, requests, padded)
-        seq_np = b.select("seq_lens_cpu", torch.from_numpy(batch.seq_lens_np), requests, padded).numpy()
+        seq_np = np.zeros(padded, dtype=batch.seq_lens_np.dtype)
+        seq_np[:count] = batch.seq_lens_np[requests]
         query_cpu = b.arange(padded + 1, torch.int32, "cpu")
         query_np = query_cpu.numpy()
         query = b.arange(padded + 1, torch.int32, batch.query_start_loc.device)
